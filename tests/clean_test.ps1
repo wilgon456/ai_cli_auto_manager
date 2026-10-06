@@ -138,3 +138,4 @@ try {
 Write-Host ''
 if ($script:fails -gt 0) { Write-Host "$($script:fails) check(s) failed"; exit 1 }
 Write-Host 'all checks passed'
+exit 0
