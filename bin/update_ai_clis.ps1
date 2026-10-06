@@ -399,7 +399,15 @@ try {
     Write-Host ""
     Write-Host "log_file=$logFile"
 
-    $problems = @(Get-AicmScheduleProblems -Skip 'Update')
+    # MCP servers, browsers and agent CLIs left running after their session ended (lib\processes.js).
+    $procAttention = @()
+    if ($env:AICM_PROCESSES -ne '0' -and -not $DryRun) {
+      Write-Host ''
+      Write-Host '== processes left behind by agent sessions =='
+      $procAttention = @((Invoke-AicmNodeModule 'processes' @()).Attention)
+    }
+
+    $problems = @(Get-AicmScheduleProblems -Skip 'Update') + $procAttention
     foreach ($p in $problems) { Write-Host "problem: $p" }
     if (-not $DryRun) {
       Write-AicmState 'last-update' ([ordered]@{

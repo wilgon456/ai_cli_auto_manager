@@ -5,6 +5,9 @@
   aicm.ps1 update    [-DryRun] [-Targets codex,claude] [-InstallMissing]
   aicm.ps1 inventory [-Offline]   list installed AI CLIs, their versions and update coverage
   aicm.ps1 clean     [-DryRun] [-Rules id,id]
+  aicm.ps1 worktrees [-Apply] [-Days 14]   worktrees and branches agents left behind (report unless -Apply)
+  aicm.ps1 config    MCP servers and skills compared across the installed CLIs
+  aicm.ps1 processes [-Kill] [-MinAgeHours 2]   agent processes left running after their session ended
   aicm.ps1 status    disk use per cleanup rule, schedules, last runs
   aicm.ps1 doctor    exit 1 when a schedule is missing or a run is overdue or failed
   aicm.ps1 schedule  install | remove | show   [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]
@@ -14,7 +17,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('update', 'inventory', 'clean', 'status', 'doctor', 'schedule', 'version', 'help')]
+  [ValidateSet('update', 'inventory', 'clean', 'worktrees', 'config', 'processes', 'status', 'doctor', 'schedule', 'version', 'help')]
   [string]$Command = 'help',
   [Parameter(Position = 1)]
   [string]$Action = '',
@@ -35,7 +38,11 @@ param(
   [switch]$NoUpdate,
   [switch]$NoInventory,
   [switch]$NoClean,
-  [switch]$KeepLegacyTask
+  [switch]$KeepLegacyTask,
+  [switch]$Apply,
+  [int]$Days = 0,
+  [switch]$Kill,
+  [int]$MinAgeHours = 0
 )
 
 Set-StrictMode -Version Latest
@@ -51,6 +58,9 @@ function Show-Help {
   Write-Host '  aicm.ps1 update    [-DryRun] [-Targets codex,claude] [-InstallMissing]'
   Write-Host '  aicm.ps1 inventory [-Offline]'
   Write-Host '  aicm.ps1 clean     [-DryRun] [-Rules id,id]'
+  Write-Host '  aicm.ps1 worktrees [-Apply] [-Days 14]'
+  Write-Host '  aicm.ps1 config'
+  Write-Host '  aicm.ps1 processes [-Kill] [-MinAgeHours 2]'
   Write-Host '  aicm.ps1 status'
   Write-Host '  aicm.ps1 doctor'
   Write-Host '  aicm.ps1 schedule  install|remove|show [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
@@ -198,6 +208,19 @@ switch ($Command) {
     $splat = @{ LogRetentionDays = $LogRetentionDays }
     if ($Offline) { $splat.Offline = $true }
     Invoke-Child 'inventory_ai_clis.ps1' $splat
+  }
+  'worktrees' {
+    $nodeArgs = @()
+    if ($Apply) { $nodeArgs += '--apply' }
+    if ($Days -gt 0) { $nodeArgs += @('--days', "$Days") }
+    $null = Invoke-AicmNodeModule 'worktrees' $nodeArgs
+  }
+  'config' { $null = Invoke-AicmNodeModule 'config-drift' @() }
+  'processes' {
+    $nodeArgs = @()
+    if ($Kill) { $nodeArgs += '--kill' }
+    if ($MinAgeHours -gt 0) { $nodeArgs += @('--min-age-hours', "$MinAgeHours") }
+    $null = Invoke-AicmNodeModule 'processes' $nodeArgs
   }
   'clean' {
     $splat = @{ LogRetentionDays = $LogRetentionDays }

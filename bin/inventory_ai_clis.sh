@@ -136,6 +136,13 @@ if ((${#changes[@]})); then
 fi
 aicm_state_write inventory "{\"finishedAt\":\"$(aicm_ts)\",\"version\":\"$(aicm_version)\",\"ok\":true,\"host\":\"$(aicm_json_escape "$(hostname 2>/dev/null || echo unknown)")\",\"clis\":[${rows_json}],\"otherNpm\":\"$(aicm_json_escape "$other_npm")\",\"changes\":[${changes_json}]}"
 
+# MCP servers and skills compared across the installed CLIs (lib/config-drift.js).
+echo
+aicm_node_module config-drift --markdown
+cfg_output="$AICM_NODE_OUTPUT"
+cfg_attention=()
+if ((${#AICM_NODE_ATTENTION[@]})); then cfg_attention=("${AICM_NODE_ATTENTION[@]}"); fi
+
 md="$AICM_HOME/inventory.md"
 {
   echo "# AI CLI inventory - $(hostname 2>/dev/null || echo this machine)"
@@ -154,11 +161,15 @@ md="$AICM_HOME/inventory.md"
     printf '\nChanges since the last inventory:\n'
     for c in "${changes[@]}"; do echo "- $c"; done
   fi
+  if [[ -n "$cfg_output" ]]; then
+    printf '\n## Configuration across CLIs\n\n%s\n' "$cfg_output"
+  fi
 } > "$md"
 echo
 echo "report: $md"
 
 attention=()
+if ((${#cfg_attention[@]})); then attention+=("${cfg_attention[@]}"); fi
 if ((${#changes[@]})); then
   for c in "${changes[@]}"; do [[ "$c" == updated:* ]] || attention+=("$c"); done
 fi

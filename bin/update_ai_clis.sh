@@ -614,6 +614,13 @@ while IFS= read -r problem; do [[ -n "$problem" ]] && problems+=("$problem"); do
 if ((${#problems[@]})); then
   for problem in "${problems[@]}"; do echo "problem: $problem"; done
 fi
+# MCP servers, browsers and agent CLIs left running after their session ended (lib/processes.js).
+if [[ "${AICM_PROCESSES:-1}" != 0 && "$DRY_RUN" != "true" ]]; then
+  echo
+  echo "== processes left behind by agent sessions =="
+  aicm_node_module processes
+  if ((${#AICM_NODE_ATTENTION[@]})); then problems+=("${AICM_NODE_ATTENTION[@]}"); fi
+fi
 
 if [[ "$DRY_RUN" != "true" ]]; then
   update_ok=true; [[ -z "$failure_summary" ]] || update_ok=false

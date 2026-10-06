@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.4.0 - 2026-10-07
+
+For machines that run many agent sessions at once (Paseo, Orca, ...). The new checks are Node.js
+modules shared by Windows and macOS/Linux and are skipped when Node.js is missing.
+
+### Added
+- Worktree and branch hygiene (`lib/worktrees.js`, `aicm worktrees`, weekly with Clean): prunes
+  worktrees whose folder is gone; removes a linked worktree only when it is clean, unlocked, untouched
+  for 14 days and its work is upstream (merged, its GitHub PR merged with exactly this commit, or all
+  commits on a remote); unlinks links inside first; never uses `--force`; deletes local branches with
+  the same proof. Reports worktrees with uncommitted work untouched for 30 days.
+- Configuration drift report (`lib/config-drift.js`, `aicm config`, weekly with Inventory): MCP servers
+  per installed CLI, skills some CLIs cannot see, same-named skills with different content.
+- Left-behind process check (`lib/processes.js`, `aicm processes`, daily with Update): MCP servers,
+  automation browsers and agent CLIs running 2+ hours after their session ended; `--kill` /
+  `AICM_KILL_ORPHANS=1` ends them with their children.
+- Node tests (`tests/node`) on all CI platforms.
+
 ## 2.3.1 - 2026-10-06
 
 ### Fixed

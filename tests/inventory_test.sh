@@ -13,6 +13,8 @@ trap 'rm -rf "$WORK"' EXIT
 export HOME="$WORK/home" TMPDIR="$WORK/tmp" AICM_HOME="$WORK/home/.ai-cli-auto-manager" AICM_OS=linux AICM_NOTIFY=0
 # If a real codex were ever reached, it would only see the throwaway home.
 export CODEX_HOME="$WORK/home/.codex" USERPROFILE="$WORK/home"
+# The node checks have their own tests (tests/node); keep these runs away from real processes and repos.
+export AICM_PROCESSES=0 AICM_WORKTREES=0
 unset AICM_MIN_RELEASE_AGE_DAYS AICM_VERIFY_SIGNATURES AICM_ALLOW
 PREFIX="$WORK/npmprefix"
 export FAKE_NPM_DIR="$WORK" FAKE_NPM_PREFIX="$PREFIX" FAKE_NPM_ROOT="$PREFIX/lib/node_modules"

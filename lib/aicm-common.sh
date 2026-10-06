@@ -537,3 +537,25 @@ aicm_npm_check() { # pkg installed target
   if ((rc != 0)); then echo "signature check failed for $pkg@$target: $summary"; return 1; fi
   echo "signatures ok: $summary"
 }
+
+# ---------------------------------------------------------------------------
+# Node.js modules (worktrees, config drift, processes), shared with Windows
+# ---------------------------------------------------------------------------
+
+# Runs lib/<module>.js and prints its output; the output without attention lines is left in
+# AICM_NODE_OUTPUT and the "attention:" lines in AICM_NODE_ATTENTION.
+AICM_NODE_ATTENTION=(); AICM_NODE_OUTPUT=""
+aicm_node_module() { # module args...
+  local module="$1" out rc=0 line
+  shift
+  AICM_NODE_ATTENTION=(); AICM_NODE_OUTPUT=""
+  if ! command -v node >/dev/null 2>&1; then echo "$module: Node.js not found, skipped"; return 0; fi
+  out="$(aicm_timeout 900 node "$AICM_ROOT/lib/$module.js" "$@" 2>&1)" || rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  AICM_NODE_OUTPUT="$(printf '%s\n' "$out" | grep -v '^attention: ' || true)"
+  if ((rc != 0)); then AICM_NODE_ATTENTION=("$module failed with exit code $rc"); return 0; fi
+  while IFS= read -r line; do
+    [[ "$line" == "attention: "* ]] && AICM_NODE_ATTENTION+=("${line#attention: }")
+  done <<< "$out"
+  return 0
+}

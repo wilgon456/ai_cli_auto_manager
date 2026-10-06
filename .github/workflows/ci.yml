@@ -34,6 +34,11 @@ jobs:
         run: bash tests/aicm_test.sh
       - name: Inventory and catalog update tests
         run: bash tests/inventory_test.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Worktree, config drift and process tests (Node)
+        run: node --test tests/node/*.test.js
 
   windows:
     runs-on: windows-latest
@@ -54,6 +59,12 @@ jobs:
       - name: Inventory and catalog update tests (PowerShell 7)
         shell: pwsh
         run: .\tests\inventory_test.ps1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Worktree, config drift and process tests (Node)
+        shell: pwsh
+        run: node --test tests/node/worktrees.test.js tests/node/config-drift.test.js tests/node/processes.test.js
       - name: PSScriptAnalyzer errors
         shell: pwsh
         run: |

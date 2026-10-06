@@ -139,11 +139,19 @@ try {
   if ($shadow.Count -gt 0) { $md.Add(''); $md.Add('Duplicate installs the daily update does not reach:'); foreach ($s in $shadow) { $md.Add("- $s") } }
   if ($changes.Count -gt 0) { $md.Add(''); $md.Add('Changes since the last inventory:'); foreach ($c in $changes) { $md.Add("- $c") } }
   $mdPath = Join-Path (Get-AicmHome) 'inventory.md'
+  # MCP servers and skills compared across the installed CLIs (lib\config-drift.js).
+  Write-Host ''
+  $cfg = Invoke-AicmNodeModule 'config-drift' @('--markdown')
+  if (@($cfg.Lines).Count -gt 0) {
+    $md.Add(''); $md.Add('## Configuration across CLIs'); $md.Add('')
+    foreach ($l in $cfg.Lines) { $md.Add($l) }
+  }
   $md | Set-Content -LiteralPath $mdPath -Encoding UTF8
   Write-Host ''
   Write-Host "report: $mdPath"
 
   $attention = New-Object System.Collections.Generic.List[string]
+  foreach ($a in @($cfg.Attention)) { if ($a) { $attention.Add($a) } }
   foreach ($c in $changes) { if ($c -notlike 'updated:*') { $attention.Add($c) } }
   # Notify once when a duplicate problem appears, not every week while it lasts (doctor keeps reporting it).
   foreach ($s in $newShadow) { $attention.Add(($s -split '\. fix:')[0]) }

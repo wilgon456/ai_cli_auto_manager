@@ -13,6 +13,9 @@ AI CLI Auto Manager $(aicm_version)
   aicm update    [--dry-run] [--targets codex,claude] [--install-missing]
   aicm inventory [--offline]   list installed AI CLIs, their versions and update coverage
   aicm clean     [--dry-run] [--rules id,id]
+  aicm worktrees [--apply] [--days 14]   worktrees and branches agents left behind (report unless --apply)
+  aicm config    MCP servers and skills compared across the installed CLIs
+  aicm processes [--kill] [--min-age-hours 2]   agent processes left running after their session ended
   aicm status    disk use per cleanup rule, schedules, last runs
   aicm doctor    exit 1 when a schedule is missing or a run is overdue or failed
   aicm schedule  install|remove|show [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
@@ -224,6 +227,10 @@ case "$cmd" in
   update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
   inventory) exec "$BIN_DIR/inventory_ai_clis.sh" "$@" ;;
   clean) exec "$BIN_DIR/clean_ai_leftovers.sh" "$@" ;;
+  worktrees|config|processes)
+    command -v node >/dev/null 2>&1 || { echo "aicm $cmd needs Node.js" >&2; exit 1; }
+    module="$cmd"; [[ "$cmd" == config ]] && module=config-drift
+    exec node "$AICM_ROOT/lib/$module.js" "$@" ;;
   status)
     echo "AI CLI Auto Manager $(aicm_version)   home: $AICM_HOME"
     echo

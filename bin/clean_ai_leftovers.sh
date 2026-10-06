@@ -424,6 +424,13 @@ fi
 
 problems=()
 if ((${#errors[@]})); then problems+=("${errors[@]}"); fi
+# Worktrees and branches agents left behind (lib/worktrees.js). Skipped when single rules are run.
+if [[ "${AICM_WORKTREES:-1}" != 0 && "$REPORT" != true && -z "$SELECTED" ]]; then
+  echo
+  echo "== worktrees and branches =="
+  if [[ "$DRY_RUN" == true ]]; then aicm_node_module worktrees; else aicm_node_module worktrees --apply; fi
+  if ((${#AICM_NODE_ATTENTION[@]})); then problems+=("${AICM_NODE_ATTENTION[@]}"); fi
+fi
 while IFS= read -r p; do [[ -n "$p" ]] && problems+=("$p"); done < <(aicm_schedule_problems clean)
 if ((${#problems[@]})); then
   for p in "${problems[@]}"; do echo "problem: $p"; done

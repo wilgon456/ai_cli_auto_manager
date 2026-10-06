@@ -605,3 +605,23 @@ function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Targ
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
+
+# ---------------------------------------------------------------------------
+# Node.js modules (worktrees, config drift, processes), shared with macOS/Linux
+# ---------------------------------------------------------------------------
+
+# Runs lib\<Module>.js and prints its output. Returns .Lines (output without attention lines) and
+# .Attention (the "attention:" lines, for notifications).
+function Invoke-AicmNodeModule([string]$Module, [string[]]$Arguments = @(), [int]$TimeoutSeconds = 900) {
+  if (-not (Resolve-AicmExecutable 'node')) {
+    Write-Host "${Module}: Node.js not found, skipped"
+    return [pscustomobject]@{ Lines = @(); Attention = @() }
+  }
+  $script = Join-Path (Get-AicmRoot) "lib\$Module.js"
+  $r = Invoke-AicmWithTimeout 'node' (@($script) + $Arguments) $TimeoutSeconds
+  $lines = @($r.Output -split "`r?`n" | Where-Object { $_ -ne '' })
+  foreach ($l in $lines) { Write-Host $l }
+  $attention = @($lines | Where-Object { $_ -like 'attention: *' } | ForEach-Object { $_.Substring(11) })
+  if ($r.ExitCode -ne 0) { $attention += "${Module} failed with exit code $($r.ExitCode)" }
+  return [pscustomobject]@{ Lines = @($lines | Where-Object { $_ -notlike 'attention: *' }); Attention = $attention }
+}

@@ -33,7 +33,7 @@ function Invoke-Clean([string[]]$Arguments, [switch]$NoFakeCodex) {
   foreach ($k in 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'CODEX_HOME', 'PATH') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
   try {
     $env:USERPROFILE = $fakeHome; $env:TEMP = $fakeTemp; $env:TMP = $fakeTemp
-    $env:LOCALAPPDATA = $fakeLocal; $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'
+    $env:LOCALAPPDATA = $fakeLocal; $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'
     # If a real codex were ever reached, it would only see the throwaway home.
     $env:CODEX_HOME = $codexHome
     if (-not $NoFakeCodex) { $env:PATH = "$fakeBin;$($saved['PATH'])" }
