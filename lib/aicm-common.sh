@@ -375,6 +375,13 @@ aicm_cli_install() {
   return 0
 }
 
+# How to get rid of a second copy that hides behind (or in front of) the one on PATH.
+aicm_shadow_fix() {
+  aicm_npm_cache
+  printf 'fix: keep one copy - uninstall the npm copy, or put %s/bin before %s in PATH so the daily-updated npm copy is the one that runs.' \
+    "${AICM_NPM_PREFIX_CACHE:-<npm prefix>}" "$(dirname "$1")"
+}
+
 # Prints whether the daily update keeps the copy on PATH current: "yes" or "no: <why>".
 aicm_cli_coverage() {
   local i="$1" id

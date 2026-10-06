@@ -432,6 +432,13 @@ function Get-AicmCliInstall($Entry) {
   return [pscustomobject]$result
 }
 
+# How to get rid of a second copy that hides behind (or in front of) the one on PATH.
+function Get-AicmShadowFix($Install) {
+  $npm = Get-AicmNpmInfo
+  $dir = Split-Path -Parent $Install.Path
+  return "fix: keep one copy - uninstall the npm copy, or put $($npm.Prefix) before $dir in your user PATH so the daily-updated npm copy is the one that runs."
+}
+
 # Whether the daily update keeps the copy on PATH current: 'yes' or 'no: <why>'.
 function Get-AicmUpdateCoverage($Entry, $Install) {
   switch ($Install.Method) {

@@ -161,6 +161,9 @@ function Get-DoctorProblems {
   $clean = Read-AicmState 'last-clean'
   $inventory = Read-AicmState 'inventory'
   if ($jobs -contains 'Inventory' -and (Get-StateAgeDays $inventory) -gt 9) { $problems.Add('no inventory run in the last 9 days') }
+  if ($inventory -and $inventory.PSObject.Properties['shadowProblems']) {
+    foreach ($s in @($inventory.shadowProblems)) { if ($s) { $problems.Add([string]$s) } }
+  }
   if ($jobs -contains 'Update') {
     if ((Get-StateAgeDays $update) -gt 3) { $problems.Add('no update run in the last 3 days') }
     elseif ($update -and -not $update.ok) { $problems.Add('last update run failed: ' + (@($update.failures) -join ', ')) }

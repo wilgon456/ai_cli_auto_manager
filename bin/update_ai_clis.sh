@@ -356,8 +356,29 @@ update_agy_cli() {
   fi
 }
 
+# The copy on PATH decides how a CLI is updated. A second copy elsewhere (for example an npm copy
+# behind a standalone one) is reported, because updating it would not change what the terminal runs.
+active_install() { # id -> sets CLI_INSTALLED CLI_PATH CLI_METHOD CLI_NPMCOPY
+  local idx
+  if ((${#AICM_CLI_ID[@]} == 0)); then aicm_load_catalog "" "" >/dev/null 2>&1 || return 1; fi
+  idx="$(aicm_cli_index "$1")" || return 1
+  aicm_cli_install "$idx"
+}
+
+shadow_warning() {
+  active_install "$1" || return 0
+  if [[ -n "$CLI_NPMCOPY" && "$CLI_METHOD" != npm ]]; then
+    echo "warn: PATH runs $CLI_PATH; the npm copy $CLI_NPMCOPY is a second install that the terminal does not use."
+    echo "      $(aicm_shadow_fix "$CLI_PATH")"
+  fi
+  return 0
+}
+
 update_claude_cli() {
-  if is_brew_cask_installed claude-code || is_brew_formula_installed claude-code; then
+  if active_install claude && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == standalone ]]; then
+    command_with_timeout 300 "$CLI_PATH" update || return $?
+    shadow_warning claude
+  elif is_brew_cask_installed claude-code || is_brew_formula_installed claude-code; then
     update_brew_package claude-code
   elif is_npm_global_installed "@anthropic-ai/claude-code"; then
     update_npm_package "@anthropic-ai/claude-code"
@@ -371,7 +392,10 @@ update_claude_cli() {
 }
 
 update_opencode_cli() {
-  if is_brew_cask_installed opencode || is_brew_formula_installed opencode; then
+  if active_install opencode && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == standalone ]]; then
+    command_with_timeout 300 "$CLI_PATH" upgrade || return $?
+    shadow_warning opencode
+  elif is_brew_cask_installed opencode || is_brew_formula_installed opencode; then
     update_brew_package opencode
   elif is_npm_global_installed "opencode-ai"; then
     update_npm_package "opencode-ai"
@@ -393,7 +417,8 @@ update_grok_cli() {
   if command -v grok >/dev/null 2>&1 && active_path_contains grok "/node_modules/" && is_npm_global_installed "@xai-official/grok"; then
     update_npm_package "@xai-official/grok"
   elif command -v grok >/dev/null 2>&1; then
-    install_or_update_grok_cli
+    install_or_update_grok_cli || return $?
+    shadow_warning grok
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
     install_or_update_grok_cli
   else
@@ -507,6 +532,8 @@ if gpt_target_enabled; then
       echo "      path: $(npm_global_package_path "@openai/codex" 2>/dev/null || echo "@openai/codex")"
     fi
   fi
+  # The Codex desktop app can put its own copy on PATH and updates it itself; say so when npm's copy is hidden.
+  shadow_warning codex
 fi
 
 if target_enabled opencode; then

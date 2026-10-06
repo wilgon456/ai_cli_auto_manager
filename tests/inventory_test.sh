@@ -79,10 +79,13 @@ grep -q 'npm copy 3.0.0 is also installed, but PATH runs' <<< "$out" && pass "hi
 grep -q '3 AI CLIs installed (catalog has 5)' <<< "$out" && pass "count line" || fail "count line"
 [[ -f "$AICM_HOME/inventory.md" ]] && grep -q '| Fake NPM | npm | 1.0.0 | 1.2.0 | behind | yes |' "$AICM_HOME/inventory.md" && pass "markdown report" || fail "markdown report"
 grep -q '"id":"fakesolo"' "$AICM_HOME/state/inventory.json" && pass "json state" || fail "json state"
-! grep -q 'notify:' <<< "$out" && pass "first run does not notify" || fail "first run notified"
+grep -q 'duplicate installs the daily update does not reach:' <<< "$out" && grep -q 'Fake Shadow: PATH runs 3.1.0 at .*fakeshadow, but the daily update refreshes the npm copy (3.0.0). fix: keep one copy' <<< "$out" && pass "duplicate install the update cannot reach is reported with a fix" || fail "duplicate report"
+[[ "$(grep -c 'notify:' <<< "$out")" == 1 ]] && grep -q 'notify: .*Fake Shadow: PATH runs' <<< "$out" && pass "first run notifies only about the duplicate" || fail "first run notifications"
+grep -q 'Fake Shadow' "$AICM_HOME/state/inventory-shadow.txt" && pass "duplicate kept in state for doctor" || fail "shadow state"
 
 echo "# offline"
 out="$("${INV[@]}" --offline 2>&1)" || true
+! grep -q 'notify:' <<< "$out" && pass "a known duplicate does not notify again" || fail "duplicate notified twice"
 grep -Eq '^Fake NPM +npm +1\.0\.0 +installed' <<< "$out" && pass "--offline skips latest lookups" || fail "offline: $out"
 
 echo "# update through the catalog"

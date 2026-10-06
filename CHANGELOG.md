@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.1.1 - 2026-10-06
+
+### Fixed
+- The update now follows the copy the terminal runs. When Claude Code or OpenCode on PATH is a
+  standalone install, its own updater runs (`claude update`, `opencode upgrade`) even if a second
+  npm copy exists; before, only the unused npm copy was updated.
+- Duplicate installs that the daily update cannot reach (for example the Codex desktop app's copy
+  on PATH with a newer npm copy behind it) are reported by the update run, listed in the inventory
+  with a concrete fix, notified once when they appear, and reported by `doctor` until resolved.
+
 ## 2.1.0 - 2026-10-06
 
 ### Added
