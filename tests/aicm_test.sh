@@ -79,7 +79,8 @@ grep -q "$AICM_HOME/app/bin/inventory_ai_clis.sh" "$WORK/crontab.txt" && pass "c
 # A registered job that has not completed for too long is caught by the others.
 touch -t "$(date -d '-20 days' +%Y%m%d%H%M 2>/dev/null || date -v-20d +%Y%m%d%H%M)" "$AICM_HOME/state/schedule.json"
 rm -f "$AICM_HOME/state/inventory.json"
-out="$("$ROOT/bin/update_ai_clis.sh" --targets none 2>&1)" || true
+# (the cleanup script, because the updater puts system folders first on PATH and would find a real crontab)
+out="$("$ROOT/bin/clean_ai_leftovers.sh" --dry-run --rules codex-tmp 2>&1)" || true
 grep -q "'inventory' has not completed for over 9 days" <<< "$out" && pass "a job that stopped completing is reported by another job" || fail "stale job: $out"
 "$AICM" schedule remove >/dev/null
 ! grep -q '# aicm:' "$WORK/crontab.txt" && grep -q '# keep me' "$WORK/crontab.txt" && pass "schedule remove" || fail "schedule remove"
