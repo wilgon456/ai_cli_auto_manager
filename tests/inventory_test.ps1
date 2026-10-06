@@ -131,10 +131,13 @@ switch ($a[0]) {
   if ($md -and $md.Contains('| Fake NPM | npm | 1.0.0 | 1.2.0 | behind | yes |')) { Pass 'markdown report' } else { Fail 'markdown report' }
   $state = Get-Content -LiteralPath "$aicmHome\state\inventory.json" -Raw | ConvertFrom-Json
   if (@($state.clis | Where-Object { $_.id -eq 'fakesolo' }).Count -eq 1) { Pass 'json state' } else { Fail 'json state' }
-  if ($r.Output -notmatch 'notify:') { Pass 'first run does not notify' } else { Fail 'first run notified' }
+  if ($r.Output -match 'duplicate installs the daily update does not reach:' -and $r.Output -match 'Fake Shadow: PATH runs 3\.1\.0 at .*fakeshadow\.cmd, but the daily update refreshes the npm copy \(3\.0\.0\)\. fix: keep one copy') { Pass 'duplicate install the update cannot reach is reported with a fix' } else { Fail 'duplicate report' }
+  if (([regex]::Matches($r.Output, 'notify:')).Count -eq 1 -and $r.Output -match 'notify: .*Fake Shadow: PATH runs') { Pass 'first run notifies only about the duplicate' } else { Fail 'first run notifications' }
+  if (@($state.shadowProblems).Count -eq 1) { Pass 'duplicate kept in state for doctor' } else { Fail 'shadow state' }
 
   Write-Host '# offline'
   $r = Invoke-Script 'bin\inventory_ai_clis.ps1' ($inv + '-Offline')
+  if ($r.Output -notmatch 'notify:') { Pass 'a known duplicate does not notify again' } else { Fail 'duplicate notified twice' }
   if ($r.Output -match '(?m)^Fake NPM +npm +1\.0\.0 +installed') { Pass '-Offline skips latest lookups' } else { Fail "offline: $($r.Output)" }
 
   Write-Host '# update through the catalog'

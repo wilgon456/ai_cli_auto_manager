@@ -97,8 +97,24 @@ try {
     foreach ($c in $changes) { Write-Host "  $c" }
   }
 
+  # Two copies where the daily update only reaches the one the terminal does not run.
+  $shadow = New-Object System.Collections.Generic.List[string]
+  foreach ($row in $rows) {
+    if ($row.npmCopy -and $row.autoUpdate -like 'no*') {
+      $shadow.Add("$($row.name): PATH runs $($row.version) at $($row.path), but the daily update refreshes the npm copy ($($row.npmCopy)). $(Get-AicmShadowFix ([pscustomobject]@{ Path = $row.path }))")
+    }
+  }
+  if ($shadow.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'duplicate installs the daily update does not reach:'
+    foreach ($s in $shadow) { Write-Host "  $s" }
+  }
+  $previousShadow = @()
+  if ($previous -and $previous.PSObject.Properties['shadowProblems']) { $previousShadow = @($previous.shadowProblems | ForEach-Object { ($_ -split ':')[0] }) }
+  $newShadow = @($shadow | Where-Object { $previousShadow -notcontains ($_ -split ':')[0] })
+
   $stamp = Get-AicmTimestamp
-  Write-AicmState 'inventory' ([ordered]@{ finishedAt = $stamp; version = Get-AicmVersion; ok = $true; host = $env:COMPUTERNAME; clis = $rows.ToArray(); otherNpm = $otherNpm; changes = $changes.ToArray() })
+  Write-AicmState 'inventory' ([ordered]@{ finishedAt = $stamp; version = Get-AicmVersion; ok = $true; host = $env:COMPUTERNAME; clis = $rows.ToArray(); otherNpm = $otherNpm; changes = $changes.ToArray(); shadowProblems = $shadow.ToArray() })
 
   $md = New-Object System.Collections.Generic.List[string]
   $md.Add("# AI CLI inventory - $env:COMPUTERNAME")
@@ -113,6 +129,7 @@ try {
     $md.Add("| $($row.name) | $($row.method) | $($row.version) | $($row.latest) | $($row.state) | $($row.autoUpdate) | $pathText |")
   }
   if ($otherNpm.Count -gt 0) { $md.Add(''); $md.Add("Other global npm packages: $($otherNpm -join ', ')") }
+  if ($shadow.Count -gt 0) { $md.Add(''); $md.Add('Duplicate installs the daily update does not reach:'); foreach ($s in $shadow) { $md.Add("- $s") } }
   if ($changes.Count -gt 0) { $md.Add(''); $md.Add('Changes since the last inventory:'); foreach ($c in $changes) { $md.Add("- $c") } }
   $mdPath = Join-Path (Get-AicmHome) 'inventory.md'
   $md | Set-Content -LiteralPath $mdPath -Encoding UTF8
@@ -121,6 +138,8 @@ try {
 
   $attention = New-Object System.Collections.Generic.List[string]
   foreach ($c in $changes) { if ($c -notlike 'updated:*') { $attention.Add($c) } }
+  # Notify once when a duplicate problem appears, not every week while it lasts (doctor keeps reporting it).
+  foreach ($s in $newShadow) { $attention.Add(($s -split '\. fix:')[0]) }
   foreach ($p in (Get-AicmScheduleProblems -Skip 'Inventory')) { Write-Host "problem: $p"; $attention.Add($p) }
   if ($attention.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($attention -join '; ') }
 

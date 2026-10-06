@@ -187,8 +187,34 @@ try {
       }
     }
 
+    # The copy on PATH decides how a CLI is updated. A second copy elsewhere (for example an npm copy
+    # behind a standalone one) is reported, because updating it would not change what the terminal runs.
+    function Get-ActiveInstall([string]$Id) {
+      $entry = @(Read-AicmCatalog | Where-Object { $_.Id -eq $Id }) | Select-Object -First 1
+      if (-not $entry) { return $null }
+      return (Get-AicmCliInstall $entry)
+    }
+
+    function Write-ShadowWarning([string]$Id) {
+      $inst = Get-ActiveInstall $Id
+      if ($inst -and $inst.NpmCopy -and $inst.Method -ne 'npm') {
+        Write-Host "warn: PATH runs $($inst.Path); the npm copy $($inst.NpmCopy) is a second install that the terminal does not use."
+        Write-Host "      $(Get-AicmShadowFix $inst)"
+      }
+    }
+
+    function Invoke-ActiveSelfUpdate($Install, [string[]]$SelfArgs) {
+      $result = Invoke-AicmWithTimeout $Install.Path $SelfArgs 300
+      if ($result.Output) { Write-Host $result.Output.TrimEnd() }
+      if ($result.ExitCode -ne 0) { throw "$($Install.Path) $($SelfArgs -join ' ') failed with exit code $($result.ExitCode)" }
+    }
+
     function Update-ClaudeCli {
-      if (Test-NpmGlobalPackage '@anthropic-ai/claude-code') {
+      $inst = Get-ActiveInstall 'claude'
+      if ($inst -and $inst.Installed -and $inst.Method -eq 'standalone') {
+        Invoke-ActiveSelfUpdate $inst @('update')
+        Write-ShadowWarning 'claude'
+      } elseif (Test-NpmGlobalPackage '@anthropic-ai/claude-code') {
         Update-NpmPackage '@anthropic-ai/claude-code'
       } elseif (Get-CommandPath 'claude') {
         $result = Invoke-AicmWithTimeout 'claude' @('update') 300
@@ -202,7 +228,11 @@ try {
     }
 
     function Update-OpenCodeCli {
-      if (Test-NpmGlobalPackage 'opencode-ai') {
+      $inst = Get-ActiveInstall 'opencode'
+      if ($inst -and $inst.Installed -and $inst.Method -eq 'standalone') {
+        Invoke-ActiveSelfUpdate $inst @('upgrade')
+        Write-ShadowWarning 'opencode'
+      } elseif (Test-NpmGlobalPackage 'opencode-ai') {
         Update-NpmPackage 'opencode-ai'
       } elseif (Get-CommandPath 'opencode') {
         $result = Invoke-AicmWithTimeout 'opencode' @('upgrade') 300
@@ -228,6 +258,7 @@ try {
         Update-NpmPackage '@xai-official/grok'
       } elseif ($grokPath) {
         Install-OrUpdate-GrokCli
+        Write-ShadowWarning 'grok'
       } elseif ($InstallMissing) {
         Install-OrUpdate-GrokCli
       } else {
@@ -283,6 +314,8 @@ try {
       } else {
         Pass-Missing 'gpt' 'codex command exists but no supported Windows package manager was detected'
       }
+      # The Codex desktop app puts its own copy on PATH and updates it itself; say so when npm's copy is hidden.
+      Write-ShadowWarning 'codex'
     }
 
     if (Test-TargetEnabled 'opencode') {

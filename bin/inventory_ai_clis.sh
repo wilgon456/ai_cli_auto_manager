@@ -42,6 +42,7 @@ fi
 rows_tsv=""
 rows_json=""
 count=0
+shadow=()
 printf '\n%-20s %-11s %-14s %-14s %-9s %s\n' CLI via version latest state "daily update"
 for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
   aicm_cli_install "$i"
@@ -64,6 +65,9 @@ for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
   coverage="$(aicm_cli_coverage "$i")"
   printf '%-20s %-11s %-14s %-14s %-9s %s\n' "$name" "$CLI_METHOD" "$version" "$latest" "$state" "$coverage"
   [[ -n "$CLI_NPMCOPY" ]] && printf '%-20s npm copy %s is also installed, but PATH runs %s\n' "" "$CLI_NPMCOPY" "$CLI_PATH"
+  if [[ -n "$CLI_NPMCOPY" && "$coverage" == no* ]]; then
+    shadow+=("$name: PATH runs $version at $CLI_PATH, but the daily update refreshes the npm copy ($CLI_NPMCOPY). $(aicm_shadow_fix "$CLI_PATH")")
+  fi
   rows_tsv+="$id"$'\t'"$name"$'\t'"$version"$'\n'
   rows_json+="${rows_json:+,}{\"id\":\"$(aicm_json_escape "$id")\",\"name\":\"$(aicm_json_escape "$name")\",\"command\":\"$(aicm_json_escape "${AICM_CLI_CMD[$i]}")\",\"method\":\"$CLI_METHOD\",\"version\":\"$(aicm_json_escape "$version")\",\"latest\":\"$(aicm_json_escape "$latest")\",\"state\":\"$state\",\"autoUpdate\":\"$(aicm_json_escape "$coverage")\",\"npmCopy\":\"$(aicm_json_escape "$CLI_NPMCOPY")\",\"path\":\"$(aicm_json_escape "$CLI_PATH")\"}"
   md_rows+="| $name | $CLI_METHOD | $version | $latest | $state | $coverage | $CLI_PATH${CLI_NPMCOPY:+ (stale npm copy $CLI_NPMCOPY also installed)} |"$'\n'
@@ -103,6 +107,22 @@ if ((${#changes[@]})); then
   for c in "${changes[@]}"; do echo "  $c"; done
 fi
 
+# Two copies where the daily update only reaches the one the terminal does not run.
+# Notify once when such a problem appears; doctor keeps reporting it while it lasts.
+shadow_file="$AICM_HOME/state/inventory-shadow.txt"
+new_shadow=()
+if ((${#shadow[@]})); then
+  echo
+  echo "duplicate installs the daily update does not reach:"
+  for s in "${shadow[@]}"; do
+    echo "  $s"
+    if ! { [[ -f "$shadow_file" ]] && grep -qF "${s%%:*}:" "$shadow_file"; }; then new_shadow+=("${s%%. fix:*}"); fi
+  done
+  printf '%s\n' "${shadow[@]}" > "$shadow_file"
+else
+  : > "$shadow_file"
+fi
+
 printf '%s' "$rows_tsv" > "$prev"
 changes_json=""
 if ((${#changes[@]})); then
@@ -120,6 +140,10 @@ md="$AICM_HOME/inventory.md"
   echo "| --- | --- | --- | --- | --- | --- | --- |"
   printf '%s' "${md_rows:-}"
   [[ -n "$other_npm" ]] && printf '\nOther global npm packages: %s\n' "$other_npm"
+  if ((${#shadow[@]})); then
+    printf '\nDuplicate installs the daily update does not reach:\n'
+    for s in "${shadow[@]}"; do echo "- $s"; done
+  fi
   if ((${#changes[@]})); then
     printf '\nChanges since the last inventory:\n'
     for c in "${changes[@]}"; do echo "- $c"; done
@@ -132,6 +156,7 @@ attention=()
 if ((${#changes[@]})); then
   for c in "${changes[@]}"; do [[ "$c" == updated:* ]] || attention+=("$c"); done
 fi
+if ((${#new_shadow[@]})); then attention+=("${new_shadow[@]}"); fi
 while IFS= read -r p; do [[ -n "$p" ]] && { echo "problem: $p"; attention+=("$p"); }; done < <(aicm_schedule_problems inventory)
 if ((${#attention[@]})); then
   joined="$(printf '%s; ' "${attention[@]}")"

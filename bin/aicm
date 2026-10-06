@@ -200,6 +200,9 @@ doctor() {
     problems+=("no inventory run in the last 9 days")
   fi
   if ! (aicm_load_catalog "" "") 2>/dev/null; then problems+=("catalog error in rules/ai-clis.conf or ai-clis.local.conf"); fi
+  if [[ -s "$STATE_DIR/inventory-shadow.txt" ]]; then
+    while IFS= read -r p; do [[ -n "$p" ]] && problems+=("$p"); done < "$STATE_DIR/inventory-shadow.txt"
+  fi
   if grep -qx clean <<< "$jobs"; then
     if state_older_than_days last-clean 9; then problems+=("no cleanup run in the last 9 days")
     elif ! grep -q '"ok":true' "$STATE_DIR/last-clean.json"; then problems+=("last cleanup run had errors; see $LOG_DIR"); fi
