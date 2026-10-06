@@ -184,7 +184,8 @@ function ConvertFrom-AicmRuleLine([string]$Line, [string]$Source) {
   if ($cols[6]) { $limit = [int]$cols[6] }
   if ($kind -eq 'age' -and $days -lt 1) { throw "age rule needs days >= 1 in ${Source}: $t" }
   if ($kind -eq 'keep-latest' -and $limit -lt 1) { throw "keep-latest rule needs limit >= 1 in ${Source}: $t" }
-  if (@('archive', 'codex') -contains $kind -and ($days -lt 1 -or $limit -lt 1)) { throw "$kind rule needs days >= 1 (archive after) and limit >= 1 (delete after) in ${Source}: $t" }
+  if ($kind -eq 'archive' -and ($days -lt 1 -or $limit -lt 1)) { throw "archive rule needs days >= 1 (archive after) and limit >= 1 (delete after) in ${Source}: $t" }
+  if ($kind -eq 'codex' -and $days -lt 1) { throw "codex rule needs days >= 1 in ${Source}: $t" }
   return [pscustomobject]@{
     Id = $cols[0]; Os = $cols[1].ToLowerInvariant(); Kind = $kind; Path = $cols[3]; Pattern = $(if ($cols[4]) { $cols[4] } else { '*' })
     Days = $days; Limit = $limit; Enabled = ($default -eq 'on'); Note = $cols[8]; Source = $Source

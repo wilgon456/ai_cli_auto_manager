@@ -132,6 +132,8 @@ exit 0
 
   @(
     'codex-trace-db      | all     | cap         | ~/.codex                     | logs_*.sqlite | 30 | 1 | on |'
+    'codex-sessions      | all     | codex       | ~/.codex                     | rollout-*     | 30 | 60 | on |'
+    'claude-transcripts  | all     | archive     | ~/.claude/projects           | *.jsonl       | 30 | 60 | on |'
     'playwright-browsers | windows | keep-latest | {localappdata}/ms-playwright | *             |    | 2 | on |'
     'escape-home         | all     | age         | ~/../escape                  | *             | 1  |   | on |'
     'home-itself         | all     | age         | ~                            | *             | 1  |   | on |'
@@ -220,6 +222,21 @@ exit 0
     if ($r.Output -match 'codex command not found: nothing touched') { Pass 'missing codex command reported' } else { Fail 'missing codex' }
     Expect-Exists "$codexHome\sessions\2026\07\01\rollout-2026-07-01T10-00-00-$U2.jsonl" 'codex files kept without the codex command'
   }
+
+  Write-Host '# defaults: Codex sessions deleted after 30 days, Claude transcripts left to Claude, archive remnants purged'
+  $local = @(Get-Content -LiteralPath "$aicmHome\clean-rules.local.conf" | Where-Object { $_ -notlike 'codex-sessions*' -and $_ -notlike 'claude-transcripts*' })
+  $local | Set-Content -LiteralPath "$aicmHome\clean-rules.local.conf" -Encoding UTF8
+  $U7 = '77777777-7777-4777-8777-777777777777'
+  New-TestFile "$codexHome\sessions\2026\08\02\rollout-2026-08-02T10-00-00-$U7.jsonl" 40
+  New-TestFile "$fakeHome\.claude\projects\q\old.jsonl" 40
+  New-TestFile "$aicmHome\archive\claude-transcripts\20200102\q\ancient.jsonl" 2000
+  Remove-Item -LiteralPath "$work\codex-calls.log" -ErrorAction SilentlyContinue
+  $null = Invoke-Clean @('-Rules', 'codex-sessions')
+  $calls = @(Get-CodexCalls)
+  if ($calls -contains "delete --force $U7" -and -not ($calls -like 'archive*')) { Pass 'default: unused 30+ days goes straight to codex delete' } else { Fail "default codex delete: $calls" }
+  $null = Invoke-Clean @()
+  Expect-Exists "$fakeHome\.claude\projects\q\old.jsonl" "default: Claude transcripts left to Claude's own cleanup"
+  Expect-Gone "$aicmHome\archive\claude-transcripts\20200102" 'default: old archive remnants purged although the rule is off'
 
   Write-Host '# explicit rule runs even when off'
   $null = Invoke-Clean @('-Rules', 'codex-images')

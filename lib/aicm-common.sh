@@ -149,7 +149,8 @@ aicm_load_rule_file() {
     [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || { echo "invalid limit in $source: $line" >&2; return 1; }
     if [[ "$kind" == age ]] && (( ${days:-0} < 1 )); then echo "age rule needs days >= 1 in $source: $line" >&2; return 1; fi
     if [[ "$kind" == keep-latest ]] && (( ${limit:-0} < 1 )); then echo "keep-latest rule needs limit >= 1 in $source: $line" >&2; return 1; fi
-    if [[ "$kind" == archive || "$kind" == codex ]] && (( ${days:-0} < 1 || ${limit:-0} < 1 )); then echo "$kind rule needs days >= 1 (archive after) and limit >= 1 (delete after) in $source: $line" >&2; return 1; fi
+    if [[ "$kind" == archive ]] && (( ${days:-0} < 1 || ${limit:-0} < 1 )); then echo "archive rule needs days >= 1 (archive after) and limit >= 1 (delete after) in $source: $line" >&2; return 1; fi
+    if [[ "$kind" == codex ]] && (( ${days:-0} < 1 )); then echo "codex rule needs days >= 1 in $source: $line" >&2; return 1; fi
     aicm_os_matches "$os" || continue
     if idx="$(aicm_rule_index "$id")"; then :; else idx=${#AICM_RULE_ID[@]}; fi
     AICM_RULE_ID[idx]="$id"; AICM_RULE_KIND[idx]="$kind"; AICM_RULE_PATH[idx]="$path"
