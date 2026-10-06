@@ -210,16 +210,41 @@ function Read-AicmRules([string]$RulesFile, [string]$LocalFile) {
   foreach ($id in $ordered) { $byId[$id] }
 }
 
+# Writes to a temp file and swaps it in, so a crash mid-write never leaves a half-written state file.
 function Write-AicmState([string]$Name, $Object) {
   $dir = Join-Path (Get-AicmHome) 'state'
   Initialize-AicmDirectory $dir
-  $Object | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $dir "$Name.json") -Encoding UTF8
+  $file = Join-Path $dir "$Name.json"
+  $tmp = "$file.$PID.tmp"
+  $Object | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $tmp -Encoding UTF8
+  if (Test-Path -LiteralPath $file) { [System.IO.File]::Replace($tmp, $file, [NullString]::Value) }
+  else { [System.IO.File]::Move($tmp, $file) }
 }
 
 function Read-AicmState([string]$Name) {
   $file = Join-Path (Join-Path (Get-AicmHome) 'state') "$Name.json"
   if (-not (Test-Path -LiteralPath $file)) { return $null }
   try { return (Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
+# Notifies the items that are new or were last announced 7+ days ago, so a lasting problem does not
+# raise a notification every day. Items that went away are forgotten.
+function Send-AicmAttention([string]$Key, [string[]]$Items) {
+  $list = @($Items | Where-Object { $_ })
+  $seen = @{}
+  $prev = Read-AicmState "attention-$Key"
+  if ($prev) { foreach ($p in $prev.PSObject.Properties) { $seen[$p.Name] = [string]$p.Value } }
+  $now = (Get-Date).ToUniversalTime()
+  $keep = [ordered]@{}
+  $due = New-Object System.Collections.Generic.List[string]
+  foreach ($i in $list) {
+    $last = [datetime]::MinValue
+    if ($seen.ContainsKey($i)) { [void][datetime]::TryParse($seen[$i], [ref]$last) }
+    if (($now - $last.ToUniversalTime()).TotalDays -ge 7) { $due.Add($i); $keep[$i] = $now.ToString('o') }
+    else { $keep[$i] = $seen[$i] }
+  }
+  Write-AicmState "attention-$Key" $keep
+  if ($due.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($due.ToArray() -join '; ') }
 }
 
 # Desktop notification. Never fails the caller. Disable with AICM_NOTIFY=0.
@@ -319,6 +344,52 @@ function Get-AicmCodexThreads([string]$CodexHome) {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Installed copy: scheduled jobs run ~/.ai-cli-auto-manager/app, not the git clone, so moving or
+# deleting the clone cannot stop them. The daily update refreshes the copy when the clone has a
+# newer VERSION.
+# ---------------------------------------------------------------------------
+
+function Get-AicmAppDir { return (Join-Path (Get-AicmHome) 'app') }
+
+# Copies bin, lib, rules, windows and VERSION from $Source into the app folder via a swap.
+function Sync-AicmAppCopy([string]$Source) {
+  $app = Get-AicmAppDir
+  if (Test-AicmSamePath $Source $app) { return $app }
+  $new = "$app.new"
+  $old = "$app.old"
+  foreach ($d in $new, $old) { if (Test-Path -LiteralPath $d) { Remove-AicmTree ([System.IO.DirectoryInfo]::new($d)) } }
+  New-Item -ItemType Directory -Path $new -Force | Out-Null
+  foreach ($d in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $Source $d) -Destination (Join-Path $new $d) -Recurse -Force }
+  foreach ($f in 'VERSION', 'LICENSE', 'README.md') {
+    $p = Join-Path $Source $f
+    if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force }
+  }
+  [System.IO.File]::WriteAllText((Join-Path $new 'SOURCE'), $Source)
+  if (Test-Path -LiteralPath $app) { Move-Item -LiteralPath $app -Destination $old }
+  Move-Item -LiteralPath $new -Destination $app
+  if (Test-Path -LiteralPath $old) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($old)) } catch { } }
+  return $app
+}
+
+# Called at the end of the daily update when it runs from the installed copy.
+function Update-AicmAppCopy {
+  $app = Get-AicmAppDir
+  if (-not (Test-AicmSamePath (Get-AicmRoot) $app)) { return }
+  $sourceFile = Join-Path $app 'SOURCE'
+  if (-not (Test-Path -LiteralPath $sourceFile)) { return }
+  $source = (Get-Content -LiteralPath $sourceFile -TotalCount 1).Trim()
+  $srcVersion = Join-Path $source 'VERSION'
+  if (-not $source -or -not (Test-Path -LiteralPath $srcVersion) -or -not (Test-Path -LiteralPath (Join-Path $source 'bin\aicm.ps1'))) {
+    Write-Host "installed copy: source $source is gone; keeping version $(Get-AicmVersion)"
+    return
+  }
+  $newVersion = (Get-Content -LiteralPath $srcVersion -TotalCount 1).Trim()
+  if ($newVersion -eq (Get-AicmVersion)) { return }
+  try { [void](Sync-AicmAppCopy $source); Write-Host "installed copy: updated $(Get-AicmVersion) -> $newVersion from $source" }
+  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); trying again next run" }
+}
+
 # AICM_TASK_PATH lets tests register throwaway tasks in their own folder.
 $script:AicmTaskPath = if ($env:AICM_TASK_PATH) { $env:AICM_TASK_PATH } else { '\AI CLI Auto Manager\' }
 
@@ -328,14 +399,28 @@ function Get-AicmTask([string]$Name) {
 
 # Checks that every scheduled job recorded at install time still exists.
 # Returns a list of human-readable problems (empty when healthy).
-function Get-AicmScheduleProblems([string]$Skip = '') {
+# Also flags a job that is registered but has not completed for too long (its script is gone, it keeps
+# crashing, ...), once the schedule has existed that long. -NoStale: existence only (doctor checks age itself).
+function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
   $problems = New-Object System.Collections.Generic.List[string]
   $sched = Read-AicmState 'schedule'
   if (-not $sched) { return $problems }
+  $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9) }
+  $installedDays = 0
+  try { $installedDays = ((Get-Date).ToUniversalTime() - [datetime]::Parse($sched.installedAt).ToUniversalTime()).TotalDays } catch { }
   foreach ($job in @($sched.jobs)) {
     if ($job -eq $Skip) { continue }
     if (-not (Get-AicmTask $job)) {
       $problems.Add("scheduled task '$job' is missing; run: aicm.ps1 schedule install")
+      continue
+    }
+    if ($NoStale -or -not $limits.ContainsKey($job)) { continue }
+    $state = Read-AicmState $limits[$job][0]
+    $days = [double]::PositiveInfinity
+    if ($state) { try { $days = ((Get-Date).ToUniversalTime() - [datetime]::Parse($state.finishedAt).ToUniversalTime()).TotalDays } catch { } }
+    $limit = $limits[$job][1]
+    if ($days -gt $limit -and $installedDays -gt $limit) {
+      $problems.Add("scheduled task '$job' has not completed for over $limit days; see $(Join-Path (Get-AicmHome) 'logs')")
     }
   }
   return $problems
@@ -564,6 +649,29 @@ function Save-AicmNpmView([string[]]$Arguments) {
   $file = [System.IO.Path]::GetTempFileName()
   [System.IO.File]::WriteAllText($file, $r.Output)
   return $file
+}
+
+# npm leaves its staging folders (node_modules\.<name>-XXXXXXXX) behind when an install fails half way;
+# on this tool's first test machine one of them was 238 MB. Removes those older than a day.
+function Remove-AicmNpmLeftovers {
+  $prefix = (Get-AicmNpmInfo).Prefix
+  if (-not $prefix) { return }
+  $root = Join-Path $prefix 'node_modules'
+  if (-not (Test-Path -LiteralPath $root)) { $root = Join-Path $prefix 'lib\node_modules' }
+  if (-not (Test-Path -LiteralPath $root)) { return }
+  $cutoff = (Get-Date).AddDays(-1)
+  $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
+  foreach ($d in ([System.IO.DirectoryInfo]::new($root)).GetDirectories()) {
+    if (Test-AicmLink $d) { continue }
+    if ($d.Name.StartsWith('@')) { foreach ($s in $d.GetDirectories()) { $dirs.Add($s) } } else { $dirs.Add($d) }
+  }
+  foreach ($d in $dirs) {
+    if ($d.Name -notmatch '^\.[^.].*-[A-Za-z0-9]{8}$' -or (Test-AicmLink $d) -or $d.LastWriteTime -gt $cutoff) { continue }
+    $bytes = 0L
+    foreach ($f in (Get-AicmFiles $d.FullName)) { $bytes += $f.Length }
+    try { Remove-AicmTree $d; Write-Host "removed npm leftover $($d.FullName) ($(Format-AicmSize $bytes))" }
+    catch { Write-Host "kept npm leftover $($d.FullName) (in use)" }
+  }
 }
 
 # The version to install: the newest stable release that is at least N days old ('' when none is).

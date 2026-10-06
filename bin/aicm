@@ -21,6 +21,7 @@ AI CLI Auto Manager $(aicm_version)
   aicm schedule  install|remove|show [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
                                      [--clean-day mon] [--clean-at 12:30] [--targets list]
                                      [--no-update] [--no-inventory] [--no-clean]
+  aicm uninstall [--purge]
   aicm version
 EOF
 }
@@ -75,11 +76,17 @@ write_plist() { # job script hour minute weekday(or empty) args...
     echo "    <string>$script</string>"
     for arg in "$@"; do echo "    <string>$arg</string>"; done
     echo '  </array>'
-    echo '  <key>StartCalendarInterval</key><dict>'
-    [[ -n "$weekday" ]] && echo "    <key>Weekday</key><integer>$((weekday % 7))</integer>"
-    echo "    <key>Hour</key><integer>$hour</integer>"
-    echo "    <key>Minute</key><integer>$minute</integer>"
-    echo '  </dict>'
+    # One start time per hour in the comma-separated list (the update job retries during the day).
+    echo '  <key>StartCalendarInterval</key><array>'
+    local h
+    for h in ${hour//,/ }; do
+      echo '    <dict>'
+      [[ -n "$weekday" ]] && echo "      <key>Weekday</key><integer>$((weekday % 7))</integer>"
+      echo "      <key>Hour</key><integer>$h</integer>"
+      echo "      <key>Minute</key><integer>$minute</integer>"
+      echo '    </dict>'
+    done
+    echo '  </array>'
     echo "  <key>StandardOutPath</key><string>$LOG_DIR/launchd.$job.out.log</string>"
     echo "  <key>StandardErrorPath</key><string>$LOG_DIR/launchd.$job.err.log</string>"
     echo '</dict></plist>'
@@ -126,16 +133,23 @@ schedule_install() {
   local wd iwd jobs="" update_args=()
   wd="$(weekday_number "$clean_day")" || exit 2
   iwd="$(weekday_number "$inventory_day")" || exit 2
-  [[ -n "$targets" ]] && update_args=(--targets "$targets")
+  update_args=(--scheduled)
+  [[ -n "$targets" ]] && update_args+=(--targets "$targets")
   mkdir -p "$LOG_DIR"
+  local app retry_hours h
+  app="$(aicm_sync_app_copy "$AICM_ROOT")"
+  echo "installed copy: $app (version $(aicm_version))"
+  # The update job retries every 3 hours for 15 hours; a run after a complete success that day exits at once.
+  retry_hours="$(hm_hour "$update_at")"
+  for h in 3 6 9 12 15; do retry_hours+=",$(( ($(hm_hour "$update_at") + h) % 24 ))"; done
 
   if [[ "$(aicm_os)" == mac ]]; then
     if [[ "$no_update" == true ]]; then remove_plist update
-    else write_plist update "$BIN_DIR/update_ai_clis.sh" "$(hm_hour "$update_at")" "$(hm_minute "$update_at")" "" ${update_args[@]+"${update_args[@]}"}; jobs+='"update",'; fi
+    else write_plist update "$app/bin/update_ai_clis.sh" "$retry_hours" "$(hm_minute "$update_at")" "" "${update_args[@]}"; jobs+='"update",'; fi
     if [[ "$no_inventory" == true ]]; then remove_plist inventory
-    else write_plist inventory "$BIN_DIR/inventory_ai_clis.sh" "$(hm_hour "$inventory_at")" "$(hm_minute "$inventory_at")" "$iwd"; jobs+='"inventory",'; fi
+    else write_plist inventory "$app/bin/inventory_ai_clis.sh" "$(hm_hour "$inventory_at")" "$(hm_minute "$inventory_at")" "$iwd"; jobs+='"inventory",'; fi
     if [[ "$no_clean" == true ]]; then remove_plist clean
-    else write_plist clean "$BIN_DIR/clean_ai_leftovers.sh" "$(hm_hour "$clean_at")" "$(hm_minute "$clean_at")" "$wd"; jobs+='"clean",'; fi
+    else write_plist clean "$app/bin/clean_ai_leftovers.sh" "$(hm_hour "$clean_at")" "$(hm_minute "$clean_at")" "$wd"; jobs+='"clean",'; fi
     if [[ -f "$HOME/Library/LaunchAgents/com.example.ai-cli-auto-update.plist" ]]; then
       echo "note: the old template job com.example.ai-cli-auto-update is still installed; remove it with:"
       echo "  launchctl unload ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist && rm ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist"
@@ -143,12 +157,12 @@ schedule_install() {
   else
     command -v crontab >/dev/null 2>&1 || { echo "crontab is not available" >&2; exit 1; }
     local lines="" q_update q_clean q_inventory q_targets=""
-    q_update="$(printf '%q' "$BIN_DIR/update_ai_clis.sh")"
-    q_clean="$(printf '%q' "$BIN_DIR/clean_ai_leftovers.sh")"
-    q_inventory="$(printf '%q' "$BIN_DIR/inventory_ai_clis.sh")"
+    q_update="$(printf '%q' "$app/bin/update_ai_clis.sh")"
+    q_clean="$(printf '%q' "$app/bin/clean_ai_leftovers.sh")"
+    q_inventory="$(printf '%q' "$app/bin/inventory_ai_clis.sh")"
     [[ -n "$targets" ]] && q_targets=" --targets $(printf '%q' "$targets")"
     if [[ "$no_update" != true ]]; then
-      lines+="$(hm_minute "$update_at") $(hm_hour "$update_at") * * * /bin/bash $q_update$q_targets >> $(printf '%q' "$LOG_DIR/cron.update.log") 2>&1 # aicm:update"$'\n'
+      lines+="$(hm_minute "$update_at") $retry_hours * * * /bin/bash $q_update --scheduled$q_targets >> $(printf '%q' "$LOG_DIR/cron.update.log") 2>&1 # aicm:update"$'\n'
       jobs+='"update",'
     fi
     if [[ "$no_inventory" != true ]]; then
@@ -164,7 +178,7 @@ schedule_install() {
     { [[ -n "$current" ]] && printf '%s\n' "$current"; printf '%s' "$lines"; } | crontab -
     printf '%s' "$lines" | sed 's/^/registered: /'
   fi
-  aicm_state_write schedule "{\"installedAt\":\"$(aicm_ts)\",\"version\":\"$(aicm_version)\",\"jobs\":[${jobs%,}]}"
+  aicm_state_write schedule "{\"installedAt\":\"$(aicm_ts)\",\"version\":\"$(aicm_version)\",\"app\":\"$(aicm_json_escape "$app")\",\"source\":\"$(aicm_json_escape "$AICM_ROOT")\",\"jobs\":[${jobs%,}]}"
   echo "Each run checks that the other jobs still exist and shows a desktop notification if one is gone."
 }
 
@@ -192,7 +206,7 @@ schedule_show() {
 
 doctor() {
   local problems=() p jobs
-  while IFS= read -r p; do [[ -n "$p" ]] && problems+=("$p"); done < <(aicm_schedule_problems "")
+  while IFS= read -r p; do [[ -n "$p" ]] && problems+=("$p"); done < <(aicm_schedule_problems "" nostale)
   jobs="$(scheduled_jobs)"
   if [[ -z "$jobs" ]]; then problems+=("no schedule installed; run: aicm schedule install"); fi
   if grep -qx update <<< "$jobs"; then
@@ -263,6 +277,19 @@ case "$cmd" in
       show) schedule_show ;;
       *) echo "unknown schedule action: $action (use install, remove or show)" >&2; exit 2 ;;
     esac
+    ;;
+  uninstall)
+    # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless --purge.
+    schedule_remove
+    if [[ -d "$AICM_APP_DIR" && "$(cd "$AICM_ROOT" && pwd -P)" != "$(cd "$AICM_APP_DIR" && pwd -P)" ]]; then
+      rm -rf -- "${AICM_APP_DIR:?}"; echo "removed installed copy: $AICM_APP_DIR"
+    fi
+    if [[ "${1:-}" == --purge ]]; then
+      [[ "$(basename "$AICM_HOME")" == .ai-cli-auto-manager || -n "${AICM_HOME_SET:-}" ]] || { echo "refusing to purge $AICM_HOME" >&2; exit 1; }
+      rm -rf -- "${AICM_HOME:?}"; echo "removed $AICM_HOME (logs, state, archive)"
+    else
+      echo "kept $AICM_HOME (logs, state, archive, local rules); add --purge to remove it too"
+    fi
     ;;
   version|--version) echo "AI CLI Auto Manager $(aicm_version)" ;;
   help|-h|--help) usage ;;

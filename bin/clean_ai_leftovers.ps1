@@ -430,7 +430,7 @@ try {
   $problems = @($errors) + @(Get-AicmScheduleProblems -Skip 'Clean') + $wtAttention
   if ($problems.Count -gt 0) {
     foreach ($p in $problems) { Write-Host "problem: $p" }
-    if (-not $DryRun) { Send-AicmNotification 'AI CLI Auto Manager' ("cleanup needs attention: " + ($problems -join '; ')) }
+    if (-not $DryRun) { Send-AicmAttention 'clean' @($problems | ForEach-Object { "cleanup: $_" }) }
   }
   if ($errors.Count -gt 0) { $exitCode = 1 }
   if (-not $Report) {

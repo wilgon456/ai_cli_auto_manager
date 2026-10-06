@@ -41,7 +41,7 @@ out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 1 ]] && grep -q 'no schedule installed' <<< "$out" && pass "doctor flags missing schedule" || fail "doctor without schedule: $out"
 
 "$AICM" schedule install --update-at 06:15 --inventory-day wed --inventory-at 11:40 --clean-day sun --clean-at 13:05 --targets codex,claude >/dev/null
-grep -Eq '^15 6 \* \* \* .*update_ai_clis.sh --targets codex\\?,claude .*# aicm:update$' "$WORK/crontab.txt" && pass "update cron line" || fail "update cron line: $(cat "$WORK/crontab.txt")"
+grep -Eq '^15 6,9,12,15,18,21 \* \* \* /bin/bash \S*\.ai-cli-auto-manager/app/bin/update_ai_clis.sh --scheduled --targets codex\\?,claude .*# aicm:update$' "$WORK/crontab.txt" && pass "update cron line" || fail "update cron line: $(cat "$WORK/crontab.txt")"
 grep -q '^5 13 \* \* 0 .*clean_ai_leftovers.sh .*# aicm:clean$' "$WORK/crontab.txt" && pass "clean cron line (sunday = 0)" || fail "clean cron line"
 grep -q '^40 11 \* \* 3 .*inventory_ai_clis.sh .*# aicm:inventory$' "$WORK/crontab.txt" && pass "inventory cron line (wednesday = 3)" || fail "inventory cron line"
 grep -q '# keep me' "$WORK/crontab.txt" && pass "other cron lines kept" || fail "other cron line lost"
@@ -74,6 +74,14 @@ out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 out="$("$ROOT/bin/update_ai_clis.sh" --targets none 2>&1)" || true
 grep -q "notify: .*'clean' is missing" <<< "$out" && pass "update run notifies about the deleted job" || fail "update did not notify: $out"
 
+[[ -x "$AICM_HOME/app/bin/update_ai_clis.sh" && -f "$AICM_HOME/app/SOURCE" ]] && pass "jobs run an installed copy, not the clone" || fail "installed copy"
+grep -q "$AICM_HOME/app/bin/inventory_ai_clis.sh" "$WORK/crontab.txt" && pass "cron points at the installed copy" || fail "cron path"
+# A registered job that has not completed for too long is caught by the others.
+touch -t "$(date -d '-20 days' +%Y%m%d%H%M 2>/dev/null || date -v-20d +%Y%m%d%H%M)" "$AICM_HOME/state/schedule.json"
+rm -f "$AICM_HOME/state/inventory.json"
+# (the cleanup script, because the updater puts system folders first on PATH and would find a real crontab)
+out="$("$ROOT/bin/clean_ai_leftovers.sh" --dry-run --rules codex-tmp 2>&1)" || true
+grep -q "'inventory' has not completed for over 9 days" <<< "$out" && pass "a job that stopped completing is reported by another job" || fail "stale job: $out"
 "$AICM" schedule remove >/dev/null
 ! grep -q '# aicm:' "$WORK/crontab.txt" && grep -q '# keep me' "$WORK/crontab.txt" && pass "schedule remove" || fail "schedule remove"
 
@@ -83,6 +91,12 @@ if command -v node >/dev/null 2>&1; then
   "$AICM" config 2>&1 | grep -q 'MCP servers per CLI' && pass "aicm config runs the node module" || fail "aicm config"
 fi
 "$AICM" status > "$WORK/status.txt" 2>&1 || true
+"$AICM" schedule install >/dev/null
+"$AICM" uninstall >/dev/null
+! grep -q '# aicm:' "$WORK/crontab.txt" && [[ ! -d "$AICM_HOME/app" && -d "$AICM_HOME/state" ]] && pass "uninstall removes jobs and the copy, keeps state" || fail "uninstall"
+"$AICM" uninstall --purge >/dev/null
+[[ ! -d "$AICM_HOME" ]] && pass "uninstall --purge removes everything" || fail "purge"
+mkdir -p "$AICM_HOME"
 grep -q '== disk use by cleanup rule ==' "$WORK/status.txt" && grep -q 'codex-sessions' "$WORK/status.txt" && pass "status shows rules" || fail "status output"
 
 echo

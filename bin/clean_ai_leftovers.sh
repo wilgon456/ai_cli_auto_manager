@@ -61,7 +61,7 @@ if [[ -n "$SELECTED" ]]; then
   done
 fi
 
-LOCK_DIR="$(aicm_temp_dir)/ai-cli-auto-manager-clean.lockdir"
+LOCK_DIR="$(aicm_temp_dir)/ai-cli-auto-manager-clean-$(id -u).lockdir"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   if [[ -f "$LOCK_DIR/pid" ]] && kill -0 "$(cat "$LOCK_DIR/pid" 2>/dev/null)" 2>/dev/null; then
     echo "[$(aicm_ts)] another cleanup run is already active"
@@ -434,10 +434,11 @@ fi
 while IFS= read -r p; do [[ -n "$p" ]] && problems+=("$p"); done < <(aicm_schedule_problems clean)
 if ((${#problems[@]})); then
   for p in "${problems[@]}"; do echo "problem: $p"; done
-  if [[ "$DRY_RUN" != true ]]; then
-    joined="$(printf '%s; ' "${problems[@]}")"
-    aicm_notify "AI CLI Auto Manager" "cleanup needs attention: ${joined%; }"
-  fi
+fi
+if [[ "$DRY_RUN" != true ]]; then
+  notes=()
+  if ((${#problems[@]})); then for p in "${problems[@]}"; do notes+=("cleanup: $p"); done; fi
+  aicm_attention clean ${notes[@]+"${notes[@]}"}
 fi
 
 if [[ "$REPORT" != true ]]; then

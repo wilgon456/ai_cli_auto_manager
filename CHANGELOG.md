@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.5.0 - 2026-10-07
+
+Hardening for months of unattended use, from a review of real logs: the previous updater on the first
+test machine had ended with a failure on 59 of 59 days.
+
+### Fixed
+- Windows: a CLI that is running is no longer overwritten. The update is deferred (not failed) when a
+  process runs from the package folder or npm reports EBUSY/EPERM; a reminder comes after 5 days.
+- npm errors on stderr no longer abort the Windows updater before they are handled.
+- The registry being unreachable is recorded as pending, not as a failed update.
+- Worktree cleanup only trusts "every commit is on a remote" right after a successful `git fetch --prune`;
+  a branch deleted on the remote (closed PR) but still in a stale `origin/*` ref is kept.
+- Per-user lock folders on macOS/Linux (a shared /tmp lock owned by another user blocked runs).
+
+### Added
+- The update job retries every 3 hours for 15 hours (Task Scheduler repetition, launchd/cron hours);
+  a run after a complete success the same day exits immediately (`-Scheduled` / `--scheduled`).
+- npm staging leftovers (`node_modules/.<name>-XXXXXXXX`) older than a day are removed after updates.
+- Jobs run an installed copy in `~/.ai-cli-auto-manager/app`; the daily update refreshes it when the
+  source clone has a newer VERSION. Windows tasks start through `windows/run-hidden.vbs` (no window).
+- Jobs also report a scheduled job that has not completed for too long (update 3 days, others 9).
+- `aicm uninstall [--purge]`.
+
+### Changed
+- Notifications: a problem is announced when it appears, then at most once a week while it lasts.
+- State files are written atomically (temp file and rename) by all implementations.
+- Grok Build's vendor install script runs only when a newer release past the waiting period exists.
+
 ## 2.4.0 - 2026-10-07
 
 For machines that run many agent sessions at once (Paseo, Orca, ...). The new checks are Node.js

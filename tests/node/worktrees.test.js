@@ -74,6 +74,13 @@ function setup() {
   // merged but used recently
   const recent = wt('wt-recent', 'feat/recent');
   sh(repo, ['merge', '-q', '--ff-only', 'feat/recent']);
+  // pushed, then deleted on the remote by someone else (a PR closed without merging): only a stale
+  // origin/feat/stale ref is left locally, which must not count as "on a remote"
+  const stale = wt('wt-stale', 'feat/stale');
+  commit(stale, 'f.txt', 'closed PR work');
+  sh(stale, ['push', '-q', 'origin', 'feat/stale']);
+  sh(work, ['clone', '-q', remote, 'other']);
+  sh(path.join(work, 'other'), ['push', '-q', 'origin', '--delete', 'feat/stale']);
   // folder deleted by hand
   const gone = wt('wt-gone', 'feat/gone');
   fs.rmSync(gone, { recursive: true, force: true });
@@ -85,14 +92,14 @@ function setup() {
   commit(repo, 'e.txt', 'branch local');
   sh(repo, ['checkout', '-q', 'main']);
 
-  for (const p of [merged, squash, dirty, unmerged]) age(repo, p);
+  for (const p of [merged, squash, dirty, unmerged, stale]) age(repo, p);
 
   const gh = path.join(work, 'gh.js');
   fs.writeFileSync(gh, `process.stdout.write(${JSON.stringify(JSON.stringify([
     { number: 7, headRefName: 'feat/squash', headRefOid: squashSha },
     { number: 8, headRefName: 'old-squash', headRefOid: branchSquashSha },
   ]))});\n`);
-  return { work, home, root, repo, outside, linked, paths: { merged, squash, dirty, unmerged, recent }, gh };
+  return { work, home, root, repo, outside, linked, paths: { merged, squash, dirty, unmerged, recent, stale }, gh };
 }
 
 function runModule(ctx, args) {
@@ -127,12 +134,14 @@ test('apply removes only what is safely upstream', () => {
     assert.ok(fs.existsSync(path.join(ctx.paths.dirty, 'wip.txt')), 'uncommitted file kept');
     assert.ok(fs.existsSync(ctx.paths.unmerged), 'unmerged worktree kept');
     assert.ok(fs.existsSync(ctx.paths.recent), 'recent worktree kept');
+    assert.ok(fs.existsSync(ctx.paths.stale), 'work only in a stale remote-tracking ref is kept');
+    assert.ok(fs.existsSync(path.join(ctx.paths.stale, 'f.txt')), '... with its files');
     assert.ok(fs.existsSync(path.join(ctx.outside, 'precious.txt')), 'link target outside the worktree never touched');
     const branches = sh(ctx.repo, ['branch', '--format=%(refname:short)']).split(/\r?\n/);
     assert.ok(!branches.includes('feat/merged') && !branches.includes('feat/squash'), 'branches of removed worktrees deleted');
     assert.ok(!branches.includes('old-merged'), 'old merged branch deleted');
     assert.ok(!branches.includes('old-squash'), 'old squash-merged branch deleted (PR head matches)');
-    for (const b of ['main', 'old-local', 'feat/dirty', 'feat/unmerged', 'feat/recent']) assert.ok(branches.includes(b), `${b} kept`);
+    for (const b of ['main', 'old-local', 'feat/dirty', 'feat/unmerged', 'feat/recent', 'feat/stale']) assert.ok(branches.includes(b), `${b} kept`);
     assert.doesNotMatch(sh(ctx.repo, ['worktree', 'list', '--porcelain']), /wt-gone/, 'missing worktree pruned');
     assert.match(out, /removed/);
     // Announced once: a second run does not repeat the attention line.

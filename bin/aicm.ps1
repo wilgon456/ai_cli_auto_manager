@@ -17,7 +17,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('update', 'inventory', 'clean', 'worktrees', 'config', 'processes', 'status', 'doctor', 'schedule', 'version', 'help')]
+  [ValidateSet('update', 'inventory', 'clean', 'worktrees', 'config', 'processes', 'status', 'doctor', 'schedule', 'uninstall', 'version', 'help')]
   [string]$Command = 'help',
   [Parameter(Position = 1)]
   [string]$Action = '',
@@ -42,7 +42,8 @@ param(
   [switch]$Apply,
   [int]$Days = 0,
   [switch]$Kill,
-  [int]$MinAgeHours = 0
+  [int]$MinAgeHours = 0,
+  [switch]$Purge
 )
 
 Set-StrictMode -Version Latest
@@ -65,6 +66,7 @@ function Show-Help {
   Write-Host '  aicm.ps1 doctor'
   Write-Host '  aicm.ps1 schedule  install|remove|show [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
   Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean]'
+  Write-Host '  aicm.ps1 uninstall [-Purge]'
   Write-Host '  aicm.ps1 version'
 }
 
@@ -86,31 +88,39 @@ function Get-StateAgeDays($State) {
   try { return ((Get-Date) - [datetime]::Parse($State.finishedAt).ToLocalTime()).TotalDays } catch { return [double]::PositiveInfinity }
 }
 
-function New-TaskAction([string]$Script, [string[]]$Extra) {
-  $argList = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$Script`"") + $Extra
-  return (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ($argList -join ' '))
+# Tasks run the installed copy through windows\run-hidden.vbs, so no PowerShell window flashes on screen.
+function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra) {
+  $vbs = Join-Path $App 'windows\run-hidden.vbs'
+  $argList = @("`"$vbs`"", 'powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $App "bin\$Script")`"") + $Extra
+  return (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ($argList -join ' '))
 }
 
 function Install-Schedule {
   if ($NoUpdate -and $NoInventory -and $NoClean) { throw 'nothing to install: -NoUpdate, -NoInventory and -NoClean were all given' }
   $jobs = New-Object System.Collections.Generic.List[string]
+  $app = Sync-AicmAppCopy (Get-AicmRoot)
+  Write-Host "installed copy: $app (version $(Get-AicmVersion))"
   $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
   if (-not $NoUpdate) {
     $extra = @('-LogRetentionDays', "$LogRetentionDays")
     $targetText = ($Targets -join ',')
     if ($targetText) { $extra += @('-Targets', "`"$targetText`"") }
     if ($InstallMissing) { $extra += '-InstallMissing' }
-    $action = New-TaskAction (Join-Path $binDir 'update_ai_clis.ps1') $extra
+    $extra += '-Scheduled'
+    $action = New-TaskAction $app 'update_ai_clis.ps1' $extra
     $trigger = New-ScheduledTaskTrigger -Daily -At $UpdateAt
+    # Retry every 3 hours for 15 hours: a CLI that was running at 05:00 is updated once it is closed.
+    # A run after a complete success the same day exits right away.
+    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At $UpdateAt -RepetitionInterval (New-TimeSpan -Hours 3) -RepetitionDuration (New-TimeSpan -Hours 15)).Repetition
     Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Update' -Action $action -Trigger $trigger -Settings $settings -Description 'AI CLI Auto Manager: update installed AI coding CLIs' -Force | Out-Null
     $jobs.Add('Update')
-    Write-Host "registered: $($script:AicmTaskPath)Update     daily at $UpdateAt"
+    Write-Host "registered: $($script:AicmTaskPath)Update     daily at $UpdateAt (retried every 3 hours until it succeeds)"
   } elseif (Get-AicmTask 'Update') {
     Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Update' -Confirm:$false
     Write-Host "removed: $($script:AicmTaskPath)Update"
   }
   if (-not $NoInventory) {
-    $action = New-TaskAction (Join-Path $binDir 'inventory_ai_clis.ps1') @('-LogRetentionDays', "$LogRetentionDays")
+    $action = New-TaskAction $app 'inventory_ai_clis.ps1' @('-LogRetentionDays', "$LogRetentionDays")
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $InventoryDay -At $InventoryAt
     Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Inventory' -Action $action -Trigger $trigger -Settings $settings -Description 'AI CLI Auto Manager: list installed AI coding CLIs' -Force | Out-Null
     $jobs.Add('Inventory')
@@ -120,7 +130,7 @@ function Install-Schedule {
     Write-Host "removed: $($script:AicmTaskPath)Inventory"
   }
   if (-not $NoClean) {
-    $action = New-TaskAction (Join-Path $binDir 'clean_ai_leftovers.ps1') @('-LogRetentionDays', "$LogRetentionDays")
+    $action = New-TaskAction $app 'clean_ai_leftovers.ps1' @('-LogRetentionDays', "$LogRetentionDays")
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $CleanDay -At $CleanAt
     Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Clean' -Action $action -Trigger $trigger -Settings $settings -Description 'AI CLI Auto Manager: remove stale AI CLI leftovers' -Force | Out-Null
     $jobs.Add('Clean')
@@ -133,7 +143,7 @@ function Install-Schedule {
     Unregister-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -Confirm:$false
     Write-Host "removed legacy task: \$legacyTaskName (replaced by $($script:AicmTaskPath)Update)"
   }
-  Write-AicmState 'schedule' ([ordered]@{ installedAt = Get-AicmTimestamp; version = Get-AicmVersion; jobs = $jobs.ToArray() })
+  Write-AicmState 'schedule' ([ordered]@{ installedAt = Get-AicmTimestamp; version = Get-AicmVersion; app = $app; source = (Get-AicmRoot); jobs = $jobs.ToArray() })
   Write-Host 'Each run checks that the other jobs still exist and shows a desktop notification if one is gone.'
 }
 
@@ -146,6 +156,26 @@ function Remove-Schedule {
   }
   $file = Join-Path (Join-Path (Get-AicmHome) 'state') 'schedule.json'
   if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+}
+
+# Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless -Purge.
+function Invoke-Uninstall {
+  Remove-Schedule
+  if (Get-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -ErrorAction SilentlyContinue) {
+    Write-Host "note: the legacy task '\$legacyTaskName' is still registered; remove it with: Unregister-ScheduledTask -TaskName '$legacyTaskName'"
+  }
+  $app = Get-AicmAppDir
+  if ((Test-Path -LiteralPath $app) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
+    Remove-AicmTree ([System.IO.DirectoryInfo]::new($app))
+    Write-Host "removed installed copy: $app"
+  }
+  $homeDir = Get-AicmHome
+  if ($Purge) {
+    if ((Split-Path -Leaf $homeDir) -ne '.ai-cli-auto-manager' -and -not $env:AICM_HOME) { throw "refusing to purge $homeDir" }
+    if (Test-Path -LiteralPath $homeDir) { Remove-AicmTree ([System.IO.DirectoryInfo]::new($homeDir)); Write-Host "removed $homeDir (logs, state, archive)" }
+  } else {
+    Write-Host "kept $homeDir (logs, state, archive, local rules); add -Purge to remove it too"
+  }
 }
 
 function Show-Schedule {
@@ -164,7 +194,7 @@ function Show-Schedule {
 
 function Get-DoctorProblems {
   $problems = New-Object System.Collections.Generic.List[string]
-  foreach ($p in (Get-AicmScheduleProblems)) { $problems.Add($p) }
+  foreach ($p in (Get-AicmScheduleProblems -NoStale)) { $problems.Add($p) }
   $sched = Read-AicmState 'schedule'
   $jobs = if ($sched) { @($sched.jobs) } else { @() }
   $update = Read-AicmState 'last-update'
@@ -197,6 +227,7 @@ function Invoke-Child([string]$Script, [hashtable]$Splat) {
 switch ($Command) {
   'help' { Show-Help }
   'version' { Write-Host "AI CLI Auto Manager $(Get-AicmVersion)" }
+  'uninstall' { Invoke-Uninstall }
   'update' {
     $splat = @{ LogRetentionDays = $LogRetentionDays }
     if ($DryRun) { $splat.DryRun = $true }

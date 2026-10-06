@@ -61,6 +61,11 @@ function listPackages(nodeModules) {
 }
 
 function main() {
+  // FAKE_NPM_OFFLINE=1: the registry cannot be reached.
+  if (process.env.FAKE_NPM_OFFLINE === '1' && ['ping', 'view', 'install'].includes(args[0]) && !args.includes('--prefix')) {
+    console.error('npm error code ENOTFOUND\nnpm error request to https://registry.npmjs.org failed');
+    return 1;
+  }
   switch (args[0]) {
     case 'prefix': console.log(prefix); return 0;
     case 'root': console.log(root); return 0;
@@ -97,6 +102,11 @@ function main() {
       if (!version || version === 'latest') version = registry[name].latest;
       const stage = option('--prefix');
       if (args.includes('-g')) {
+        // "ebusy": a file of the installed copy is held by a running process (Windows).
+        if (registry[name].versions[version] && registry[name].versions[version].ebusy) {
+          console.error("npm error code EBUSY\nnpm error EBUSY: resource busy or locked, copyfile 'cli.exe'");
+          return 1;
+        }
         writePackage(root, name, version);
         log(`install -g ${name}@${version}`);
       } else if (stage) {

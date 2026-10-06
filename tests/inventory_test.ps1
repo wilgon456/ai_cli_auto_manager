@@ -37,7 +37,7 @@ function New-NpmCli([string]$Command, [string]$Package, [string]$Version) {
 
 function Invoke-Script([string]$Script, [string[]]$Arguments, [hashtable]$Extra = @{}) {
   $exe = (Get-Process -Id $PID).Path
-  $names = @('USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'PATH', 'AICM_MIN_RELEASE_AGE_DAYS', 'AICM_VERIFY_SIGNATURES', 'AICM_ALLOW') + @($fakeEnv.Keys)
+  $names = @('USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'PATH', 'AICM_MIN_RELEASE_AGE_DAYS', 'AICM_VERIFY_SIGNATURES', 'AICM_ALLOW') + @($fakeEnv.Keys) + @($Extra.Keys)
   $saved = @{}
   foreach ($k in $names) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
   try {
@@ -173,6 +173,57 @@ try {
   if ($r.Output -match 'new: Fake New') { Pass 'new CLI reported' } else { Fail 'new' }
   if ($r.Output -match 'updated: Fake NPM 1\.1\.0 -> 1\.2\.0') { Pass 'version change reported' } else { Fail 'updated' }
   if ($r.Output -match 'notify: .*removed: Fake Solo') { Pass 'added/removed CLIs raise a notification' } else { Fail 'notification' }
+
+  Write-Host '# a CLI that is running is deferred, not failed'
+  $reg = Get-Content -LiteralPath "$work\registry.json" -Raw | ConvertFrom-Json
+  $reg.'@fake/npmcli'.latest = '1.3.0'
+  $reg.'@fake/npmcli'.versions | Add-Member -NotePropertyName '1.3.0' -NotePropertyValue ([pscustomobject]@{ daysAgo = 10; provenance = $true })
+  $reg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$work\registry.json" -Encoding ASCII
+  $pkgDir = Join-Path $npmRoot '@fake\npmcli\'
+  # A process whose command line points into the package folder, like a running CLI session.
+  $blocker = Start-Process powershell.exe -ArgumentList '-NoProfile', '-Command', "Start-Sleep -Seconds 120 # $pkgDir" -WindowStyle Hidden -PassThru
+  try {
+    Start-Sleep -Seconds 2
+    $r = Invoke-Script $upd @('-Targets', 'fakenpm')
+    if ($r.ExitCode -eq 0 -and $r.Output -match 'deferred: @fake/npmcli is running') { Pass 'running CLI deferred, run still succeeds' } else { Fail "deferral: exit $($r.ExitCode) $($r.Output)" }
+    if ((Get-Calls) -notcontains 'install -g @fake/npmcli@1.3.0') { Pass 'nothing installed over the running CLI' } else { Fail 'installed over a running CLI' }
+    $last = Get-Content -LiteralPath "$aicmHome\state\last-update.json" -Raw | ConvertFrom-Json
+    if ($last.pending -and @($last.deferred) -contains '@fake/npmcli') { Pass 'deferral recorded as pending' } else { Fail 'pending state' }
+    if ($r.Output -notmatch 'notify:.*always running') { Pass 'no reminder on the first day' } else { Fail 'reminded too early' }
+  } finally { Stop-Process -Id $blocker.Id -Force -ErrorAction SilentlyContinue }
+
+  $reg.'@fake/npmcli'.versions.'1.3.0' | Add-Member -NotePropertyName 'ebusy' -NotePropertyValue $true
+  $reg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$work\registry.json" -Encoding ASCII
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm')
+  if ($r.ExitCode -eq 0 -and $r.Output -match 'deferred: @fake/npmcli files are in use') { Pass 'EBUSY during install deferred, not failed' } else { Fail "ebusy: exit $($r.ExitCode) $($r.Output)" }
+
+  # Deferred for 6 days: the next run reminds once.
+  $old = (Get-Date).ToUniversalTime().AddDays(-6).ToString('o')
+  "{`"@fake/npmcli`":`"$old`"}" | Set-Content -LiteralPath "$aicmHome\state\update-deferred.json" -Encoding ASCII
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm')
+  if ($r.Output -match 'notify: .*@fake/npmcli has not been updated for 6 days') { Pass 'reminder after 5+ days of deferral' } else { Fail "reminder: $($r.Output)" }
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm')
+  if ($r.Output -notmatch 'notify:') { Pass 'the same reminder is not repeated the next day' } else { Fail 'reminder repeated' }
+
+  $reg.'@fake/npmcli'.versions.'1.3.0'.ebusy = $false
+  $reg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$work\registry.json" -Encoding ASCII
+  New-Item -ItemType Directory -Path (Join-Path $npmRoot '@fake\.npmcli-AbCd1234') -Force | Out-Null
+  'x' | Set-Content -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-AbCd1234\stale.txt')
+  (Get-Item -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-AbCd1234')).LastWriteTime = (Get-Date).AddDays(-3)
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm', '-Scheduled')
+  if ((Get-Calls) -contains 'install -g @fake/npmcli@1.3.0') { Pass 'scheduled retry installs once the CLI is free' } else { Fail "retry: $($r.Output)" }
+  if (-not (Test-Path -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-AbCd1234'))) { Pass 'npm staging leftover removed' } else { Fail 'npm leftover kept' }
+  $deferredNow = Get-Content -LiteralPath "$aicmHome\state\update-deferred.json" -Raw | ConvertFrom-Json
+  if (@($deferredNow.PSObject.Properties).Count -eq 0) { Pass 'deferral cleared after the update' } else { Fail 'deferral not cleared' }
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm', '-Scheduled')
+  if ($r.Output -match 'already updated today') { Pass 'later scheduled run the same day exits at once' } else { Fail "early exit: $($r.Output)" }
+
+  Write-Host '# registry unreachable: skipped, not failed'
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm') @{ FAKE_NPM_OFFLINE = '1' }
+  $last = Get-Content -LiteralPath "$aicmHome\state\last-update.json" -Raw | ConvertFrom-Json
+  if ($r.ExitCode -eq 0 -and $r.Output -match 'registry unreachable' -and $last.pending) { Pass 'offline run succeeds and stays pending' } else { Fail "offline: exit $($r.ExitCode) $($r.Output)" }
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm', '-Scheduled')
+  if ($r.Output -notmatch 'already updated today') { Pass 'a pending day is retried by the scheduled run' } else { Fail 'pending day not retried' }
 
   Write-Host '# bad catalog'
   'Bad Id | x | x |  |  |  |  |' | Set-Content -LiteralPath "$work\bad.conf" -Encoding UTF8

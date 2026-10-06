@@ -146,6 +146,19 @@ grep -q 'new: Fake New' <<< "$out" && pass "new CLI reported" || fail "new"
 grep -q 'updated: Fake NPM 1.1.0 -> 1.2.0' <<< "$out" && pass "version change reported" || fail "updated"
 grep -q 'notify: .*removed: Fake Solo' <<< "$out" && pass "added/removed CLIs raise a notification" || fail "notification"
 
+echo "# retries, registry outages and npm leftovers"
+mkdir -p "$FAKE_NPM_ROOT/@fake/.npmcli-AbCd1234"
+echo x > "$FAKE_NPM_ROOT/@fake/.npmcli-AbCd1234/stale.txt"
+touch -t "$(date -d '-3 days' +%Y%m%d%H%M 2>/dev/null || date -v-3d +%Y%m%d%H%M)" "$FAKE_NPM_ROOT/@fake/.npmcli-AbCd1234"
+"$UPD" --targets fakenpm >/dev/null 2>&1 || true
+[[ ! -e "$FAKE_NPM_ROOT/@fake/.npmcli-AbCd1234" ]] && pass "npm staging leftover removed" || fail "npm leftover kept"
+out="$("$UPD" --targets fakenpm --scheduled 2>&1)" || true
+grep -q 'already updated today' <<< "$out" && pass "later scheduled run the same day exits at once" || fail "early exit: $out"
+out="$(FAKE_NPM_OFFLINE=1 "$UPD" --targets fakenpm 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -q 'registry unreachable' <<< "$out" && grep -q '"pending":true' "$AICM_HOME/state/last-update.json" && pass "offline run succeeds and stays pending" || fail "offline: rc=$rc $out"
+out="$("$UPD" --targets fakenpm --scheduled 2>&1)" || true
+! grep -q 'already updated today' <<< "$out" && pass "a pending day is retried by the scheduled run" || fail "pending day not retried"
+
 echo "# bad catalog"
 printf 'Bad Id | x | x |  |  |  |  |\n' > "$WORK/bad.conf"
 if "$ROOT/bin/inventory_ai_clis.sh" --catalog-file "$WORK/bad.conf" >/dev/null 2>&1; then fail "bad catalog accepted"; else pass "bad catalog rejected"; fi
