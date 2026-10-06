@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.3.0 - 2026-10-06
+
+### Changed
+- Conversation history unused for 30 days is deleted instead of archived by default:
+  `codex-sessions` deletes with `codex delete --force` after 30 days (`limit` 0 = no archive stage),
+  `gemini-tmp`, `qwen-tmp`, `grok-sessions`, `copilot-sessions` are plain 30-day `age` rules.
+- `claude-transcripts` is off by default: Claude Code deletes its own transcripts (`cleanupPeriodDays`).
+  Turning it on archives them a week before that.
+- `claude-temp` age is 1 day.
+- The README is in English; the Korean README moved to `README.ko.md`.
+
+### Added
+- `codex` rules accept `limit` 0 (delete directly after `days`).
+- Archive folders older than the rule's `limit` are purged even when the archive rule is off,
+  so remnants never stay behind.
+
 ## 2.2.1 - 2026-10-06
 
 ### Fixed

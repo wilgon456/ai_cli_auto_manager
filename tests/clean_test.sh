@@ -115,6 +115,8 @@ fi
 
 cat > "$AICM_HOME/clean-rules.local.conf" <<'EOF'
 codex-trace-db      | all   | cap         | ~/.codex                | logs_*.sqlite | 30 | 1 | on |
+codex-sessions      | all   | codex       | ~/.codex                | rollout-*     | 30 | 60 | on |
+claude-transcripts  | all   | archive     | ~/.claude/projects      | *.jsonl       | 30 | 60 | on |
 playwright-browsers | linux | keep-latest | {cache}/ms-playwright   | *             |    | 2 | on |
 escape-home         | all   | age         | ~/../escape             | *             | 1  |   | on |
 home-itself         | all   | age         | ~                       | *             | 1  |   | on |
@@ -190,6 +192,19 @@ else
   grep -q 'codex command not found: nothing touched' "$WORK/nocodex.txt" && pass "missing codex command reported" || fail "missing codex"
   expect_exists "$HOME/.codex/sessions/2026/07/01/rollout-2026-07-01T10-00-00-$U2.jsonl" "codex files kept without the codex command"
 fi
+
+echo "# defaults: Codex sessions deleted after 30 days, Claude transcripts left to Claude, archive remnants purged"
+grep -v -e '^codex-sessions' -e '^claude-transcripts' "$AICM_HOME/clean-rules.local.conf" > "$WORK/local.conf"; mv "$WORK/local.conf" "$AICM_HOME/clean-rules.local.conf"
+U7=77777777-7777-4777-8777-777777777777
+make_file "$HOME/.codex/sessions/2026/08/02/rollout-2026-08-02T10-00-00-$U7.jsonl" 40
+make_file "$HOME/.claude/projects/q/old.jsonl" 40
+make_file "$AICM_HOME/archive/claude-transcripts/20200102/q/ancient.jsonl" 2000
+: > "$WORK/codex-calls.log"
+"$ROOT/bin/clean_ai_leftovers.sh" --rules codex-sessions > /dev/null 2>&1 || true
+grep -qx "delete --force $U7" "$WORK/codex-calls.log" && ! grep -q "^archive" "$WORK/codex-calls.log" && pass "default: unused 30+ days goes straight to codex delete" || fail "default codex delete: $(cat "$WORK/codex-calls.log")"
+"$ROOT/bin/clean_ai_leftovers.sh" > /dev/null 2>&1 || true
+expect_exists "$HOME/.claude/projects/q/old.jsonl" "default: Claude transcripts left to Claude's own cleanup"
+expect_gone "$AICM_HOME/archive/claude-transcripts/20200102" "default: old archive remnants purged although the rule is off"
 
 echo "# explicit rule runs even when off"
 "$ROOT/bin/clean_ai_leftovers.sh" --rules codex-images >/dev/null 2>&1 || true

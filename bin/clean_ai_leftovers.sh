@@ -201,8 +201,9 @@ purge_archive() { # archive_dir days dry
 
 # Session files older than the archive age move to ~/.ai-cli-auto-manager/archive/<rule>/<today>/,
 # keeping their relative path; archive folders older than <limit> days are deleted.
-run_archive_rule() { # root id pattern days limit dry
-  local root="$1" id="$2" pattern="$3" days="$4" limit="$5" dry="$6" adays native list f rel target size dest
+# Old archive folders are purged even when the rule is off (purge_dry), so remnants never stay behind.
+run_archive_rule() { # root id pattern days limit dry purge_dry
+  local root="$1" id="$2" pattern="$3" days="$4" limit="$5" dry="$6" purge_dry="$7" adays native list f rel target size dest
   adays="$(aicm_archive_days "$id" "$days")"
   native="$(aicm_native_retention_days "$id")"
   [[ "$adays" != "$days" ]] && R_DETAIL="archive after ${adays}d (the CLI deletes after ${native}d)"
@@ -227,7 +228,7 @@ run_archive_rule() { # root id pattern days limit dry
     find "$root" -mindepth 1 -type d -empty -delete 2>/dev/null || true
   fi
   rm -f "$list"
-  purge_archive "$AICM_HOME/archive/$id" "$limit" "$dry"
+  purge_archive "$AICM_HOME/archive/$id" "$limit" "$purge_dry"
 }
 
 codex_id() { [[ "$1" =~ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) ]] && printf '%s' "${BASH_REMATCH[1]}"; }
@@ -242,6 +243,8 @@ run_codex_rule() { # root days limit dry
   arch="$(mktemp)"; del="$(mktemp)"; threads="$(mktemp)"
   [[ -d "$root/sessions" ]] && find "$root/sessions" -type f -name 'rollout-*' -mmin +"$((days * 1440))" -print0 2>/dev/null > "$arch"
   [[ -d "$root/archived_sessions" ]] && find "$root/archived_sessions" -type f -name 'rollout-*' -mmin +"$(((days + limit) * 1440))" -print0 2>/dev/null > "$del"
+  # limit 0: no archive stage, sessions unused for <days> are deleted right away.
+  if ((limit == 0)); then cat "$arch" >> "$del"; : > "$arch"; fi
   if aicm_codex_threads "$root" > "$threads"; then
     now="$(date +%s)"; cut=$((now - (days + limit) * 86400))
     while IFS=$'\t' read -r id rollout updated _archived; do
@@ -339,7 +342,7 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
         age) run_age_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
         cap) run_cap_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
         keep-latest) run_keep_latest_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
-        archive) run_archive_rule "$root" "$id" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
+        archive) run_archive_rule "$root" "$id" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" "$DRY_RUN" ;;
         codex) run_codex_rule "$root" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
       esac
       if [[ "$enabled" != 1 ]]; then R_STATUS=off
@@ -353,7 +356,7 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
   # Archiving moves files; only deletions free space.
   is_archive=false; [[ "$kind" == archive || "$kind" == codex ]] && is_archive=true
   if [[ "$enabled" != 1 ]]; then
-    if [[ "$is_archive" == true ]]; then off_bytes=$((off_bytes + R_PURGE_BYTES)); else off_bytes=$((off_bytes + R_BYTES)); fi
+    if [[ "$is_archive" == true ]]; then freed_bytes=$((freed_bytes + R_PURGED_BYTES)); else off_bytes=$((off_bytes + R_BYTES)); fi
   elif [[ "$is_archive" == true ]]; then
     planned_bytes=$((planned_bytes + R_PURGE_BYTES)); freed_bytes=$((freed_bytes + R_PURGED_BYTES))
     archive_bytes=$((archive_bytes + R_BYTES)); archived_bytes=$((archived_bytes + R_REMOVED_BYTES))

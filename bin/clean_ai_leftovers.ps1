@@ -134,7 +134,7 @@ function New-ArchiveResult {
 }
 
 # Archive date folders (archive\<rule>\yyyyMMdd) older than $Days are removed.
-function Invoke-ArchivePurge($Result, [string]$ArchiveDir, [int]$Days) {
+function Invoke-ArchivePurge($Result, [string]$ArchiveDir, [int]$Days, [bool]$PurgeDry) {
   if (-not (Test-Path -LiteralPath $ArchiveDir -PathType Container)) { return }
   $cutoff = (Get-Date).Date.AddDays(-$Days)
   foreach ($d in ([System.IO.DirectoryInfo]::new($ArchiveDir)).GetDirectories()) {
@@ -145,14 +145,15 @@ function Invoke-ArchivePurge($Result, [string]$ArchiveDir, [int]$Days) {
     $bytes = Get-TreeBytes $d.FullName
     $Result.purge++
     $Result.purgeBytes += $bytes
-    if ($DryRun) { continue }
+    if ($PurgeDry) { continue }
     try { Remove-AicmTree $d; $Result.purged++; $Result.purgedBytes += $bytes } catch { $Result.inUse++ }
   }
 }
 
 # Session files older than the archive age move to ~/.ai-cli-auto-manager/archive/<rule>/<today>/,
 # keeping their relative path; archive folders older than the rule's limit are deleted.
-function Invoke-ArchiveRule($Rule, [string]$Root) {
+# Old archive folders are purged even when the rule is off, so remnants never stay behind.
+function Invoke-ArchiveRule($Rule, [string]$Root, [bool]$PurgeDry) {
   $result = New-ArchiveResult
   $days = Get-AicmArchiveDays $Rule
   if ($days -ne $Rule.Days) { $result.detail = "archive after ${days}d (the CLI deletes after $(Get-AicmNativeRetentionDays $Rule.Id)d)" }
@@ -179,7 +180,7 @@ function Invoke-ArchiveRule($Rule, [string]$Root) {
     }
     [void](Remove-AicmEmptyDirs $Root)
   }
-  Invoke-ArchivePurge $result $archiveDir $Rule.Limit
+  Invoke-ArchivePurge $result $archiveDir $Rule.Limit $PurgeDry
   return $result
 }
 
@@ -194,14 +195,17 @@ function Invoke-CodexRule($Rule, [string]$Root) {
   $now = Get-Date
   $archiveCut = $now.AddDays(-$Rule.Days)
   $deleteCut = $now.AddDays(-($Rule.Days + $Rule.Limit))
-  $toArchive = @()
+  $old = @()
   if (Test-Path -LiteralPath (Join-Path $Root 'sessions')) {
-    $toArchive = @(Get-AicmFiles (Join-Path $Root 'sessions') 'rollout-*' | Where-Object { $_.LastWriteTime -lt $archiveCut -and (Get-AicmCodexId $_.Name) })
+    $old = @(Get-AicmFiles (Join-Path $Root 'sessions') 'rollout-*' | Where-Object { $_.LastWriteTime -lt $archiveCut -and (Get-AicmCodexId $_.Name) })
   }
   $toDelete = @()
   if (Test-Path -LiteralPath (Join-Path $Root 'archived_sessions')) {
     $toDelete = @(Get-AicmFiles (Join-Path $Root 'archived_sessions') 'rollout-*' | Where-Object { $_.LastWriteTime -lt $deleteCut -and (Get-AicmCodexId $_.Name) })
   }
+  # limit 0: no archive stage, sessions unused for Days are deleted right away.
+  $toArchive = $old
+  if ($Rule.Limit -eq 0) { $toDelete = @($toDelete) + @($old); $toArchive = @() }
   $threads = Get-AicmCodexThreads $Root
   $orphans = @()
   if ($threads) {
@@ -334,7 +338,7 @@ try {
               'age' { Invoke-AgeRule $rule $root }
               'cap' { Invoke-CapRule $rule $root }
               'keep-latest' { Invoke-KeepLatestRule $rule $root }
-              'archive' { Invoke-ArchiveRule $rule $root }
+              'archive' { Invoke-ArchiveRule $rule $root $wasDry }
               'codex' { Invoke-CodexRule $rule $root }
             }
           } finally { $DryRun = $wasDry }
@@ -374,7 +378,10 @@ try {
   $plannedBytes = 0L; $freedBytes = 0L; $offBytes = 0L; $archiveBytes = 0L; $archivedBytes = 0L
   foreach ($row in $rows) {
     $isArchive = @('archive', 'codex') -contains $row.kind
-    if (-not $row.enabled) { $offBytes += $(if ($isArchive) { $row.purgeBytes } else { $row.bytes }); continue }
+    if (-not $row.enabled) {
+      if ($isArchive) { $freedBytes += $row.purgedBytes } else { $offBytes += $row.bytes }
+      continue
+    }
     if ($isArchive) {
       $plannedBytes += $row.purgeBytes; $freedBytes += $row.purgedBytes
       $archiveBytes += $row.bytes; $archivedBytes += $row.removedBytes
