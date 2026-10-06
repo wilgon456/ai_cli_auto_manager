@@ -175,7 +175,7 @@ function ConvertFrom-AicmRuleLine([string]$Line, [string]$Source) {
   if ($cols.Count -lt 8) { throw "invalid rule in ${Source}: expected 9 columns: $t" }
   while ($cols.Count -lt 9) { $cols += '' }
   $kind = $cols[2].ToLowerInvariant()
-  if (@('age', 'cap', 'keep-latest', 'command') -notcontains $kind) { throw "invalid rule kind '$kind' in ${Source}: $t" }
+  if (@('age', 'cap', 'keep-latest', 'command', 'archive', 'codex') -notcontains $kind) { throw "invalid rule kind '$kind' in ${Source}: $t" }
   $default = $cols[7].ToLowerInvariant()
   if (@('on', 'off') -notcontains $default) { throw "invalid default '$default' in ${Source}: $t" }
   $days = 0
@@ -184,6 +184,7 @@ function ConvertFrom-AicmRuleLine([string]$Line, [string]$Source) {
   if ($cols[6]) { $limit = [int]$cols[6] }
   if ($kind -eq 'age' -and $days -lt 1) { throw "age rule needs days >= 1 in ${Source}: $t" }
   if ($kind -eq 'keep-latest' -and $limit -lt 1) { throw "keep-latest rule needs limit >= 1 in ${Source}: $t" }
+  if (@('archive', 'codex') -contains $kind -and ($days -lt 1 -or $limit -lt 1)) { throw "$kind rule needs days >= 1 (archive after) and limit >= 1 (delete after) in ${Source}: $t" }
   return [pscustomobject]@{
     Id = $cols[0]; Os = $cols[1].ToLowerInvariant(); Kind = $kind; Path = $cols[3]; Pattern = $(if ($cols[4]) { $cols[4] } else { '*' })
     Days = $days; Limit = $limit; Enabled = ($default -eq 'on'); Note = $cols[8]; Source = $Source
@@ -234,6 +235,86 @@ function Send-AicmNotification([string]$Title, [string]$Body) {
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show([Windows.UI.Notifications.ToastNotification]::new($xml))
   } catch {
     Write-Host "warn: desktop notification unavailable: $($_.Exception.Message)"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Archive lifecycle helpers
+# ---------------------------------------------------------------------------
+
+function Get-AicmArchiveRoot {
+  return (Join-Path (Get-AicmHome) 'archive')
+}
+
+# Days after which the CLI deletes these files itself (0 when it does not). The archive step has to
+# run before that, and the cleanup runs weekly, so it archives a week earlier than the CLI deletes.
+function Get-AicmNativeRetentionDays([string]$RuleId) {
+  $userHome = Get-AicmUserHome
+  $read = {
+    param($File, $Pattern)
+    if (-not (Test-Path -LiteralPath $File)) { return $null }
+    $text = Get-Content -LiteralPath $File -Raw -ErrorAction SilentlyContinue
+    if ($text -and $text -match $Pattern) { return $Matches }
+    return $null
+  }
+  switch ($RuleId) {
+    'claude-transcripts' {
+      $m = & $read (Join-Path $userHome '.claude\settings.json') '"cleanupPeriodDays"\s*:\s*(\d+)'
+      if ($m) { return [int]$m[1] }
+      return 30
+    }
+    'gemini-tmp' {
+      $m = & $read (Join-Path $userHome '.gemini\settings.json') '"maxAge"\s*:\s*"(\d+)([hdw])"'
+      if ($m) { switch ($m[2]) { 'h' { return [int][Math]::Ceiling([int]$m[1] / 24) } 'w' { return [int]$m[1] * 7 } default { return [int]$m[1] } } }
+      return 30
+    }
+    'qwen-tmp' {
+      $m = & $read (Join-Path $userHome '.qwen\settings.json') '"cleanupPeriodDays"\s*:\s*(\d+)'
+      if ($m) { return [int]$m[1] }
+      return 30
+    }
+  }
+  return 0
+}
+
+function Get-AicmArchiveDays($Rule) {
+  $native = Get-AicmNativeRetentionDays $Rule.Id
+  if ($native -gt 0) { return [Math]::Max(1, [Math]::Min($Rule.Days, $native - 8)) }
+  return $Rule.Days
+}
+
+function Get-AicmCodexId([string]$Name) {
+  if ($Name -match '([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})') { return $Matches[1] }
+  return ''
+}
+
+# Codex threads from its state DB (read-only): id -> rollout path, last update (unix seconds), archived.
+# Needs Python with sqlite3; returns $null when that is not available or the layout is unknown.
+function Get-AicmCodexThreads([string]$CodexHome) {
+  if ($env:AICM_CODEX_DB_READER -eq '0') { return $null }
+  $db = Get-ChildItem -LiteralPath $CodexHome -Filter 'state_*.sqlite' -File -ErrorAction SilentlyContinue |
+    Sort-Object { [int](($_.BaseName -split '_')[-1]) } -Descending | Select-Object -First 1
+  if (-not $db) { return $null }
+  $python = @('python', 'python3', 'py') | Where-Object { Resolve-AicmExecutable $_ } | Select-Object -First 1
+  if (-not $python) { return $null }
+  $code = "import sqlite3,sys`ncon=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)`nfor r in con.execute('select id, rollout_path, updated_at, archived from threads'):`n    print('\t'.join('' if v is None else str(v) for v in r))"
+  $script = [System.IO.Path]::GetTempFileName() + '.py'
+  [System.IO.File]::WriteAllText($script, $code)
+  try {
+    $r = Invoke-AicmWithTimeout $python @($script, $db.FullName) 120
+    if ($r.ExitCode -ne 0) { return $null }
+    $threads = @{}
+    foreach ($line in ($r.Output -split "`r?`n")) {
+      $c = $line.Split("`t")
+      if ($c.Count -lt 4 -or -not $c[0]) { continue }
+      $u = 0.0
+      [void][double]::TryParse($c[2], [ref]$u)
+      if ($u -gt 1e11) { $u = $u / 1000 }
+      $threads[$c[0]] = [pscustomobject]@{ Rollout = $c[1]; Updated = $u; Archived = ($c[3] -eq '1') }
+    }
+    return $threads
+  } finally {
+    Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -455,4 +536,71 @@ function Get-AicmUpdateCoverage($Entry, $Install) {
     }
   }
   return 'no'
+}
+
+# ---------------------------------------------------------------------------
+# Release checks for npm installs (logic in lib\npm-guard.js, shared with macOS/Linux)
+#   AICM_MIN_RELEASE_AGE_DAYS  only install versions at least this old (default 3, 0 = newest)
+#   AICM_VERIFY_SIGNATURES     0 skips the staged `npm audit signatures` check (default on)
+#   AICM_ALLOW                 comma list of pkg@version accepted despite red flags
+# ---------------------------------------------------------------------------
+
+function Get-AicmMinReleaseAgeDays {
+  if ($env:AICM_MIN_RELEASE_AGE_DAYS -match '^\d+$') { return [int]$env:AICM_MIN_RELEASE_AGE_DAYS }
+  return 3
+}
+
+function Invoke-AicmNpmGuard([string[]]$Arguments) {
+  $guard = Join-Path (Get-AicmRoot) 'lib\npm-guard.js'
+  $r = Invoke-AicmWithTimeout 'node' (@($guard) + $Arguments) 60
+  if ($r.ExitCode -ne 0) { throw "npm-guard failed: $($r.Output.Trim())" }
+  return @($r.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Save-AicmNpmView([string[]]$Arguments) {
+  $r = Invoke-AicmWithTimeout 'npm' (@('view') + $Arguments + @('--json')) 90
+  if ($r.ExitCode -ne 0) { throw "npm view $($Arguments -join ' ') failed: $($r.Output.Trim())" }
+  $file = [System.IO.Path]::GetTempFileName()
+  [System.IO.File]::WriteAllText($file, $r.Output)
+  return $file
+}
+
+# The version to install: the newest stable release that is at least N days old ('' when none is).
+function Get-AicmNpmTarget([string]$Package, [int]$MinAgeDays) {
+  if ($MinAgeDays -le 0) {
+    $r = Invoke-AicmWithTimeout 'npm' @('view', $Package, 'version') 60
+    return (Get-AicmSemver $r.Output)
+  }
+  $view = Save-AicmNpmView @($Package, 'time', 'dist-tags')
+  try { return (@(Invoke-AicmNpmGuard @('pick', "$MinAgeDays", $view)) | Select-Object -First 1) }
+  finally { Remove-Item -LiteralPath $view -Force -ErrorAction SilentlyContinue }
+}
+
+# Throws when the candidate looks unlike the installed release or fails the registry signature check.
+function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Target) {
+  $allowed = @(($env:AICM_ALLOW -split ',') | ForEach-Object { $_.Trim() }) -contains "$Package@$Target"
+  if ($Installed) {
+    $old = Save-AicmNpmView @("$Package@$Installed")
+    $new = Save-AicmNpmView @("$Package@$Target")
+    try { $flags = @(Invoke-AicmNpmGuard @('compare', $old, $new)) }
+    finally { Remove-Item -LiteralPath $old, $new -Force -ErrorAction SilentlyContinue }
+    foreach ($f in $flags) { Write-Host "red flag: $Package $f" }
+    if ($flags.Count -gt 0 -and -not $allowed) {
+      throw "blocked $Package@$Target ($($flags -join '; ')). If this is expected, set AICM_ALLOW=$Package@$Target"
+    }
+  }
+  if ($env:AICM_VERIFY_SIGNATURES -eq '0') { return }
+  $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('aicm-stage-' + [guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Path $stage -Force | Out-Null
+  try {
+    # --ignore-scripts: nothing from the candidate runs before it has passed the checks.
+    $r = Invoke-AicmWithTimeout 'npm' @('install', "$Package@$Target", '--prefix', $stage, '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error') 900
+    if ($r.ExitCode -ne 0) { throw "staged install of $Package@$Target failed: $($r.Output.Trim())" }
+    $r = Invoke-AicmWithTimeout 'npm' @('audit', 'signatures', '--prefix', $stage) 300
+    $summary = @($r.Output -split "`r?`n" | Where-Object { $_.Trim() }) -join ' / '
+    if ($r.ExitCode -ne 0) { throw "signature check failed for $Package@${Target}: $summary" }
+    Write-Host "signatures ok: $summary"
+  } finally {
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }

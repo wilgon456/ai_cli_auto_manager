@@ -129,6 +129,118 @@ function Invoke-KeepLatestRule($Rule, [string]$Root) {
   return $result
 }
 
+function New-ArchiveResult {
+  return [ordered]@{ files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; purge = 0; purgeBytes = 0L; purged = 0; purgedBytes = 0L; detail = '' }
+}
+
+# Archive date folders (archive\<rule>\yyyyMMdd) older than $Days are removed.
+function Invoke-ArchivePurge($Result, [string]$ArchiveDir, [int]$Days) {
+  if (-not (Test-Path -LiteralPath $ArchiveDir -PathType Container)) { return }
+  $cutoff = (Get-Date).Date.AddDays(-$Days)
+  foreach ($d in ([System.IO.DirectoryInfo]::new($ArchiveDir)).GetDirectories()) {
+    if (Test-AicmLink $d) { continue }
+    $when = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($d.Name, 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$when)) { continue }
+    if ($when -ge $cutoff) { continue }
+    $bytes = Get-TreeBytes $d.FullName
+    $Result.purge++
+    $Result.purgeBytes += $bytes
+    if ($DryRun) { continue }
+    try { Remove-AicmTree $d; $Result.purged++; $Result.purgedBytes += $bytes } catch { $Result.inUse++ }
+  }
+}
+
+# Session files older than the archive age move to ~/.ai-cli-auto-manager/archive/<rule>/<today>/,
+# keeping their relative path; archive folders older than the rule's limit are deleted.
+function Invoke-ArchiveRule($Rule, [string]$Root) {
+  $result = New-ArchiveResult
+  $days = Get-AicmArchiveDays $Rule
+  if ($days -ne $Rule.Days) { $result.detail = "archive after ${days}d (the CLI deletes after $(Get-AicmNativeRetentionDays $Rule.Id)d)" }
+  $cutoff = (Get-Date).AddDays(-$days)
+  $candidates = @(Get-AicmFiles $Root $Rule.Pattern | Where-Object { $_.LastWriteTime -lt $cutoff -and -not (Test-AicmProtected $_) })
+  $result.files = $candidates.Count
+  foreach ($f in $candidates) { $result.bytes += $f.Length }
+  $archiveDir = Join-Path (Get-AicmArchiveRoot) $Rule.Id
+  if (-not $DryRun -and $candidates.Count -gt 0) {
+    $dest = Join-Path $archiveDir (Get-Date -Format 'yyyyMMdd')
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    foreach ($f in $candidates) {
+      $target = Join-Path $dest $f.FullName.Substring($rootFull.Length + 1)
+      try {
+        Initialize-AicmDirectory (Split-Path -Parent $target)
+        if (Test-Path -LiteralPath $target) { $target = $target + '.' + [guid]::NewGuid().ToString('N').Substring(0, 6) }
+        $len = $f.Length
+        [System.IO.File]::Move($f.FullName, $target)
+        $result.removed++
+        $result.removedBytes += $len
+      } catch {
+        $result.inUse++
+      }
+    }
+    [void](Remove-AicmEmptyDirs $Root)
+  }
+  Invoke-ArchivePurge $result $archiveDir $Rule.Limit
+  return $result
+}
+
+# Codex keeps every session in its own database as well as in rollout files, so files are never
+# deleted directly: `codex archive` after Days, `codex delete --force` once a session has been
+# unused for Days + Limit. Threads whose file is already gone count as archived and are deleted
+# on the same schedule (needs Python to read the database; skipped otherwise).
+function Invoke-CodexRule($Rule, [string]$Root) {
+  $result = New-ArchiveResult
+  $codex = Resolve-AicmExecutable 'codex'
+  if (-not $codex) { $result.detail = 'codex command not found: nothing touched'; return $result }
+  $now = Get-Date
+  $archiveCut = $now.AddDays(-$Rule.Days)
+  $deleteCut = $now.AddDays(-($Rule.Days + $Rule.Limit))
+  $toArchive = @()
+  if (Test-Path -LiteralPath (Join-Path $Root 'sessions')) {
+    $toArchive = @(Get-AicmFiles (Join-Path $Root 'sessions') 'rollout-*' | Where-Object { $_.LastWriteTime -lt $archiveCut -and (Get-AicmCodexId $_.Name) })
+  }
+  $toDelete = @()
+  if (Test-Path -LiteralPath (Join-Path $Root 'archived_sessions')) {
+    $toDelete = @(Get-AicmFiles (Join-Path $Root 'archived_sessions') 'rollout-*' | Where-Object { $_.LastWriteTime -lt $deleteCut -and (Get-AicmCodexId $_.Name) })
+  }
+  $threads = Get-AicmCodexThreads $Root
+  $orphans = @()
+  if ($threads) {
+    $epochCut = ($deleteCut.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
+    foreach ($id in $threads.Keys) {
+      $t = $threads[$id]
+      if ($t.Rollout -and -not (Test-Path -LiteralPath $t.Rollout) -and $t.Updated -gt 0 -and $t.Updated -lt $epochCut) { $orphans += $id }
+    }
+  } else {
+    $result.detail = 'Codex database not read (Python not found): sessions whose file is already gone are left alone'
+  }
+  $result.files = $toArchive.Count
+  foreach ($f in $toArchive) { $result.bytes += $f.Length }
+  $result.purge = $toDelete.Count + $orphans.Count
+  foreach ($f in $toDelete) { $result.purgeBytes += $f.Length }
+  if ($orphans.Count -gt 0) { $result.detail = "$($orphans.Count) of the deletions are sessions whose file is already gone" }
+  if ($DryRun) { return $result }
+
+  foreach ($f in $toArchive) {
+    $len = $f.Length
+    $r = Invoke-AicmWithTimeout $codex @('archive', (Get-AicmCodexId $f.Name)) 120
+    if ($r.ExitCode -eq 0) { $result.removed++; $result.removedBytes += $len } else { $result.inUse++ }
+  }
+  foreach ($f in $toDelete) {
+    $id = Get-AicmCodexId $f.Name
+    $len = $f.Length
+    $r = Invoke-AicmWithTimeout $codex @('delete', '--force', $id) 120
+    if ($r.ExitCode -eq 0) { $result.purged++; $result.purgedBytes += $len; continue }
+    # A file Codex does not know (older layout) cannot be orphaned; remove it directly.
+    if ($threads -and -not $threads.ContainsKey($id) -and (Remove-FileQuietly $f)) { $result.purged++; $result.purgedBytes += $len; continue }
+    $result.inUse++
+  }
+  foreach ($id in $orphans) {
+    $r = Invoke-AicmWithTimeout $codex @('delete', '--force', $id) 120
+    if ($r.ExitCode -eq 0) { $result.purged++ } else { $result.inUse++ }
+  }
+  return $result
+}
+
 function Invoke-CommandRule($Rule) {
   $cmd = Get-Command $Rule.Path -ErrorAction SilentlyContinue
   if (-not $cmd) { return [ordered]@{ status = 'not installed' } }
@@ -189,7 +301,8 @@ try {
   foreach ($rule in $allRules) {
     $explicit = $selected -contains $rule.Id
     if ($selected.Count -gt 0 -and -not $explicit) { continue }
-    $row = [ordered]@{ id = $rule.Id; kind = $rule.Kind; enabled = ($rule.Enabled -or $explicit); path = $rule.Path; status = ''; files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; totalBytes = $null; note = $rule.Note }
+    $row = [ordered]@{ id = $rule.Id; kind = $rule.Kind; enabled = ($rule.Enabled -or $explicit); path = $rule.Path; status = ''; files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; purge = 0; purgeBytes = 0L; purged = 0; purgedBytes = 0L; detail = ''; totalBytes = $null; note = $rule.Note }
+    $archiving = @('archive', 'codex') -contains $rule.Kind
     try {
       if ($rule.Kind -eq 'command') {
         $row.path = $rule.Path
@@ -214,10 +327,15 @@ try {
               'age' { Invoke-AgeRule $rule $root }
               'cap' { Invoke-CapRule $rule $root }
               'keep-latest' { Invoke-KeepLatestRule $rule $root }
+              'archive' { Invoke-ArchiveRule $rule $root }
+              'codex' { Invoke-CodexRule $rule $root }
             }
           } finally { $DryRun = $wasDry }
           foreach ($k in 'files', 'bytes', 'removed', 'removedBytes', 'inUse') { $row[$k] = $r[$k] }
+          if ($archiving) { foreach ($k in 'purge', 'purgeBytes', 'purged', 'purgedBytes', 'detail') { $row[$k] = $r[$k] } }
           if (-not $row.enabled) { $row.status = 'off' }
+          elseif ($archiving -and $DryRun) { $row.status = 'would archive' }
+          elseif ($archiving) { $row.status = 'archived' }
           elseif ($DryRun) { $row.status = 'would remove' }
           else { $row.status = 'removed' }
         }
@@ -231,23 +349,37 @@ try {
 
   Write-Host ''
   foreach ($row in $rows) {
-    $age = switch ($row.kind) { 'age' { 'age' } 'cap' { 'cap' } 'keep-latest' { 'keep' } default { 'cmd' } }
+    $age = switch ($row.kind) { 'age' { 'age' } 'cap' { 'cap' } 'keep-latest' { 'keep' } 'archive' { 'arch' } 'codex' { 'arch' } default { 'cmd' } }
     $unit = if ($row.kind -eq 'keep-latest') { 'dirs ' } else { 'files' }
-    $size = if ($row.kind -eq 'command') { '' } elseif ($row.status -eq 'removed') { "{0,6} {1} {2,10}" -f $row.removed, $unit, (Format-AicmSize $row.removedBytes) } else { "{0,6} {1} {2,10}" -f $row.files, $unit, (Format-AicmSize $row.bytes) }
+    $done = @('removed', 'archived') -contains $row.status
+    $size = if ($row.kind -eq 'command') { '' } elseif ($done) { "{0,6} {1} {2,10}" -f $row.removed, $unit, (Format-AicmSize $row.removedBytes) } else { "{0,6} {1} {2,10}" -f $row.files, $unit, (Format-AicmSize $row.bytes) }
     $total = if ($null -ne $row.totalBytes) { "  of {0,10}" -f (Format-AicmSize $row.totalBytes) } else { '' }
-    $busy = if ($row.inUse -gt 0) { " ($($row.inUse) in use, kept)" } else { '' }
-    Write-Host ("{0,-22} {1,-4} {2,-22}{3}  {4}{5}  {6}" -f $row.id, $age, $size, $total, $row.status, $busy, $row.path)
+    $busy = if ($row.inUse -gt 0) { " ($($row.inUse) in use or failed, kept)" } else { '' }
+    $purgeText = ''
+    if (@('archive', 'codex') -contains $row.kind -and $row.status -notlike 'not present*' -and $row.status -notlike 'refused*') {
+      $purgeText = if ($done) { "; deleted from archive: $($row.purged) ($(Format-AicmSize $row.purgedBytes))" } else { "; would delete from archive: $($row.purge) ($(Format-AicmSize $row.purgeBytes))" }
+    }
+    Write-Host ("{0,-22} {1,-4} {2,-22}{3}  {4}{5}{6}  {7}" -f $row.id, $age, $size, $total, $row.status, $purgeText, $busy, $row.path)
+    if ($row.detail) { Write-Host ("{0,-22} {1}" -f '', $row.detail) }
   }
 
-  $plannedBytes = 0L; $freedBytes = 0L; $offBytes = 0L
+  # Archiving moves files; only deletions free space.
+  $plannedBytes = 0L; $freedBytes = 0L; $offBytes = 0L; $archiveBytes = 0L; $archivedBytes = 0L
   foreach ($row in $rows) {
-    if ($row.enabled) { $plannedBytes += $row.bytes; $freedBytes += $row.removedBytes } else { $offBytes += $row.bytes }
+    $isArchive = @('archive', 'codex') -contains $row.kind
+    if (-not $row.enabled) { $offBytes += $(if ($isArchive) { $row.purgeBytes } else { $row.bytes }); continue }
+    if ($isArchive) {
+      $plannedBytes += $row.purgeBytes; $freedBytes += $row.purgedBytes
+      $archiveBytes += $row.bytes; $archivedBytes += $row.removedBytes
+    } else {
+      $plannedBytes += $row.bytes; $freedBytes += $row.removedBytes
+    }
   }
   Write-Host ''
   if ($DryRun) {
-    Write-Host "reclaimable now: $(Format-AicmSize $plannedBytes)"
+    Write-Host "reclaimable now: $(Format-AicmSize $plannedBytes)   to archive: $(Format-AicmSize $archiveBytes)"
   } else {
-    Write-Host "freed: $(Format-AicmSize $freedBytes)"
+    Write-Host "freed: $(Format-AicmSize $freedBytes)   archived: $(Format-AicmSize $archivedBytes) (in $(Get-DisplayPath (Get-AicmArchiveRoot)) and ~\.codex\archived_sessions)"
   }
   if ($offBytes -gt 0) {
     Write-Host "also reclaimable by rules that are off: $(Format-AicmSize $offBytes) (turn on in $(Get-DisplayPath $LocalRulesFile))"
@@ -260,7 +392,8 @@ try {
       ok = ($errors.Count -eq 0)
       freedBytes = [int64]$freedBytes
       errors = $errors.ToArray()
-      rules = @($rows | ForEach-Object { [ordered]@{ id = $_.id; status = $_.status; removed = $_.removed; removedBytes = [int64]$_.removedBytes; inUse = $_.inUse } })
+      archivedBytes = [int64]$archivedBytes
+      rules = @($rows | ForEach-Object { [ordered]@{ id = $_.id; status = $_.status; removed = $_.removed; removedBytes = [int64]$_.removedBytes; purged = $_.purged; purgedBytes = [int64]$_.purgedBytes; inUse = $_.inUse } })
     })
     Remove-OldCleanLogs
   }

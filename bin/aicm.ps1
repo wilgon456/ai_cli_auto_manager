@@ -215,6 +215,12 @@ switch ($Command) {
     Write-Host "update     $(Get-StateAgeText (Read-AicmState 'last-update'))"
     Write-Host "inventory  $(Get-StateAgeText (Read-AicmState 'inventory'))"
     Write-Host "clean      $(Get-StateAgeText (Read-AicmState 'last-clean'))"
+    $archiveRoot = Get-AicmArchiveRoot
+    if (Test-Path -LiteralPath $archiveRoot) {
+      $archiveBytes = 0L
+      foreach ($f in (Get-AicmFiles $archiveRoot)) { $archiveBytes += $f.Length }
+      Write-Host "archive    $(Format-AicmSize $archiveBytes) in $archiveRoot (move files back to restore)"
+    }
     $inv = Read-AicmState 'inventory'
     if ($inv) {
       Write-Host ''

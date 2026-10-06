@@ -9,6 +9,8 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 export HOME="$WORK/home" TMPDIR="$WORK/tmp" AICM_HOME="$WORK/home/.ai-cli-auto-manager" AICM_OS=linux AICM_NOTIFY=0
+# If a real codex were ever reached, it would only see the throwaway home.
+export CODEX_HOME="$WORK/home/.codex" USERPROFILE="$WORK/home"
 mkdir -p "$HOME" "$TMPDIR" "$WORK/fakebin"
 
 # Fake crontab that keeps its table in a file.

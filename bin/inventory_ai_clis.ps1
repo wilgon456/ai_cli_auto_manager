@@ -57,6 +57,13 @@ try {
       if ($r.ExitCode -eq 0) { $latest = Get-AicmSemver $r.Output }
     }
     $state = if (-not $version) { 'unknown' } elseif (-not $latest) { 'installed' } elseif ((Compare-AicmVersion $version $latest) -lt 0) { 'behind' } else { 'current' }
+    # A newer release that is still inside the waiting period is expected, not a problem.
+    if ($state -eq 'behind' -and $install.Method -eq 'npm') {
+      try {
+        $target = Get-AicmNpmTarget $entry.Npm (Get-AicmMinReleaseAgeDays)
+        if (-not $target -or (Compare-AicmVersion $version $target) -ge 0) { $state = 'held' }
+      } catch { }
+    }
     $coverage = Get-AicmUpdateCoverage $entry $install
     $rows.Add([pscustomobject][ordered]@{
       id = $entry.Id; name = $entry.Name; command = $entry.Command; method = $install.Method; version = $version
