@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
+
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use the bash 3.2 that ships with macOS
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/oldbash"
+          ln -s /bin/bash "$RUNNER_TEMP/oldbash/bash"
+          echo "$RUNNER_TEMP/oldbash" >> "$GITHUB_PATH"
+      - run: bash --version | head -n 1
+      - name: Cleanup tests
+        run: bash tests/clean_test.sh
+      - name: Command and schedule tests
+        run: bash tests/aicm_test.sh
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cleanup tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\clean_test.ps1
+      - name: Command and schedule tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\aicm_test.ps1
+      - name: Cleanup tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\clean_test.ps1
+      - name: PSScriptAnalyzer errors
+        shell: pwsh
+        run: |
+          $found = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          $found | Format-Table -AutoSize | Out-String | Write-Host
+          if ($found) { exit 1 }

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Updates installed AI coding CLIs on Windows.
+  Updates installed AI coding CLIs on Windows (AI CLI Auto Manager).
 .DESCRIPTION
   Conservative updater for selected AI coding CLIs.
   Missing CLIs/packages are treated as pass/skip, not failures.
@@ -9,7 +9,7 @@
 param(
   [Alias('Check')]
   [switch]$DryRun,
-  [string]$LogDir = $(if ($env:LOG_DIR) { $env:LOG_DIR } else { Join-Path $env:USERPROFILE '.ai-cli-auto-update\logs' }),
+  [string]$LogDir = $(if ($env:LOG_DIR) { $env:LOG_DIR } else { Join-Path $(if ($env:AICM_HOME) { $env:AICM_HOME } else { Join-Path $env:USERPROFILE '.ai-cli-auto-manager' }) 'logs' }),
   [int]$LogRetentionDays = $(if ($env:LOG_RETENTION_DAYS) { [int]$env:LOG_RETENTION_DAYS } else { 30 }),
   [int]$VersionTimeoutSeconds = $(if ($env:VERSION_TIMEOUT_SECONDS) { [int]$env:VERSION_TIMEOUT_SECONDS } else { 10 }),
   [string[]]$Targets = $(if ($env:AI_CLI_TARGETS) { $env:AI_CLI_TARGETS } else { 'kimi,gpt,opencode,agy,claude,grok' }),
@@ -18,6 +18,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-common.ps1')
 
 function Get-Timestamp {
   return (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -111,7 +112,7 @@ try {
 
   $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
   $userPart = if ($identity -and $identity.User) { $identity.User.Value -replace '[^A-Za-z0-9._-]', '-' } else { $env:USERNAME -replace '[^A-Za-z0-9._-]', '-' }
-  $mutexName = "Local\ai-cli-auto-update-$userPart"
+  $mutexName = "Local\ai-cli-auto-manager-update-$userPart"
   $mutex = [System.Threading.Mutex]::new($false, $mutexName)
   $hasLock = $false
   try {
@@ -176,8 +177,24 @@ try {
       Write-Host "pass: $Tool not installed or not managed here ($Reason)"
     }
 
+    function Get-NpmInstalledVersion([string]$Package) {
+      $raw = (& npm list -g --depth=0 --json $Package 2>$null) -join "`n"
+      try {
+        $deps = ($raw | ConvertFrom-Json).dependencies
+        if ($deps -and $deps.PSObject.Properties[$Package]) { return [string]$deps.PSObject.Properties[$Package].Value.version }
+      } catch { }
+      return ''
+    }
+
     function Update-NpmPackage([string]$Package) {
       if (-not (Get-CommandPath 'npm')) { throw 'npm is not installed' }
+      # Skip the reinstall when already current: reinstalling a CLI that is running fails on Windows (EBUSY).
+      $installed = Get-NpmInstalledVersion $Package
+      $latest = ((& npm view $Package version 2>$null) -join '').Trim()
+      if ($installed -and $latest -and $installed -eq $latest) {
+        Write-Host "already current: $Package $installed"
+        return
+      }
       & npm install -g "$Package@latest"
       if ($LASTEXITCODE -ne 0) { throw "npm install failed for $Package with exit code $LASTEXITCODE" }
     }
@@ -308,8 +325,35 @@ try {
     if (Test-TargetEnabled 'claude') { Write-Version claude }
     if (Test-TargetEnabled 'grok') { Write-Version grok }
 
+    # Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Failure is only a warning.
+    $hook = Join-Path (Get-AicmHome) 'hooks\post-update.ps1'
+    if (-not $DryRun -and (Test-Path -LiteralPath $hook)) {
+      Write-Host ""
+      Write-Host "== post-update hook =="
+      try {
+        & $hook
+        Write-Host "ok: post-update hook"
+      } catch {
+        Write-Host "warn: post-update hook failed: $($_.Exception.Message)"
+      }
+    }
+
     Write-Host ""
     Write-Host "log_file=$logFile"
+
+    $problems = @(Get-AicmScheduleProblems -Skip 'Update')
+    foreach ($p in $problems) { Write-Host "problem: $p" }
+    if (-not $DryRun) {
+      Write-AicmState 'last-update' ([ordered]@{
+        finishedAt = Get-AicmTimestamp
+        version = Get-AicmVersion
+        ok = ($script:failures.Count -eq 0)
+        failures = @($script:failures)
+        logFile = $logFile
+      })
+      $attention = @($script:failures | ForEach-Object { "update failed: $_" }) + $problems
+      if ($attention.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($attention -join '; ') }
+    }
 
     if ($script:failures.Count -gt 0) {
       Write-Host "[$(Get-Timestamp)] AI CLI update finished with failures: $($script:failures -join ', ')"

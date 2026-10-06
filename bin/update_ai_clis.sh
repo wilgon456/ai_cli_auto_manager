@@ -16,8 +16,12 @@ set -Eeuo pipefail
 #   - continues per-tool if one updater fails
 #   - never prints secrets/env values
 
-LOCK_DIR="${LOCK_DIR:-/tmp/ai-cli-auto-update.lockdir}"
-LOG_DIR="${LOG_DIR:-${HOME:-/tmp}/.ai-cli-auto-update/logs}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/aicm-common.sh
+. "$SCRIPT_DIR/../lib/aicm-common.sh"
+
+LOCK_DIR="${LOCK_DIR:-/tmp/ai-cli-auto-manager-update.lockdir}"
+LOG_DIR="${LOG_DIR:-$AICM_HOME/logs}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 BREW="${BREW:-$(command -v brew 2>/dev/null || echo /usr/local/bin/brew)}"
 NPM="${NPM:-$(command -v npm 2>/dev/null || echo /usr/local/bin/npm)}"
@@ -305,9 +309,22 @@ update_brew_package() {
   fi
 }
 
+npm_installed_version() {
+  local root
+  root="$("$NPM" root -g 2>/dev/null)" || return 0
+  [[ -f "$root/$1/package.json" ]] || return 0
+  node -p "require(process.argv[1]).version" "$root/$1/package.json" 2>/dev/null || true
+}
+
 update_npm_package() {
-  local pkg="$1"
+  local pkg="$1" installed latest
   if is_npm_global_installed "$pkg"; then
+    installed="$(npm_installed_version "$pkg")"
+    latest="$("$NPM" view "$pkg" version 2>/dev/null || true)"
+    if [[ -n "$installed" && "$installed" == "$latest" ]]; then
+      echo "already current: $pkg $installed"
+      return 0
+    fi
     "$NPM" install -g "$pkg@latest"
   else
     echo "npm global package not installed: $pkg"
@@ -465,17 +482,41 @@ target_enabled kimi && version_of kimi
 target_enabled claude && version_of claude
 target_enabled grok && version_of grok
 
+# Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Failure is only a warning.
+POST_UPDATE_HOOK="$AICM_HOME/hooks/post-update.sh"
+if [[ -x "$POST_UPDATE_HOOK" ]]; then
+  run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
+fi
+
 echo
 echo "log_file=$LOG_FILE"
 
-if ((${#failures[@]} || ${#version_failures[@]})); then
-  failure_summary=""
-  if ((${#failures[@]})); then
-    failure_summary="${failures[*]}"
+failure_summary=""
+if ((${#failures[@]})); then
+  failure_summary="${failures[*]}"
+fi
+if ((${#version_failures[@]})); then
+  failure_summary="${failure_summary:+$failure_summary }${version_failures[*]}"
+fi
+
+problems=()
+while IFS= read -r problem; do [[ -n "$problem" ]] && problems+=("$problem"); done < <(aicm_schedule_problems update)
+if ((${#problems[@]})); then
+  for problem in "${problems[@]}"; do echo "problem: $problem"; done
+fi
+
+if [[ "$DRY_RUN" != "true" ]]; then
+  update_ok=true; [[ -z "$failure_summary" ]] || update_ok=false
+  aicm_state_write last-update "{\"finishedAt\":\"$(ts)\",\"version\":\"$(aicm_version)\",\"ok\":$update_ok,\"failures\":\"$(aicm_json_escape "$failure_summary")\",\"logFile\":\"$(aicm_json_escape "$LOG_FILE")\"}"
+  attention="${failure_summary:+update failed: $failure_summary}"
+  if ((${#problems[@]})); then
+    attention="${attention:+$attention; }$(printf '%s; ' "${problems[@]}")"
+    attention="${attention%; }"
   fi
-  if ((${#version_failures[@]})); then
-    failure_summary="${failure_summary:+$failure_summary }${version_failures[*]}"
-  fi
+  [[ -z "$attention" ]] || aicm_notify "AI CLI Auto Manager" "$attention"
+fi
+
+if [[ -n "$failure_summary" ]]; then
   echo "[$(ts)] AI CLI update finished with failures: $failure_summary"
   exit 1
 fi
