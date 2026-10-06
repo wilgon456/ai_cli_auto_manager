@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.1 - 2026-10-06
+
+### Fixed
+- Deleting a Codex session also deletes the sub-agent sessions it spawned, so a later delete of
+  one of those failed and was reported as "in use or failed". Such ids are re-checked against the
+  database and counted as removed when they are gone.
+
 ## 2.2.0 - 2026-10-06
 
 ### Added

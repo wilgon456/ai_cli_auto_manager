@@ -48,6 +48,9 @@ function Invoke-Clean([string[]]$Arguments, [switch]$NoFakeCodex) {
 $U1 = '11111111-1111-4111-8111-111111111111'; $U2 = '22222222-2222-4222-8222-222222222222'
 $U3 = '33333333-3333-4333-8333-333333333333'; $U4 = '44444444-4444-4444-8444-444444444444'
 $UX = 'ffffffff-ffff-4fff-8fff-ffffffffffff'; $UO = '55555555-5555-4555-8555-555555555555'; $UY = '66666666-6666-4666-8666-666666666666'
+$UE = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+$python = @('python', 'python3', 'py') | Where-Object { Get-Command $_ -CommandType Application -ErrorAction SilentlyContinue } | Select-Object -First 1
+$pythonPath = if ($python) { (Get-Command $python -CommandType Application | Select-Object -First 1).Source } else { 'python' }
 
 try {
   New-Item -ItemType Directory -Path $fakeHome, $fakeTemp, $fakeLocal, $aicmHome, $outside, $fakeBin -Force | Out-Null
@@ -59,7 +62,11 @@ $calls = '__WORK__\codex-calls.log'
 $codexHome = '__CODEX__'
 Add-Content -LiteralPath $calls -Value ($args -join ' ')
 $id = $args[-1]
-if ($id -like 'ffffffff*') { Write-Output "Error: failed to $($args[0]) session"; exit 1 }
+if ($id -like 'ffffffff*' -or $id -like 'eeeeeeee*') { Write-Output "Error: failed to $($args[0]) session"; exit 1 }
+# Deleting session 55555555-... also deletes its sub-agent session eeeeeeee-..., like the real Codex does.
+if ($args[0] -eq 'delete' -and $id -like '55555555*' -and (Test-Path -LiteralPath '__WORK__\dbdel.py')) {
+  & '__PYTHON__' '__WORK__\dbdel.py' 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+}
 switch ($args[0]) {
   'archive' {
     $f = Get-ChildItem -LiteralPath "$codexHome\sessions" -Recurse -File -Filter "*$id*" | Select-Object -First 1
@@ -71,7 +78,7 @@ switch ($args[0]) {
 }
 exit 0
 '@
-  $impl.Replace('__WORK__', $work).Replace('__CODEX__', $codexHome) | Set-Content -LiteralPath "$fakeBin\codex-impl.ps1" -Encoding ASCII
+  $impl.Replace('__WORK__', $work).Replace('__CODEX__', $codexHome).Replace('__PYTHON__', $pythonPath) | Set-Content -LiteralPath "$fakeBin\codex-impl.ps1" -Encoding ASCII
   "& '$fakeBin\codex-impl.ps1' @args; exit `$LASTEXITCODE" | Set-Content -LiteralPath "$fakeBin\codex.ps1" -Encoding ASCII
   "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0codex-impl.ps1`" %*" | Set-Content -LiteralPath "$fakeBin\codex.cmd" -Encoding ASCII
 
@@ -110,15 +117,17 @@ exit 0
 
   # Codex database with two sessions whose file is already gone (100 and 50 days unused), when Python exists.
   $dbOk = $false
-  $python = @('python', 'python3', 'py') | Where-Object { Get-Command $_ -CommandType Application -ErrorAction SilentlyContinue } | Select-Object -First 1
   if ($python) {
     $now = [int64]([datetime]::UtcNow - [datetime]'1970-01-01').TotalSeconds
     $sql = "create table threads (id text, rollout_path text, updated_at integer, archived integer);" +
       "insert into threads values ('$U1', '$($codexHome -replace '\\', '/')/sessions/x-$U1.jsonl', $($now - 40 * 86400), 0);" +
       "insert into threads values ('$UO', '$($codexHome -replace '\\', '/')/sessions/gone-$UO.jsonl', $($now - 100 * 86400), 0);" +
-      "insert into threads values ('$UY', '$($codexHome -replace '\\', '/')/sessions/gone-$UY.jsonl', $($now - 50 * 86400), 0);"
+      "insert into threads values ('$UY', '$($codexHome -replace '\\', '/')/sessions/gone-$UY.jsonl', $($now - 50 * 86400), 0);" +
+      "insert into threads values ('$UE', '$($codexHome -replace '\\', '/')/sessions/gone-$UE.jsonl', $($now - 100 * 86400), 0);"
     & $python -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.commit()' "$codexHome\state_5.sqlite" $sql
     $dbOk = ($LASTEXITCODE -eq 0)
+    "import sqlite3,sys`nc=sqlite3.connect(r'$codexHome\state_5.sqlite')`nc.execute('delete from threads where id = ?', (sys.argv[1],))`nc.commit()" |
+      Set-Content -LiteralPath "$work\dbdel.py" -Encoding ASCII
   }
 
   @(
@@ -170,6 +179,8 @@ exit 0
   if ($dbOk) {
     if ($calls -contains "delete --force $UO") { Pass 'session whose file is gone and unused 90+ days deleted' } else { Fail 'orphan delete' }
     if (-not ($calls -match $UY)) { Pass 'session whose file is gone but used within 90 days kept' } else { Fail 'young orphan touched' }
+    $codexRow = @($r.Output -split "`r?`n" | Where-Object { $_ -like 'codex-sessions *' }) | Select-Object -First 1
+    if ($codexRow -and $codexRow -notmatch 'in use or failed') { Pass 'sub-agent session removed with its parent is not reported as failed' } else { Fail "sub-agent recount: $codexRow" }
     Expect-Gone "$codexHome\archived_sessions\rollout-2026-05-01T10-00-00-$UX.jsonl" 'file Codex does not know is removed directly'
   } else {
     Write-Host 'skip - Codex database checks (no Python here)'

@@ -280,9 +280,18 @@ run_codex_rule() { # root days limit dry
       fi
     done < "$del"
     if ((${#orphans[@]})); then
+      local failed=()
       for cid in "${orphans[@]}"; do
-        if aicm_timeout 120 "$codex" delete --force "$cid" </dev/null >/dev/null 2>&1; then R_PURGED=$((R_PURGED + 1)); else R_IN_USE=$((R_IN_USE + 1)); fi
+        if aicm_timeout 120 "$codex" delete --force "$cid" </dev/null >/dev/null 2>&1; then R_PURGED=$((R_PURGED + 1)); else failed+=("$cid"); fi
       done
+      if ((${#failed[@]})); then
+        # Deleting a session also deletes the sub-agent sessions it spawned, so a later delete of one of
+        # those fails although it is already gone. Count what the database no longer has as done.
+        aicm_codex_threads "$root" > "$threads" || : > "$threads"
+        for cid in "${failed[@]}"; do
+          if [[ -s "$threads" ]] && ! grep -q "^$cid"$'\t' "$threads"; then R_PURGED=$((R_PURGED + 1)); else R_IN_USE=$((R_IN_USE + 1)); fi
+        done
+      fi
     fi
   fi
   rm -f "$arch" "$del" "$threads"

@@ -234,9 +234,16 @@ function Invoke-CodexRule($Rule, [string]$Root) {
     if ($threads -and -not $threads.ContainsKey($id) -and (Remove-FileQuietly $f)) { $result.purged++; $result.purgedBytes += $len; continue }
     $result.inUse++
   }
+  $failed = @()
   foreach ($id in $orphans) {
     $r = Invoke-AicmWithTimeout $codex @('delete', '--force', $id) 120
-    if ($r.ExitCode -eq 0) { $result.purged++ } else { $result.inUse++ }
+    if ($r.ExitCode -eq 0) { $result.purged++ } else { $failed += $id }
+  }
+  if ($failed.Count -gt 0) {
+    # Deleting a session also deletes the sub-agent sessions it spawned, so a later delete of one of
+    # those fails although it is already gone. Count what the database no longer has as done.
+    $after = Get-AicmCodexThreads $Root
+    foreach ($id in $failed) { if ($after -and -not $after.ContainsKey($id)) { $result.purged++ } else { $result.inUse++ } }
   }
   return $result
 }
