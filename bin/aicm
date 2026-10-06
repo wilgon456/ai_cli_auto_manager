@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# AI CLI Auto Manager for macOS and Linux: keeps AI coding CLIs updated and their leftovers cleaned.
+set -Eeuo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/aicm-common.sh
+. "$BIN_DIR/../lib/aicm-common.sh"
+
+usage() {
+  cat <<EOF
+AI CLI Auto Manager $(aicm_version)
+
+  aicm update    [--dry-run] [--targets codex,claude] [--install-missing]
+  aicm clean     [--dry-run] [--rules id,id]
+  aicm status    disk use per cleanup rule, schedules, last runs
+  aicm doctor    exit 1 when a schedule is missing or a run is overdue or failed
+  aicm schedule  install|remove|show [--update-at 05:00] [--clean-day mon] [--clean-at 12:30]
+                                     [--targets list] [--no-update] [--no-clean]
+  aicm version
+EOF
+}
+
+STATE_DIR="$AICM_HOME/state"
+LOG_DIR="$AICM_HOME/logs"
+
+state_age_text() { # name
+  local file="$STATE_DIR/$1.json" when result
+  [[ -f "$file" ]] || { echo never; return; }
+  when="$(sed -n 's/.*"finishedAt":"\([^"]*\)".*/\1/p' "$file")"
+  if grep -q '"ok":true' "$file"; then result=ok; else result=FAILED; fi
+  echo "${when:-unknown} UTC ($result)"
+}
+
+state_older_than_days() { # name days
+  local file="$STATE_DIR/$1.json"
+  [[ -f "$file" ]] || return 0
+  [[ -n "$(find "$file" -mmin +"$(($2 * 1440))" 2>/dev/null)" ]]
+}
+
+scheduled_jobs() {
+  local file="$STATE_DIR/schedule.json"
+  [[ -f "$file" ]] || return 0
+  grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean)$' || true
+}
+
+hm_hour() { local h="${1%%:*}"; echo $((10#$h)); }
+hm_minute() { local m="${1##*:}"; echo $((10#$m)); }
+
+weekday_number() { # mon..sun or 1..7 -> 1..7 (Monday = 1, Sunday = 7)
+  case "$(aicm_lower "$1")" in
+    1|mon|monday) echo 1 ;; 2|tue|tuesday) echo 2 ;; 3|wed|wednesday) echo 3 ;;
+    4|thu|thursday) echo 4 ;; 5|fri|friday) echo 5 ;; 6|sat|saturday) echo 6 ;;
+    7|0|sun|sunday) echo 7 ;;
+    *) echo "invalid day: $1" >&2; return 1 ;;
+  esac
+}
+
+write_plist() { # job script hour minute weekday(or empty) args...
+  local job="$1" script="$2" hour="$3" minute="$4" weekday="$5"; shift 5
+  local label="$AICM_LAUNCHD_PREFIX.$job" plist arg
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>$label</string>"
+    echo '  <key>ProgramArguments</key><array>'
+    echo '    <string>/bin/bash</string>'
+    echo "    <string>$script</string>"
+    for arg in "$@"; do echo "    <string>$arg</string>"; done
+    echo '  </array>'
+    echo '  <key>StartCalendarInterval</key><dict>'
+    [[ -n "$weekday" ]] && echo "    <key>Weekday</key><integer>$((weekday % 7))</integer>"
+    echo "    <key>Hour</key><integer>$hour</integer>"
+    echo "    <key>Minute</key><integer>$minute</integer>"
+    echo '  </dict>'
+    echo "  <key>StandardOutPath</key><string>$LOG_DIR/launchd.$job.out.log</string>"
+    echo "  <key>StandardErrorPath</key><string>$LOG_DIR/launchd.$job.err.log</string>"
+    echo '</dict></plist>'
+  } > "$plist"
+  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
+  echo "registered: $label"
+}
+
+remove_plist() {
+  local label="$AICM_LAUNCHD_PREFIX.$1" plist
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  [[ -f "$plist" ]] || return 0
+  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
+  rm -f "$plist"
+  echo "removed: $label"
+}
+
+cron_without_aicm() { crontab -l 2>/dev/null | grep -v '# aicm:' || true; }
+
+schedule_install() {
+  local update_at=05:00 clean_day=mon clean_at=12:30 targets="" no_update=false no_clean=false
+  while (($#)); do
+    case "$1" in
+      --update-at) shift; update_at="${1:-}" ;;
+      --clean-day) shift; clean_day="${1:-}" ;;
+      --clean-at) shift; clean_at="${1:-}" ;;
+      --targets) shift; targets="${1:-}" ;;
+      --no-update) no_update=true ;;
+      --no-clean) no_clean=true ;;
+      *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  [[ "$update_at" =~ ^[0-9]{1,2}:[0-9]{2}$ && "$clean_at" =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || { echo "times must look like 05:00" >&2; exit 2; }
+  [[ "$no_update" == true && "$no_clean" == true ]] && { echo "nothing to install: both --no-update and --no-clean" >&2; exit 2; }
+  local wd jobs="" update_args=()
+  wd="$(weekday_number "$clean_day")" || exit 2
+  [[ -n "$targets" ]] && update_args=(--targets "$targets")
+  mkdir -p "$LOG_DIR"
+
+  if [[ "$(aicm_os)" == mac ]]; then
+    if [[ "$no_update" == true ]]; then remove_plist update
+    else write_plist update "$BIN_DIR/update_ai_clis.sh" "$(hm_hour "$update_at")" "$(hm_minute "$update_at")" "" ${update_args[@]+"${update_args[@]}"}; jobs+='"update",'; fi
+    if [[ "$no_clean" == true ]]; then remove_plist clean
+    else write_plist clean "$BIN_DIR/clean_ai_leftovers.sh" "$(hm_hour "$clean_at")" "$(hm_minute "$clean_at")" "$wd"; jobs+='"clean",'; fi
+    if [[ -f "$HOME/Library/LaunchAgents/com.example.ai-cli-auto-update.plist" ]]; then
+      echo "note: the old template job com.example.ai-cli-auto-update is still installed; remove it with:"
+      echo "  launchctl unload ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist && rm ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist"
+    fi
+  else
+    command -v crontab >/dev/null 2>&1 || { echo "crontab is not available" >&2; exit 1; }
+    local lines="" q_update q_clean q_targets=""
+    q_update="$(printf '%q' "$BIN_DIR/update_ai_clis.sh")"
+    q_clean="$(printf '%q' "$BIN_DIR/clean_ai_leftovers.sh")"
+    [[ -n "$targets" ]] && q_targets=" --targets $(printf '%q' "$targets")"
+    if [[ "$no_update" != true ]]; then
+      lines+="$(hm_minute "$update_at") $(hm_hour "$update_at") * * * /bin/bash $q_update$q_targets >> $(printf '%q' "$LOG_DIR/cron.update.log") 2>&1 # aicm:update"$'\n'
+      jobs+='"update",'
+    fi
+    if [[ "$no_clean" != true ]]; then
+      lines+="$(hm_minute "$clean_at") $(hm_hour "$clean_at") * * $((wd % 7)) /bin/bash $q_clean >> $(printf '%q' "$LOG_DIR/cron.clean.log") 2>&1 # aicm:clean"$'\n'
+      jobs+='"clean",'
+    fi
+    local current
+    current="$(cron_without_aicm)"
+    { [[ -n "$current" ]] && printf '%s\n' "$current"; printf '%s' "$lines"; } | crontab -
+    printf '%s' "$lines" | sed 's/^/registered: /'
+  fi
+  aicm_state_write schedule "{\"installedAt\":\"$(aicm_ts)\",\"version\":\"$(aicm_version)\",\"jobs\":[${jobs%,}]}"
+  echo "Each run checks that the other job still exists and shows a desktop notification if it is gone."
+}
+
+schedule_remove() {
+  if [[ "$(aicm_os)" == mac ]]; then
+    remove_plist update; remove_plist clean
+  elif command -v crontab >/dev/null 2>&1; then
+    local current
+    current="$(cron_without_aicm)"
+    if [[ -n "$current" ]]; then printf '%s\n' "$current" | crontab -; else crontab -r 2>/dev/null || printf '' | crontab -; fi
+    echo "removed aicm crontab lines"
+  fi
+  rm -f "$STATE_DIR/schedule.json"
+}
+
+schedule_show() {
+  local job
+  for job in update clean; do
+    if aicm_job_exists "$job"; then echo "$job   registered"; else echo "$job   not registered"; fi
+  done
+  if [[ "$(aicm_os)" != mac ]] && command -v crontab >/dev/null 2>&1; then
+    crontab -l 2>/dev/null | grep '# aicm:' | sed 's/^/  /' || true
+  fi
+}
+
+doctor() {
+  local problems=() p jobs
+  while IFS= read -r p; do [[ -n "$p" ]] && problems+=("$p"); done < <(aicm_schedule_problems "")
+  jobs="$(scheduled_jobs)"
+  if [[ -z "$jobs" ]]; then problems+=("no schedule installed; run: aicm schedule install"); fi
+  if grep -qx update <<< "$jobs"; then
+    if state_older_than_days last-update 3; then problems+=("no update run in the last 3 days")
+    elif ! grep -q '"ok":true' "$STATE_DIR/last-update.json"; then problems+=("last update run failed; see $LOG_DIR/latest.log"); fi
+  fi
+  if grep -qx clean <<< "$jobs"; then
+    if state_older_than_days last-clean 9; then problems+=("no cleanup run in the last 9 days")
+    elif ! grep -q '"ok":true' "$STATE_DIR/last-clean.json"; then problems+=("last cleanup run had errors; see $LOG_DIR"); fi
+  fi
+  if ! (aicm_load_rules "$AICM_ROOT/rules/clean-rules.conf" "$AICM_HOME/clean-rules.local.conf") 2>/dev/null; then
+    problems+=("rules file error; run: aicm clean --dry-run")
+  fi
+  if ((${#problems[@]} == 0)); then
+    echo "healthy: schedules registered, recent runs succeeded"
+    return 0
+  fi
+  for p in "${problems[@]}"; do echo "problem: $p"; done
+  return 1
+}
+
+cmd="${1:-help}"
+(($#)) && shift
+case "$cmd" in
+  update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
+  clean) exec "$BIN_DIR/clean_ai_leftovers.sh" "$@" ;;
+  status)
+    echo "AI CLI Auto Manager $(aicm_version)   home: $AICM_HOME"
+    echo
+    echo "== schedules =="
+    schedule_show
+    echo
+    echo "== last runs =="
+    echo "update  $(state_age_text last-update)"
+    echo "clean   $(state_age_text last-clean)"
+    echo
+    echo "== disk use by cleanup rule =="
+    exec "$BIN_DIR/clean_ai_leftovers.sh" --report
+    ;;
+  doctor) doctor ;;
+  schedule)
+    action="${1:-show}"
+    (($#)) && shift
+    case "$action" in
+      install) schedule_install "$@" ;;
+      remove) schedule_remove ;;
+      show) schedule_show ;;
+      *) echo "unknown schedule action: $action (use install, remove or show)" >&2; exit 2 ;;
+    esac
+    ;;
+  version|--version) echo "AI CLI Auto Manager $(aicm_version)" ;;
+  help|-h|--help) usage ;;
+  *) echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;
+esac
