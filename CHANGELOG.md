@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.3.1 - 2026-10-06
+
+### Fixed
+- A `codex` rule with `limit` 0 is shown as a deletion (`del`, "would remove"/"removed", with the
+  sessions to delete counted) instead of as an archive.
+
 ## 2.3.0 - 2026-10-06
 
 ### Changed

@@ -346,6 +346,9 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
         codex) run_codex_rule "$root" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
       esac
       if [[ "$enabled" != 1 ]]; then R_STATUS=off
+      elif [[ "$kind" == codex && "${AICM_RULE_LIMIT[$i]}" == 0 ]]; then
+        # limit 0 deletes directly; show it as a deletion, not an archive.
+        if [[ "$DRY_RUN" == true ]]; then R_STATUS="would remove"; else R_STATUS=removed; fi
       elif [[ "$kind" == archive || "$kind" == codex ]]; then
         if [[ "$DRY_RUN" == true ]]; then R_STATUS="would archive"; else R_STATUS=archived; fi
       elif [[ "$DRY_RUN" == true ]]; then R_STATUS="would remove"
@@ -367,8 +370,14 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
   unit=files; [[ "$kind" == keep-latest ]] && unit="dirs "
   short=age; [[ "$kind" == cap ]] && short=cap; [[ "$kind" == keep-latest ]] && short=keep; [[ "$kind" == command ]] && short=cmd
   [[ "$is_archive" == true ]] && short=arch
+  direct=false; [[ "$kind" == codex && "${AICM_RULE_LIMIT[$i]}" == 0 ]] && direct=true
+  [[ "$direct" == true ]] && short=del
   size_col=""
-  if [[ "$kind" != command ]]; then
+  if [[ "$direct" == true && "$R_STATUS" == removed ]]; then
+    size_col="$(printf '%6s %s %10s' "$R_PURGED" "$unit" "$(aicm_format_size "$R_PURGED_BYTES")")"
+  elif [[ "$direct" == true ]]; then
+    size_col="$(printf '%6s %s %10s' "$R_PURGE" "$unit" "$(aicm_format_size "$R_PURGE_BYTES")")"
+  elif [[ "$kind" != command ]]; then
     if [[ "$R_STATUS" == removed || "$R_STATUS" == archived ]]; then
       size_col="$(printf '%6s %s %10s' "$R_REMOVED" "$unit" "$(aicm_format_size "$R_REMOVED_BYTES")")"
     else
@@ -378,7 +387,7 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
   total_col=""; [[ -n "$total" ]] && total_col="$(printf '  of %10s' "$(aicm_format_size "$total")")"
   busy=""; ((R_IN_USE > 0)) && busy=" ($R_IN_USE in use or failed, kept)"
   purge_text=""
-  if [[ "$is_archive" == true && "$R_STATUS" != "not present" && "$R_STATUS" != refused* ]]; then
+  if [[ "$is_archive" == true && "$direct" != true && "$R_STATUS" != "not present" && "$R_STATUS" != refused* ]]; then
     if [[ "$R_STATUS" == archived ]]; then purge_text="; deleted from archive: $R_PURGED ($(aicm_format_size "$R_PURGED_BYTES"))"
     else purge_text="; would delete from archive: $R_PURGE ($(aicm_format_size "$R_PURGE_BYTES"))"; fi
   fi
