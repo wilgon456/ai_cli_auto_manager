@@ -137,7 +137,7 @@ Security fixes also arrive as updates, so a long waiting period has a cost. Thre
 
 ### Post-update hook
 
-A daemon that is already running may keep the old CLI binaries loaded. Put a hook file in place and it runs after every update; a failing hook only produces a warning.
+A daemon that is already running may keep the old CLI binaries loaded. Put a hook file in place and it runs after an update that changed at least one CLI version; a failing hook only produces a warning.
 
 | OS | Hook file |
 | --- | --- |

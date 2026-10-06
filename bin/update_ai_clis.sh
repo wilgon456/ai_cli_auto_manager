@@ -29,6 +29,7 @@ AI_CLI_TARGETS="${AI_CLI_TARGETS:-all}"
 INSTALL_MISSING="${INSTALL_MISSING:-false}"
 PATH="/usr/local/bin:/opt/homebrew/bin:${HOME:-}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 DRY_RUN=false
+VERSION_TEXT=""
 SCHEDULED=false
 MIN_RELEASE_AGE_DAYS="$(aicm_min_release_age_days)"
 VERSION_TIMEOUT_SECONDS="${VERSION_TIMEOUT_SECONDS:-10}"
@@ -255,6 +256,7 @@ version_of() {
     version_rc=0
     version_output="$(command_with_timeout "$VERSION_TIMEOUT_SECONDS" "$cmd" --version 2>&1)" || version_rc=$?
     first_line="${version_output%%$'\n'*}"
+    VERSION_TEXT+="$cmd=$first_line;"
     if ((version_rc == 124)); then
       echo "TIMEOUT after ${VERSION_TIMEOUT_SECONDS}s"
       echo "warn: $cmd --version timed out; continuing updater"
@@ -615,6 +617,8 @@ for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do
   update_catalog_extra "$idx"
 done
 
+versions_before="$VERSION_TEXT"
+VERSION_TEXT=""
 echo
 echo "== after versions =="
 hash -r || true
@@ -626,10 +630,12 @@ target_enabled claude && version_of claude
 target_enabled grok && version_of grok
 for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx]}"; done
 
-# Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Failure is only a warning.
+# Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Runs only when a CLI
+# version actually changed (the job retries during the day). Failure is only a warning.
 POST_UPDATE_HOOK="$AICM_HOME/hooks/post-update.sh"
 if [[ -x "$POST_UPDATE_HOOK" ]]; then
-  run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
+  if [[ "$versions_before" != "$VERSION_TEXT" ]]; then run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
+  else echo; echo "post-update hook skipped: no CLI version changed"; fi
 fi
 
 echo

@@ -126,6 +126,9 @@ try {
   if ($r.Output -match '(?m)^Fake NPM +npm +1\.0\.0 +installed') { Pass '-Offline skips latest lookups' } else { Fail "offline: $($r.Output)" }
   if ($r.Output -notmatch 'notify:') { Pass 'a known duplicate does not notify again' } else { Fail 'duplicate notified twice' }
 
+  New-Item -ItemType Directory -Path "$aicmHome\hooks" -Force | Out-Null
+  "Add-Content -LiteralPath '$work\hook.log' -Value ran" | Set-Content -LiteralPath "$aicmHome\hooks\post-update.ps1" -Encoding ASCII
+
   Write-Host '# update waits 3 days and checks the release'
   # Never '-Targets all' here: that would also run the dedicated updaters for real CLIs on this machine.
   $r = Invoke-Script $upd @('-Targets', 'fakenpm,fakesolo,fakeshadow')
@@ -140,6 +143,8 @@ try {
 
   $r = Invoke-Script $upd @('-Targets', 'fakenpm')
   if ($r.Output -match 'already current: @fake/npmcli 1\.1\.0') { Pass 'nothing newer than the waiting period: not reinstalled' } else { Fail "reinstalled: $($r.Output)" }
+  if (@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count -eq 1) { Pass 'post-update hook ran once: only the run that changed a version' } else { Fail "hook runs: $(@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count)" }
+  if ($r.Output -match 'post-update hook skipped: no CLI version changed') { Pass 'hook skipped when nothing changed' } else { Fail 'hook skip message' }
   $r = Invoke-Script 'bin\inventory_ai_clis.ps1' $inv
   if ($r.Output -match '(?m)^Fake NPM +npm +1\.1\.0 +1\.2\.0 +held +yes') { Pass 'inventory shows a release in its waiting period as held' } else { Fail "held state: $($r.Output)" }
 

@@ -97,6 +97,10 @@ out="$("${INV[@]}" --offline 2>&1)" || true
 grep -Eq '^Fake NPM +npm +1\.0\.0 +installed' <<< "$out" && pass "--offline skips latest lookups" || fail "offline: $out"
 ! grep -q 'notify:' <<< "$out" && pass "a known duplicate does not notify again" || fail "duplicate notified twice"
 
+mkdir -p "$AICM_HOME/hooks"
+printf '#!/usr/bin/env bash\necho ran >> "%s/hook.log"\n' "$WORK" > "$AICM_HOME/hooks/post-update.sh"
+chmod +x "$AICM_HOME/hooks/post-update.sh"
+
 echo "# update waits 3 days and checks the release"
 out="$("$UPD" --targets fakenpm,fakesolo,fakeshadow 2>&1)" && rc=0 || rc=$?
 echo "$out"
@@ -110,6 +114,8 @@ grep -q 'pass: Fake Shadow is installed standalone' <<< "$out" && pass "no updat
 
 out="$("$UPD" --targets fakenpm 2>&1)" || true
 grep -q 'already current: @fake/npmcli 1.1.0' <<< "$out" && pass "nothing newer than the waiting period: not reinstalled" || fail "reinstalled: $out"
+[[ "$(grep -c ran "$WORK/hook.log" 2>/dev/null)" == 1 ]] && pass "post-update hook ran once: only the run that changed a version" || fail "hook runs: $(cat "$WORK/hook.log" 2>/dev/null)"
+grep -q 'post-update hook skipped: no CLI version changed' <<< "$out" && pass "hook skipped when nothing changed" || fail "hook skip message"
 out="$("${INV[@]}" 2>&1)" || true
 grep -Eq '^Fake NPM +npm +1\.1\.0 +1\.2\.0 +held +yes' <<< "$out" && pass "inventory shows a release in its waiting period as held" || fail "held state: $out"
 
