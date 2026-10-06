@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.5.1 - 2026-10-07
+
+### Fixed
+- The post-update hook runs only when a CLI version actually changed. With retries during the day it
+  would otherwise reload daemons such as Paseo several times a day for nothing.
+
 ## 2.5.0 - 2026-10-07
 
 Hardening for months of unattended use, from a review of real logs: the previous updater on the first

@@ -118,11 +118,14 @@ try {
       return $null
     }
 
+    # Every version line printed is also collected, so before and after can be compared.
+    $script:versionText = ''
     function Write-Version([string]$Name) {
       $path = Get-CommandPath $Name
       if ($path) {
         $result = Invoke-AicmWithTimeout $Name @('--version') $VersionTimeoutSeconds
         $firstLine = (($result.Output -split "`r?`n") | Where-Object { $_ } | Select-Object -First 1)
+        $script:versionText += "$Name=$firstLine;"
         if ($result.ExitCode -eq 124) {
           Write-Host "${Name}: TIMEOUT after ${VersionTimeoutSeconds}s"
         } elseif ($result.ExitCode -ne 0) {
@@ -446,6 +449,8 @@ try {
       }
     }
 
+    $versionsBefore = $script:versionText
+    $script:versionText = ''
     Write-Host ""
     Write-Host "== after versions =="
     if (Test-GptTargetEnabled) { Write-Version codex }
@@ -457,9 +462,12 @@ try {
     $script:AicmWingetText = $null
     foreach ($x in $catalogExtras) { if ($x.Entry.Command) { Write-Version $x.Entry.Command } else { Write-Host "$($x.Entry.Name): $(Get-AicmWingetVersion $x.Entry.Winget) (winget)" } }
 
-    # Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Failure is only a warning.
+    # Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Runs only when a CLI
+    # version actually changed (the job retries during the day). Failure is only a warning.
     $hook = Join-Path (Get-AicmHome) 'hooks\post-update.ps1'
-    if (-not $DryRun -and (Test-Path -LiteralPath $hook)) {
+    $versionsChanged = $versionsBefore -ne $script:versionText
+    if (-not $DryRun -and -not $versionsChanged -and (Test-Path -LiteralPath $hook)) { Write-Host ''; Write-Host 'post-update hook skipped: no CLI version changed' }
+    if (-not $DryRun -and $versionsChanged -and (Test-Path -LiteralPath $hook)) {
       Write-Host ""
       Write-Host "== post-update hook =="
       try {
