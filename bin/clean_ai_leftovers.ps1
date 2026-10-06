@@ -312,8 +312,11 @@ try {
   foreach ($rule in $allRules) {
     $explicit = $selected -contains $rule.Id
     if ($selected.Count -gt 0 -and -not $explicit) { continue }
-    $row = [ordered]@{ id = $rule.Id; kind = $rule.Kind; enabled = ($rule.Enabled -or $explicit); path = $rule.Path; status = ''; files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; purge = 0; purgeBytes = 0L; purged = 0; purgedBytes = 0L; detail = ''; totalBytes = $null; note = $rule.Note }
+    $row = [ordered]@{ id = $rule.Id; kind = $rule.Kind; enabled = ($rule.Enabled -or $explicit); path = $rule.Path; status = ''; files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; purge = 0; purgeBytes = 0L; purged = 0; purgedBytes = 0L; detail = ''; direct = $false; totalBytes = $null; note = $rule.Note }
     $archiving = @('archive', 'codex') -contains $rule.Kind
+    # A codex rule with limit 0 deletes directly; show it as a deletion, not an archive.
+    $direct = ($rule.Kind -eq 'codex' -and $rule.Limit -eq 0)
+    $row.direct = $direct
     try {
       if ($rule.Kind -eq 'command') {
         $row.path = $rule.Path
@@ -345,6 +348,8 @@ try {
           foreach ($k in 'files', 'bytes', 'removed', 'removedBytes', 'inUse') { $row[$k] = $r[$k] }
           if ($archiving) { foreach ($k in 'purge', 'purgeBytes', 'purged', 'purgedBytes', 'detail') { $row[$k] = $r[$k] } }
           if (-not $row.enabled) { $row.status = 'off' }
+          elseif ($direct -and $DryRun) { $row.status = 'would remove' }
+          elseif ($direct) { $row.status = 'removed' }
           elseif ($archiving -and $DryRun) { $row.status = 'would archive' }
           elseif ($archiving) { $row.status = 'archived' }
           elseif ($DryRun) { $row.status = 'would remove' }
@@ -360,14 +365,14 @@ try {
 
   Write-Host ''
   foreach ($row in $rows) {
-    $age = switch ($row.kind) { 'age' { 'age' } 'cap' { 'cap' } 'keep-latest' { 'keep' } 'archive' { 'arch' } 'codex' { 'arch' } default { 'cmd' } }
+    $age = switch ($row.kind) { 'age' { 'age' } 'cap' { 'cap' } 'keep-latest' { 'keep' } 'archive' { 'arch' } 'codex' { if ($row.direct) { 'del' } else { 'arch' } } default { 'cmd' } }
     $unit = if ($row.kind -eq 'keep-latest') { 'dirs ' } else { 'files' }
     $done = @('removed', 'archived') -contains $row.status
-    $size = if ($row.kind -eq 'command') { '' } elseif ($done) { "{0,6} {1} {2,10}" -f $row.removed, $unit, (Format-AicmSize $row.removedBytes) } else { "{0,6} {1} {2,10}" -f $row.files, $unit, (Format-AicmSize $row.bytes) }
+    $size = if ($row.kind -eq 'command') { '' } elseif ($row.direct -and $done) { "{0,6} {1} {2,10}" -f $row.purged, $unit, (Format-AicmSize $row.purgedBytes) } elseif ($row.direct) { "{0,6} {1} {2,10}" -f $row.purge, $unit, (Format-AicmSize $row.purgeBytes) } elseif ($done) { "{0,6} {1} {2,10}" -f $row.removed, $unit, (Format-AicmSize $row.removedBytes) } else { "{0,6} {1} {2,10}" -f $row.files, $unit, (Format-AicmSize $row.bytes) }
     $total = if ($null -ne $row.totalBytes) { "  of {0,10}" -f (Format-AicmSize $row.totalBytes) } else { '' }
     $busy = if ($row.inUse -gt 0) { " ($($row.inUse) in use or failed, kept)" } else { '' }
     $purgeText = ''
-    if (@('archive', 'codex') -contains $row.kind -and $row.status -notlike 'not present*' -and $row.status -notlike 'refused*') {
+    if (@('archive', 'codex') -contains $row.kind -and -not $row.direct -and $row.status -notlike 'not present*' -and $row.status -notlike 'refused*') {
       $purgeText = if ($done) { "; deleted from archive: $($row.purged) ($(Format-AicmSize $row.purgedBytes))" } else { "; would delete from archive: $($row.purge) ($(Format-AicmSize $row.purgeBytes))" }
     }
     Write-Host ("{0,-22} {1,-4} {2,-22}{3}  {4}{5}{6}  {7}" -f $row.id, $age, $size, $total, $row.status, $purgeText, $busy, $row.path)
