@@ -143,12 +143,13 @@ aicm_load_rule_file() {
     id="$(aicm_trim "$id")"; os="$(aicm_lower "$(aicm_trim "$os")")"; kind="$(aicm_lower "$(aicm_trim "$kind")")"
     path="$(aicm_trim "$path")"; pattern="$(aicm_trim "$pattern")"; days="$(aicm_trim "$days")"
     limit="$(aicm_trim "$limit")"; default="$(aicm_lower "$(aicm_trim "$default")")"; note="$(aicm_trim "$note")"
-    case "$kind" in age|cap|keep-latest|command) ;; *) echo "invalid rule kind '$kind' in $source: $line" >&2; return 1 ;; esac
+    case "$kind" in age|cap|keep-latest|command|archive|codex) ;; *) echo "invalid rule kind '$kind' in $source: $line" >&2; return 1 ;; esac
     case "$default" in on|off) ;; *) echo "invalid default '$default' in $source: $line" >&2; return 1 ;; esac
     [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || { echo "invalid days in $source: $line" >&2; return 1; }
     [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || { echo "invalid limit in $source: $line" >&2; return 1; }
     if [[ "$kind" == age ]] && (( ${days:-0} < 1 )); then echo "age rule needs days >= 1 in $source: $line" >&2; return 1; fi
     if [[ "$kind" == keep-latest ]] && (( ${limit:-0} < 1 )); then echo "keep-latest rule needs limit >= 1 in $source: $line" >&2; return 1; fi
+    if [[ "$kind" == archive || "$kind" == codex ]] && (( ${days:-0} < 1 || ${limit:-0} < 1 )); then echo "$kind rule needs days >= 1 (archive after) and limit >= 1 (delete after) in $source: $line" >&2; return 1; fi
     aicm_os_matches "$os" || continue
     if idx="$(aicm_rule_index "$id")"; then :; else idx=${#AICM_RULE_ID[@]}; fi
     AICM_RULE_ID[idx]="$id"; AICM_RULE_KIND[idx]="$kind"; AICM_RULE_PATH[idx]="$path"
@@ -199,6 +200,71 @@ aicm_notify() {
     notify-send "$title" "$body" >/dev/null 2>&1 || true
   fi
   return 0
+}
+
+# yyyymmdd of the date N days ago (GNU date, BSD date, or perl).
+aicm_date_days_ago() {
+  local n="$1"
+  date -d "-$n days" +%Y%m%d 2>/dev/null && return 0
+  date -v-"$n"d +%Y%m%d 2>/dev/null && return 0
+  perl -e 'my @t = localtime(time - $ARGV[0] * 86400); printf "%04d%02d%02d\n", $t[5] + 1900, $t[4] + 1, $t[3]' "$n"
+}
+
+# Days after which the CLI deletes these files itself (0 when it does not). The archive step has to
+# run before that, and the cleanup runs weekly, so it archives a week earlier than the CLI deletes.
+aicm_native_retention_days() {
+  local v
+  case "$1" in
+    claude-transcripts)
+      v="$(sed -n 's/.*"cleanupPeriodDays"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$HOME/.claude/settings.json" 2>/dev/null | head -n 1)"
+      echo "${v:-30}" ;;
+    gemini-tmp)
+      v="$(sed -n 's/.*"maxAge"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*[hdw]\)".*/\1/p' "$HOME/.gemini/settings.json" 2>/dev/null | head -n 1)"
+      case "$v" in
+        *h) echo $(( (${v%h} + 23) / 24 )) ;;
+        *w) echo $(( ${v%w} * 7 )) ;;
+        *d) echo "${v%d}" ;;
+        *) echo 30 ;;
+      esac ;;
+    qwen-tmp)
+      v="$(sed -n 's/.*"cleanupPeriodDays"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$HOME/.qwen/settings.json" 2>/dev/null | head -n 1)"
+      echo "${v:-30}" ;;
+    *) echo 0 ;;
+  esac
+}
+
+aicm_archive_days() { # rule_id rule_days
+  local native days="$2"
+  native="$(aicm_native_retention_days "$1")"
+  if ((native > 0)); then
+    ((native - 8 < days)) && days=$((native - 8))
+    ((days < 1)) && days=1
+  fi
+  echo "$days"
+}
+
+# Codex threads from its state DB (read-only), one "id<TAB>rollout_path<TAB>updated_at<TAB>archived" line each.
+# Uses sqlite3 (always on macOS) or python3 on Linux; fails when neither can read it.
+aicm_codex_threads() {
+  local root="$1" db
+  [[ "${AICM_CODEX_DB_READER:-1}" == 0 ]] && return 1
+  db="$(find "$root" -maxdepth 1 -name 'state_*.sqlite' -type f 2>/dev/null | sort -t_ -k2 -n | tail -n 1)"
+  [[ -n "$db" ]] || return 1
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 -readonly -separator "$(printf '\t')" "$db" 'select id, rollout_path, updated_at, archived from threads' 2>/dev/null
+    return
+  fi
+  # On macOS python3 may be an installer stub, so only Linux falls back to it.
+  if [[ "$(aicm_os)" == linux ]] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$db" <<'PY' 2>/dev/null
+import sqlite3, sys
+con = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
+for r in con.execute('select id, rollout_path, updated_at, archived from threads'):
+    print('\t'.join('' if v is None else str(v) for v in r))
+PY
+    return
+  fi
+  return 1
 }
 
 AICM_LAUNCHD_PREFIX="io.github.wilgon456.ai-cli-auto-manager"
@@ -317,6 +383,12 @@ aicm_npm_cache() {
   [[ -n "$AICM_NPM_CMD" ]] && command -v "$AICM_NPM_CMD" >/dev/null 2>&1 || return 0
   AICM_NPM_PREFIX_CACHE="$(aicm_timeout 30 "$AICM_NPM_CMD" prefix -g 2>/dev/null | head -n 1 || true)"
   AICM_NPM_ROOT_CACHE="$(aicm_timeout 30 "$AICM_NPM_CMD" root -g 2>/dev/null | head -n 1 || true)"
+  # Git Bash on Windows: npm prints C:/... while command -v prints /c/... or /tmp/...; use one form.
+  if command -v cygpath >/dev/null 2>&1; then
+    [[ -n "$AICM_NPM_PREFIX_CACHE" ]] && AICM_NPM_PREFIX_CACHE="$(cygpath -u "$AICM_NPM_PREFIX_CACHE")"
+    [[ -n "$AICM_NPM_ROOT_CACHE" ]] && AICM_NPM_ROOT_CACHE="$(cygpath -u "$AICM_NPM_ROOT_CACHE")"
+  fi
+  return 0
 }
 
 # Version of a globally installed npm package, empty when not installed.
@@ -399,4 +471,68 @@ aicm_cli_coverage() {
       else echo "no: installed standalone without a self-update command"; fi ;;
     *) echo no ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Release checks for npm installs (logic in lib/npm-guard.js, shared with Windows)
+#   AICM_MIN_RELEASE_AGE_DAYS  only install versions at least this old (default 3, 0 = newest)
+#   AICM_VERIFY_SIGNATURES     0 skips the staged `npm audit signatures` check (default on)
+#   AICM_ALLOW                 comma list of pkg@version accepted despite red flags
+# ---------------------------------------------------------------------------
+
+aicm_min_release_age_days() {
+  if [[ "${AICM_MIN_RELEASE_AGE_DAYS:-}" =~ ^[0-9]+$ ]]; then echo "$AICM_MIN_RELEASE_AGE_DAYS"; else echo 3; fi
+}
+
+aicm_npm() { aicm_timeout "${AICM_NPM_TIMEOUT:-900}" "${NPM:-$AICM_NPM_CMD}" "$@"; }
+
+# Writes `npm view <args> --json` to a temp file and prints its path.
+aicm_npm_view_file() {
+  local f
+  f="$(mktemp)"
+  if ! AICM_NPM_TIMEOUT=90 aicm_npm view "$@" --json > "$f" 2>/dev/null; then rm -f "$f"; return 1; fi
+  echo "$f"
+}
+
+# The version to install: the newest stable release at least N days old (empty when none is).
+aicm_npm_target() { # pkg days
+  local pkg="$1" days="$2" f out
+  if ((days <= 0)); then
+    AICM_NPM_TIMEOUT=60 aicm_npm view "$pkg" version 2>/dev/null | aicm_semver || true
+    return 0
+  fi
+  f="$(aicm_npm_view_file "$pkg" time dist-tags)" || return 1
+  out="$(node "$AICM_ROOT/lib/npm-guard.js" pick "$days" "$f")" || { rm -f "$f"; return 1; }
+  rm -f "$f"
+  printf '%s' "$out" | head -n 1
+}
+
+# Fails when the candidate looks unlike the installed release or fails the registry signature check.
+aicm_npm_check() { # pkg installed target
+  local pkg="$1" installed="$2" target="$3" old new flags stage summary rc
+  if [[ -n "$installed" ]]; then
+    old="$(aicm_npm_view_file "$pkg@$installed")" || { echo "could not read $pkg@$installed from the registry"; return 1; }
+    new="$(aicm_npm_view_file "$pkg@$target")" || { rm -f "$old"; echo "could not read $pkg@$target from the registry"; return 1; }
+    flags="$(node "$AICM_ROOT/lib/npm-guard.js" compare "$old" "$new")" || { rm -f "$old" "$new"; echo "npm-guard failed"; return 1; }
+    rm -f "$old" "$new"
+    if [[ -n "$flags" ]]; then
+      printf '%s\n' "$flags" | sed "s|^|red flag: $pkg |"
+      if [[ ",${AICM_ALLOW:-}," != *",$pkg@$target,"* ]]; then
+        echo "blocked $pkg@$target. If this is expected, set AICM_ALLOW=$pkg@$target"
+        return 1
+      fi
+    fi
+  fi
+  [[ "${AICM_VERIFY_SIGNATURES:-1}" == 0 ]] && return 0
+  stage="$(mktemp -d)"
+  # --ignore-scripts: nothing from the candidate runs before it has passed the checks.
+  if ! aicm_npm install "$pkg@$target" --prefix "$stage" --ignore-scripts --no-audit --no-fund --loglevel=error >/dev/null 2>&1; then
+    rm -rf "$stage"; echo "staged install of $pkg@$target failed"; return 1
+  fi
+  rc=0
+  summary="$(AICM_NPM_TIMEOUT=300 aicm_npm audit signatures --prefix "$stage" 2>&1)" || rc=$?
+  rm -rf "$stage"
+  summary="$(printf '%s\n' "$summary" | awk 'NF' | paste -sd '/' -)"
+  if ((rc != 0)); then echo "signature check failed for $pkg@$target: $summary"; return 1; fi
+  echo "signatures ok: $summary"
 }

@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.2.0 - 2026-10-06
+
+### Added
+- Safer npm updates (`lib/npm-guard.js`, shared by both platforms):
+  - only releases at least 3 days old are installed (`AICM_MIN_RELEASE_AGE_DAYS`,
+    `-MinReleaseAgeDays`, `--min-release-age-days`; 0 = newest); the inventory shows newer
+    releases in their waiting period as `held`;
+  - a release is blocked when it loses the provenance attestation the installed release had, or
+    adds or changes a preinstall/install/postinstall script (this catches the Cline CLI 2.3.0
+    incident); `AICM_ALLOW=pkg@version` accepts a reviewed release;
+  - the candidate is installed into a temporary folder with `--ignore-scripts` and checked with
+    `npm audit signatures` before the global install (`AICM_VERIFY_SIGNATURES=0` skips it).
+- Two-stage cleanup for conversation history: rule kind `archive` moves old session files to
+  `~/.ai-cli-auto-manager/archive/<rule>/<date>/` and deletes archive folders after `limit` days.
+- Rule kind `codex`: Codex sessions are archived with `codex archive` and deleted with
+  `codex delete --force`, never by removing files. Sessions whose file is already gone are deleted
+  on the same schedule (reads Codex's database read-only with Python or sqlite3 when available).
+- Archive ages follow the CLIs' own retention settings (Claude Code `cleanupPeriodDays`, Gemini CLI
+  `sessionRetention.maxAge`, Qwen Code `cleanupPeriodDays`): archiving happens a week before the
+  CLI would delete the files itself.
+- New rule `copilot-sessions`; `status` shows the archive size.
+
+### Changed
+- `claude-transcripts`, `gemini-tmp`, `qwen-tmp`, `grok-sessions`, `codex-images` archive instead
+  of deleting; `codex-sessions` uses Codex's commands; `codex-archived` is gone (covered by `codex-sessions`).
+
+### Fixed
+- Deleting Codex rollout files directly (1.x, 2.0, 2.1) left sessions in Codex's database that
+  could not be opened. 2.2 stops doing that and removes such entries once they are 90 days unused.
+
 ## 2.1.1 - 2026-10-06
 
 ### Fixed

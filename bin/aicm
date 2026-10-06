@@ -234,6 +234,9 @@ case "$cmd" in
     echo "update     $(state_age_text last-update)"
     echo "inventory  $(state_age_text inventory)"
     echo "clean      $(state_age_text last-clean)"
+    if [[ -d "$AICM_HOME/archive" ]]; then
+      echo "archive    $(aicm_format_size "$(find "$AICM_HOME/archive" -type f -print0 | aicm_sizes_stdin | aicm_sum_lines)") in $AICM_HOME/archive (move files back to restore)"
+    fi
     if [[ -f "$AICM_HOME/inventory.md" ]]; then
       echo
       echo "== installed AI CLIs (from the last inventory: $AICM_HOME/inventory.md) =="

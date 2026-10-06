@@ -60,7 +60,13 @@ for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
   fi
   if [[ -z "$version" ]]; then state=unknown
   elif [[ -z "$latest" ]]; then state=installed
-  elif aicm_version_older "$version" "$latest"; then state=behind
+  elif aicm_version_older "$version" "$latest"; then
+    state=behind
+    # A newer release that is still inside the waiting period is expected, not a problem.
+    if [[ "$CLI_METHOD" == npm ]]; then
+      target="$(aicm_npm_target "$npm_pkg" "$(aicm_min_release_age_days)" 2>/dev/null || true)"
+      if [[ -z "$target" ]] || ! aicm_version_older "$version" "$target"; then state=held; fi
+    fi
   else state=current; fi
   coverage="$(aicm_cli_coverage "$i")"
   printf '%-20s %-11s %-14s %-14s %-9s %s\n' "$name" "$CLI_METHOD" "$version" "$latest" "$state" "$coverage"

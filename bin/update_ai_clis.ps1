@@ -13,12 +13,15 @@ param(
   [int]$LogRetentionDays = $(if ($env:LOG_RETENTION_DAYS) { [int]$env:LOG_RETENTION_DAYS } else { 30 }),
   [int]$VersionTimeoutSeconds = $(if ($env:VERSION_TIMEOUT_SECONDS) { [int]$env:VERSION_TIMEOUT_SECONDS } else { 10 }),
   [string[]]$Targets = $(if ($env:AI_CLI_TARGETS) { $env:AI_CLI_TARGETS } else { 'all' }),
-  [switch]$InstallMissing
+  [switch]$InstallMissing,
+  # npm releases younger than this are not installed yet (env AICM_MIN_RELEASE_AGE_DAYS, default 3; 0 = newest).
+  [int]$MinReleaseAgeDays = -1
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-common.ps1')
+if ($MinReleaseAgeDays -lt 0) { $MinReleaseAgeDays = Get-AicmMinReleaseAgeDays }
 
 function Get-Timestamp {
   return (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -150,16 +153,24 @@ try {
       return ''
     }
 
+    # Only releases at least $MinReleaseAgeDays old are installed, and only after they look like the
+    # installed release (provenance kept, no new install scripts) and pass a staged signature check.
     function Update-NpmPackage([string]$Package) {
       if (-not (Get-CommandPath 'npm')) { throw 'npm is not installed' }
-      # Skip the reinstall when already current: reinstalling a CLI that is running fails on Windows (EBUSY).
       $installed = Get-NpmInstalledVersion $Package
-      $latest = ((& npm view $Package version 2>$null) -join '').Trim()
-      if ($installed -and $latest -and $installed -eq $latest) {
-        Write-Host "already current: $Package $installed"
+      $target = Get-AicmNpmTarget $Package $MinReleaseAgeDays
+      if (-not $target) {
+        Write-Host "hold: no release of $Package is $MinReleaseAgeDays days old yet"
         return
       }
-      & npm install -g "$Package@latest"
+      # Skip the reinstall when already current: reinstalling a CLI that is running fails on Windows (EBUSY).
+      if ($installed -and (Compare-AicmVersion $installed $target) -ge 0) {
+        Write-Host "already current: $Package $installed (newest release at least $MinReleaseAgeDays days old: $target)"
+        return
+      }
+      Write-Host "candidate: $Package $installed -> $target"
+      Test-AicmNpmRelease $Package $installed $target
+      & npm install -g "$Package@$target"
       if ($LASTEXITCODE -ne 0) { throw "npm install failed for $Package with exit code $LASTEXITCODE" }
     }
 
@@ -291,7 +302,7 @@ try {
     }
 
     Write-Host "[$(Get-Timestamp)] AI CLI update started"
-    Write-Host "host=$env:COMPUTERNAME user=$env:USERNAME dry_run=$DryRun targets=$(($Targets -join ',')) install_missing=$InstallMissing"
+    Write-Host "host=$env:COMPUTERNAME user=$env:USERNAME dry_run=$DryRun targets=$(($Targets -join ',')) install_missing=$InstallMissing min_release_age_days=$MinReleaseAgeDays"
     Remove-OldLogs $LogDir $LogRetentionDays
 
     Write-Host ""

@@ -29,6 +29,7 @@ AI_CLI_TARGETS="${AI_CLI_TARGETS:-all}"
 INSTALL_MISSING="${INSTALL_MISSING:-false}"
 PATH="/usr/local/bin:/opt/homebrew/bin:${HOME:-}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 DRY_RUN=false
+MIN_RELEASE_AGE_DAYS="$(aicm_min_release_age_days)"
 VERSION_TIMEOUT_SECONDS="${VERSION_TIMEOUT_SECONDS:-10}"
 if [[ ! "$VERSION_TIMEOUT_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "$VERSION_TIMEOUT_SECONDS" == 0 || "$VERSION_TIMEOUT_SECONDS" == 0.0 ]]; then
   VERSION_TIMEOUT_SECONDS=10
@@ -43,8 +44,13 @@ while (($#)); do
       AI_CLI_TARGETS="$1"
       ;;
     --targets=*) AI_CLI_TARGETS="${1#--targets=}" ;;
+    --min-release-age-days)
+      shift
+      [[ "${1:-}" =~ ^[0-9]+$ ]] || { echo "--min-release-age-days needs a number" >&2; exit 2; }
+      MIN_RELEASE_AGE_DAYS="$1"
+      ;;
     -h|--help)
-      echo "Usage: $0 [--dry-run|--check] [--targets all|id,id (see rules/ai-clis.conf)] [--install-missing]"
+      echo "Usage: $0 [--dry-run|--check] [--targets all|id,id (see rules/ai-clis.conf)] [--install-missing] [--min-release-age-days N]"
       exit 0
       ;;
     *)
@@ -327,25 +333,36 @@ npm_installed_version() {
   node -p "require(process.argv[1]).version" "$root/$1/package.json" 2>/dev/null || true
 }
 
+# Only releases at least MIN_RELEASE_AGE_DAYS old are installed, and only after they look like the
+# installed release (provenance kept, no new install scripts) and pass a staged signature check.
 update_npm_package() {
-  local pkg="$1" installed latest
+  local pkg="$1" installed target
   if is_npm_global_installed "$pkg"; then
     installed="$(npm_installed_version "$pkg")"
-    latest="$("$NPM" view "$pkg" version 2>/dev/null || true)"
-    if [[ -n "$installed" && "$installed" == "$latest" ]]; then
-      echo "already current: $pkg $installed"
+    target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS")" || { echo "could not read the release list of $pkg"; return 1; }
+    if [[ -z "$target" ]]; then
+      echo "hold: no release of $pkg is $MIN_RELEASE_AGE_DAYS days old yet"
       return 0
     fi
-    "$NPM" install -g "$pkg@latest"
+    if [[ -n "$installed" ]] && ! aicm_version_older "$installed" "$target"; then
+      echo "already current: $pkg $installed (newest release at least $MIN_RELEASE_AGE_DAYS days old: $target)"
+      return 0
+    fi
+    echo "candidate: $pkg $installed -> $target"
+    aicm_npm_check "$pkg" "$installed" "$target" || return 1
+    "$NPM" install -g "$pkg@$target"
   else
     echo "npm global package not installed: $pkg"
   fi
 }
 
 install_npm_package() {
-  local pkg="$1"
+  local pkg="$1" target
   command -v "$NPM" >/dev/null 2>&1 || { echo "npm is not installed"; return 1; }
-  "$NPM" install -g "$pkg@latest"
+  target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS")" || { echo "could not read the release list of $pkg"; return 1; }
+  [[ -n "$target" ]] || { echo "hold: no release of $pkg is $MIN_RELEASE_AGE_DAYS days old yet"; return 0; }
+  aicm_npm_check "$pkg" "" "$target" || return 1
+  "$NPM" install -g "$pkg@$target"
 }
 
 update_agy_cli() {
@@ -486,7 +503,7 @@ update_kimi_cli() {
 }
 
 echo "[$(ts)] AI CLI update started"
-echo "host=$(hostname) user=$(id -un) dry_run=$DRY_RUN targets=$AI_CLI_TARGETS install_missing=$INSTALL_MISSING"
+echo "host=$(hostname) user=$(id -un) dry_run=$DRY_RUN targets=$AI_CLI_TARGETS install_missing=$INSTALL_MISSING min_release_age_days=$MIN_RELEASE_AGE_DAYS"
 cleanup_old_logs
 collect_catalog_extras
 
