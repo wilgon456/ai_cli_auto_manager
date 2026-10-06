@@ -217,8 +217,179 @@ aicm_job_exists() {
 aicm_schedule_problems() {
   local skip="${1:-}" file="$AICM_HOME/state/schedule.json" job
   [[ -f "$file" ]] || return 0
-  for job in $(grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean)$'); do
+  for job in $(grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean|inventory)$'); do
     [[ "$job" == "$skip" ]] && continue
     aicm_job_exists "$job" || echo "scheduled job '$job' is missing; run: aicm schedule install"
   done
+}
+
+# ---------------------------------------------------------------------------
+# Running CLIs and the AI CLI catalog
+# ---------------------------------------------------------------------------
+
+# aicm_timeout SECONDS CMD ARGS...: exit 124 when the command runs too long.
+aicm_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    local rc=0
+    perl -e 'alarm shift; exec @ARGV or exit 127' "$secs" "$@" || rc=$?
+    ((rc == 142)) && return 124
+    return "$rc"
+  else
+    "$@"
+  fi
+}
+
+aicm_semver() {
+  grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.-]+)?' | head -n 1
+}
+
+# Succeeds when version $1 is older than $2 (numeric compare of the dotted part).
+aicm_version_older() {
+  local a="${1%%[-+]*}" b="${2%%[-+]*}"
+  [[ -n "$a" && -n "$b" && "$a" != "$b" ]] || return 1
+  awk -v a="$a" -v b="$b" 'BEGIN {
+    n = split(a, x, "."); m = split(b, y, "."); k = (n > m) ? n : m
+    for (i = 1; i <= k; i++) { xi = x[i] + 0; yi = y[i] + 0; if (xi < yi) exit 0; if (xi > yi) exit 1 }
+    exit 1 }'
+}
+
+aicm_realpath() {
+  local p="$1"
+  if command -v perl >/dev/null 2>&1; then
+    perl -MCwd -e 'print Cwd::abs_path(shift)' "$p" 2>/dev/null && return 0
+  fi
+  readlink -f "$p" 2>/dev/null || printf '%s' "$p"
+}
+
+AICM_BUILTIN_IDS=" claude codex opencode grok kimi agy "
+AICM_CLI_ID=(); AICM_CLI_CMD=(); AICM_CLI_NAME=(); AICM_CLI_NPM=(); AICM_CLI_BREW=()
+AICM_CLI_WINGET=(); AICM_CLI_SELF=(); AICM_CLI_NOTE=()
+
+aicm_cli_index() {
+  local id="$1" i
+  for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
+    [[ "${AICM_CLI_ID[$i]}" == "$id" ]] && { echo "$i"; return 0; }
+  done
+  return 1
+}
+
+aicm_cli_col() { local v; v="$(aicm_trim "$1")"; [[ "$v" == - ]] && v=""; printf '%s' "$v"; }
+
+aicm_load_catalog_file() {
+  local file="$1" line id cmd name npm brew winget self note rest idx source
+  [[ -f "$file" ]] || return 0
+  source="$(basename "$file")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$(aicm_trim "$line")" || "$(aicm_trim "$line")" == \#* ]] && continue
+    IFS='|' read -r id cmd name npm brew winget self note rest <<< "$line"
+    id="$(aicm_cli_col "$id")"; cmd="$(aicm_cli_col "$cmd")"; name="$(aicm_cli_col "$name")"
+    npm="$(aicm_cli_col "$npm")"; brew="$(aicm_cli_col "$brew")"; winget="$(aicm_cli_col "$winget")"
+    self="$(aicm_cli_col "$self")"; note="$(aicm_cli_col "$note")"
+    [[ "$id" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "invalid catalog id '$id' in $source" >&2; return 1; }
+    [[ -n "$cmd" || -n "$winget" ]] || { echo "catalog row '$id' in $source needs a command or a winget id" >&2; return 1; }
+    if idx="$(aicm_cli_index "$id")"; then :; else idx=${#AICM_CLI_ID[@]}; fi
+    AICM_CLI_ID[idx]="$id"; AICM_CLI_CMD[idx]="$cmd"; AICM_CLI_NAME[idx]="${name:-$id}"; AICM_CLI_NPM[idx]="$npm"
+    AICM_CLI_BREW[idx]="$brew"; AICM_CLI_WINGET[idx]="$winget"; AICM_CLI_SELF[idx]="$self"; AICM_CLI_NOTE[idx]="$note"
+  done < "$file"
+}
+
+aicm_load_catalog() {
+  AICM_CLI_ID=(); AICM_CLI_CMD=(); AICM_CLI_NAME=(); AICM_CLI_NPM=(); AICM_CLI_BREW=()
+  AICM_CLI_WINGET=(); AICM_CLI_SELF=(); AICM_CLI_NOTE=()
+  aicm_load_catalog_file "${1:-$AICM_ROOT/rules/ai-clis.conf}" || return 1
+  aicm_load_catalog_file "${2:-$AICM_HOME/ai-clis.local.conf}" || return 1
+}
+
+aicm_is_builtin() { [[ "$AICM_BUILTIN_IDS" == *" $1 "* ]]; }
+
+AICM_NPM_CMD="${NPM:-$(command -v npm 2>/dev/null || true)}"
+AICM_NPM_PREFIX_CACHE=""; AICM_NPM_ROOT_CACHE=""; AICM_NPM_CACHED=false
+
+aicm_npm_cache() {
+  [[ "$AICM_NPM_CACHED" == true ]] && return 0
+  AICM_NPM_CACHED=true
+  [[ -n "$AICM_NPM_CMD" ]] && command -v "$AICM_NPM_CMD" >/dev/null 2>&1 || return 0
+  AICM_NPM_PREFIX_CACHE="$(aicm_timeout 30 "$AICM_NPM_CMD" prefix -g 2>/dev/null | head -n 1 || true)"
+  AICM_NPM_ROOT_CACHE="$(aicm_timeout 30 "$AICM_NPM_CMD" root -g 2>/dev/null | head -n 1 || true)"
+}
+
+# Version of a globally installed npm package, empty when not installed.
+aicm_npm_pkg_version() {
+  aicm_npm_cache
+  local file="$AICM_NPM_ROOT_CACHE/$1/package.json"
+  [[ -n "$1" && -n "$AICM_NPM_ROOT_CACHE" && -f "$file" ]] || return 0
+  sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n 1
+}
+
+# Lists global npm packages as "name version" lines.
+aicm_npm_globals() {
+  aicm_npm_cache
+  [[ -n "$AICM_NPM_ROOT_CACHE" && -d "$AICM_NPM_ROOT_CACHE" ]] || return 0
+  local d name
+  for d in "$AICM_NPM_ROOT_CACHE"/* "$AICM_NPM_ROOT_CACHE"/@*/*; do
+    [[ -f "$d/package.json" ]] || continue
+    name="${d#"$AICM_NPM_ROOT_CACHE"/}"
+    echo "$name $(aicm_npm_pkg_version "$name")"
+  done
+}
+
+AICM_BREW_PREFIX_CACHE="unset"
+aicm_brew_prefix() {
+  if [[ "$AICM_BREW_PREFIX_CACHE" == unset ]]; then
+    AICM_BREW_PREFIX_CACHE=""
+    command -v brew >/dev/null 2>&1 && AICM_BREW_PREFIX_CACHE="$(brew --prefix 2>/dev/null || true)"
+  fi
+  printf '%s' "$AICM_BREW_PREFIX_CACHE"
+}
+
+# Sets CLI_INSTALLED CLI_PATH CLI_METHOD (npm|brew|standalone) CLI_NPMCOPY for catalog index $1.
+aicm_cli_install() {
+  local i="$1" cmd npm_version real brew_prefix
+  CLI_INSTALLED=false; CLI_PATH=""; CLI_METHOD=""; CLI_NPMCOPY=""
+  cmd="${AICM_CLI_CMD[$i]}"
+  [[ -n "$cmd" ]] || return 0
+  npm_version="$(aicm_npm_pkg_version "${AICM_CLI_NPM[$i]}")"
+  CLI_PATH="$(command -v "$cmd" 2>/dev/null || true)"
+  if [[ -z "$CLI_PATH" ]]; then
+    if [[ -n "$npm_version" ]]; then CLI_INSTALLED=true; CLI_METHOD=npm; CLI_PATH="(npm package, command not on PATH)"; fi
+    return 0
+  fi
+  CLI_INSTALLED=true
+  real="$(aicm_realpath "$CLI_PATH")"
+  aicm_npm_cache
+  brew_prefix="$(aicm_brew_prefix)"
+  if [[ "$real" == */node_modules/* ]] || { [[ -n "$AICM_NPM_PREFIX_CACHE" ]] && [[ "$CLI_PATH" == "$AICM_NPM_PREFIX_CACHE/bin/"* ]]; }; then
+    CLI_METHOD=npm
+  elif [[ "$real" == */Cellar/* || "$real" == */Caskroom/* ]] || { [[ -n "$brew_prefix" ]] && [[ "$real" == "$brew_prefix/"* ]]; }; then
+    CLI_METHOD=brew
+  else
+    CLI_METHOD=standalone
+  fi
+  [[ "$CLI_METHOD" != npm && -n "$npm_version" ]] && CLI_NPMCOPY="$npm_version"
+  return 0
+}
+
+# Prints whether the daily update keeps the copy on PATH current: "yes" or "no: <why>".
+aicm_cli_coverage() {
+  local i="$1" id
+  id="${AICM_CLI_ID[$i]}"
+  case "$CLI_METHOD" in
+    npm) if [[ -n "${AICM_CLI_NPM[$i]}" ]]; then echo yes; else echo "no: unknown npm package"; fi ;;
+    brew)
+      if [[ -n "${AICM_CLI_BREW[$i]}" ]] || [[ " claude codex opencode " == *" $id "* ]]; then echo yes
+      else echo "no: add its Homebrew name to the catalog"; fi ;;
+    standalone)
+      if aicm_is_builtin "$id" && [[ -n "$CLI_NPMCOPY" && " claude codex opencode kimi " == *" $id "* ]]; then
+        echo "no: the update refreshes the npm copy, not the one on PATH"
+      elif [[ -n "${AICM_CLI_SELF[$i]}" ]]; then echo yes
+      elif [[ -n "${AICM_CLI_NOTE[$i]}" ]]; then echo "no: ${AICM_CLI_NOTE[$i]}"
+      else echo "no: installed standalone without a self-update command"; fi ;;
+    *) echo no ;;
+  esac
 }

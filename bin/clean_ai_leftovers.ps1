@@ -259,7 +259,7 @@ try {
       version = Get-AicmVersion
       ok = ($errors.Count -eq 0)
       freedBytes = [int64]$freedBytes
-      errors = @($errors)
+      errors = $errors.ToArray()
       rules = @($rows | ForEach-Object { [ordered]@{ id = $_.id; status = $_.status; removed = $_.removed; removedBytes = [int64]$_.removedBytes; inUse = $_.inUse } })
     })
     Remove-OldCleanLogs

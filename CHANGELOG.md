@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.1.0 - 2026-10-06
+
+### Added
+- Weekly **inventory** (`aicm inventory`, `bin/inventory_ai_clis.*`): finds every AI CLI in the new
+  catalog `rules/ai-clis.conf` (18 CLIs, extendable with `~/.ai-cli-auto-manager/ai-clis.local.conf`)
+  and reports version, latest published version, install method, and whether the daily update
+  actually reaches the copy on PATH. Flags stale npm copies hidden behind another copy, lists
+  other global npm packages, writes `inventory.md` and `state/inventory.json`, and notifies when
+  a CLI appears or disappears.
+- `schedule install` registers a third job, `Inventory` (weekly, Monday 12:00 by default);
+  `--inventory-day/--inventory-at` (`-InventoryDay/-InventoryAt`) and `--no-inventory` (`-NoInventory`).
+- The daily update now covers every installed catalog CLI, not just the six built-in ones:
+  npm, Homebrew or winget, whichever installed the copy on PATH, or the CLI's own updater.
+  New CLIs are installed only when named explicitly with `--install-missing`.
+- Cleanup rule `qwen-tmp`.
+- `status` shows the last inventory; `doctor` flags an overdue inventory and catalog errors.
+
+### Changed
+- Default update target is `all` (every installed catalog CLI).
+- Grok Build is updated through npm when the copy on PATH is the npm one.
+- Timed commands use `timeout`/`gtimeout`/`perl` before `python3`, because a fresh Mac's
+  `/usr/bin/python3` opens an install dialog.
+
+### Fixed
+- Windows: `--version` and self-update calls failed for npm-installed CLIs (the `.ps1` shim was
+  started directly) and timed calls lost their exit code.
+- Windows PowerShell 5.1: writing state with an empty list failed ("Argument types do not match").
+
 ## 2.0.0 - 2026-10-06
 
 Renamed from **AI CLI Auto Update** (`ai_cli_auto_update_public`) to **AI CLI Auto Manager** (`ai_cli_auto_manager`).

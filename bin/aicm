@@ -11,11 +11,13 @@ usage() {
 AI CLI Auto Manager $(aicm_version)
 
   aicm update    [--dry-run] [--targets codex,claude] [--install-missing]
+  aicm inventory [--offline]   list installed AI CLIs, their versions and update coverage
   aicm clean     [--dry-run] [--rules id,id]
   aicm status    disk use per cleanup rule, schedules, last runs
   aicm doctor    exit 1 when a schedule is missing or a run is overdue or failed
-  aicm schedule  install|remove|show [--update-at 05:00] [--clean-day mon] [--clean-at 12:30]
-                                     [--targets list] [--no-update] [--no-clean]
+  aicm schedule  install|remove|show [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
+                                     [--clean-day mon] [--clean-at 12:30] [--targets list]
+                                     [--no-update] [--no-inventory] [--no-clean]
   aicm version
 EOF
 }
@@ -40,7 +42,7 @@ state_older_than_days() { # name days
 scheduled_jobs() {
   local file="$STATE_DIR/schedule.json"
   [[ -f "$file" ]] || return 0
-  grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean)$' || true
+  grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean|inventory)$' || true
 }
 
 hm_hour() { local h="${1%%:*}"; echo $((10#$h)); }
@@ -96,10 +98,14 @@ remove_plist() {
 cron_without_aicm() { crontab -l 2>/dev/null | grep -v '# aicm:' || true; }
 
 schedule_install() {
-  local update_at=05:00 clean_day=mon clean_at=12:30 targets="" no_update=false no_clean=false
+  local update_at=05:00 inventory_day=mon inventory_at=12:00 clean_day=mon clean_at=12:30 targets=""
+  local no_update=false no_inventory=false no_clean=false
   while (($#)); do
     case "$1" in
       --update-at) shift; update_at="${1:-}" ;;
+      --inventory-day) shift; inventory_day="${1:-}" ;;
+      --inventory-at) shift; inventory_at="${1:-}" ;;
+      --no-inventory) no_inventory=true ;;
       --clean-day) shift; clean_day="${1:-}" ;;
       --clean-at) shift; clean_at="${1:-}" ;;
       --targets) shift; targets="${1:-}" ;;
@@ -109,16 +115,22 @@ schedule_install() {
     esac
     shift
   done
-  [[ "$update_at" =~ ^[0-9]{1,2}:[0-9]{2}$ && "$clean_at" =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || { echo "times must look like 05:00" >&2; exit 2; }
-  [[ "$no_update" == true && "$no_clean" == true ]] && { echo "nothing to install: both --no-update and --no-clean" >&2; exit 2; }
-  local wd jobs="" update_args=()
+  local t
+  for t in "$update_at" "$inventory_at" "$clean_at"; do
+    [[ "$t" =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || { echo "times must look like 05:00" >&2; exit 2; }
+  done
+  [[ "$no_update" == true && "$no_inventory" == true && "$no_clean" == true ]] && { echo "nothing to install" >&2; exit 2; }
+  local wd iwd jobs="" update_args=()
   wd="$(weekday_number "$clean_day")" || exit 2
+  iwd="$(weekday_number "$inventory_day")" || exit 2
   [[ -n "$targets" ]] && update_args=(--targets "$targets")
   mkdir -p "$LOG_DIR"
 
   if [[ "$(aicm_os)" == mac ]]; then
     if [[ "$no_update" == true ]]; then remove_plist update
     else write_plist update "$BIN_DIR/update_ai_clis.sh" "$(hm_hour "$update_at")" "$(hm_minute "$update_at")" "" ${update_args[@]+"${update_args[@]}"}; jobs+='"update",'; fi
+    if [[ "$no_inventory" == true ]]; then remove_plist inventory
+    else write_plist inventory "$BIN_DIR/inventory_ai_clis.sh" "$(hm_hour "$inventory_at")" "$(hm_minute "$inventory_at")" "$iwd"; jobs+='"inventory",'; fi
     if [[ "$no_clean" == true ]]; then remove_plist clean
     else write_plist clean "$BIN_DIR/clean_ai_leftovers.sh" "$(hm_hour "$clean_at")" "$(hm_minute "$clean_at")" "$wd"; jobs+='"clean",'; fi
     if [[ -f "$HOME/Library/LaunchAgents/com.example.ai-cli-auto-update.plist" ]]; then
@@ -127,13 +139,18 @@ schedule_install() {
     fi
   else
     command -v crontab >/dev/null 2>&1 || { echo "crontab is not available" >&2; exit 1; }
-    local lines="" q_update q_clean q_targets=""
+    local lines="" q_update q_clean q_inventory q_targets=""
     q_update="$(printf '%q' "$BIN_DIR/update_ai_clis.sh")"
     q_clean="$(printf '%q' "$BIN_DIR/clean_ai_leftovers.sh")"
+    q_inventory="$(printf '%q' "$BIN_DIR/inventory_ai_clis.sh")"
     [[ -n "$targets" ]] && q_targets=" --targets $(printf '%q' "$targets")"
     if [[ "$no_update" != true ]]; then
       lines+="$(hm_minute "$update_at") $(hm_hour "$update_at") * * * /bin/bash $q_update$q_targets >> $(printf '%q' "$LOG_DIR/cron.update.log") 2>&1 # aicm:update"$'\n'
       jobs+='"update",'
+    fi
+    if [[ "$no_inventory" != true ]]; then
+      lines+="$(hm_minute "$inventory_at") $(hm_hour "$inventory_at") * * $((iwd % 7)) /bin/bash $q_inventory >> $(printf '%q' "$LOG_DIR/cron.inventory.log") 2>&1 # aicm:inventory"$'\n'
+      jobs+='"inventory",'
     fi
     if [[ "$no_clean" != true ]]; then
       lines+="$(hm_minute "$clean_at") $(hm_hour "$clean_at") * * $((wd % 7)) /bin/bash $q_clean >> $(printf '%q' "$LOG_DIR/cron.clean.log") 2>&1 # aicm:clean"$'\n'
@@ -145,12 +162,12 @@ schedule_install() {
     printf '%s' "$lines" | sed 's/^/registered: /'
   fi
   aicm_state_write schedule "{\"installedAt\":\"$(aicm_ts)\",\"version\":\"$(aicm_version)\",\"jobs\":[${jobs%,}]}"
-  echo "Each run checks that the other job still exists and shows a desktop notification if it is gone."
+  echo "Each run checks that the other jobs still exist and shows a desktop notification if one is gone."
 }
 
 schedule_remove() {
   if [[ "$(aicm_os)" == mac ]]; then
-    remove_plist update; remove_plist clean
+    remove_plist update; remove_plist inventory; remove_plist clean
   elif command -v crontab >/dev/null 2>&1; then
     local current
     current="$(cron_without_aicm)"
@@ -162,8 +179,8 @@ schedule_remove() {
 
 schedule_show() {
   local job
-  for job in update clean; do
-    if aicm_job_exists "$job"; then echo "$job   registered"; else echo "$job   not registered"; fi
+  for job in update inventory clean; do
+    if aicm_job_exists "$job"; then printf '%-10s registered\n' "$job"; else printf '%-10s not registered\n' "$job"; fi
   done
   if [[ "$(aicm_os)" != mac ]] && command -v crontab >/dev/null 2>&1; then
     crontab -l 2>/dev/null | grep '# aicm:' | sed 's/^/  /' || true
@@ -179,6 +196,10 @@ doctor() {
     if state_older_than_days last-update 3; then problems+=("no update run in the last 3 days")
     elif ! grep -q '"ok":true' "$STATE_DIR/last-update.json"; then problems+=("last update run failed; see $LOG_DIR/latest.log"); fi
   fi
+  if grep -qx inventory <<< "$jobs" && state_older_than_days inventory 9; then
+    problems+=("no inventory run in the last 9 days")
+  fi
+  if ! (aicm_load_catalog "" "") 2>/dev/null; then problems+=("catalog error in rules/ai-clis.conf or ai-clis.local.conf"); fi
   if grep -qx clean <<< "$jobs"; then
     if state_older_than_days last-clean 9; then problems+=("no cleanup run in the last 9 days")
     elif ! grep -q '"ok":true' "$STATE_DIR/last-clean.json"; then problems+=("last cleanup run had errors; see $LOG_DIR"); fi
@@ -198,6 +219,7 @@ cmd="${1:-help}"
 (($#)) && shift
 case "$cmd" in
   update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
+  inventory) exec "$BIN_DIR/inventory_ai_clis.sh" "$@" ;;
   clean) exec "$BIN_DIR/clean_ai_leftovers.sh" "$@" ;;
   status)
     echo "AI CLI Auto Manager $(aicm_version)   home: $AICM_HOME"
@@ -206,8 +228,14 @@ case "$cmd" in
     schedule_show
     echo
     echo "== last runs =="
-    echo "update  $(state_age_text last-update)"
-    echo "clean   $(state_age_text last-clean)"
+    echo "update     $(state_age_text last-update)"
+    echo "inventory  $(state_age_text inventory)"
+    echo "clean      $(state_age_text last-clean)"
+    if [[ -f "$AICM_HOME/inventory.md" ]]; then
+      echo
+      echo "== installed AI CLIs (from the last inventory: $AICM_HOME/inventory.md) =="
+      grep '^| ' "$AICM_HOME/inventory.md" | tail -n +3 | awk -F '|' '{ for (i = 2; i <= 7; i++) gsub(/^ +| +$/, "", $i); printf "%-20s %-11s %-14s %-9s %s\n", $2, $3, $4, $6, $7 }'
+    fi
     echo
     echo "== disk use by cleanup rule =="
     exec "$BIN_DIR/clean_ai_leftovers.sh" --report
