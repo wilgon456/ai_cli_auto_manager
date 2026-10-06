@@ -25,7 +25,7 @@ LOG_DIR="${LOG_DIR:-$AICM_HOME/logs}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 BREW="${BREW:-$(command -v brew 2>/dev/null || echo /usr/local/bin/brew)}"
 NPM="${NPM:-$(command -v npm 2>/dev/null || echo /usr/local/bin/npm)}"
-AI_CLI_TARGETS="${AI_CLI_TARGETS:-kimi,gpt,opencode,agy,claude,grok}"
+AI_CLI_TARGETS="${AI_CLI_TARGETS:-all}"
 INSTALL_MISSING="${INSTALL_MISSING:-false}"
 PATH="/usr/local/bin:/opt/homebrew/bin:${HOME:-}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 DRY_RUN=false
@@ -44,7 +44,7 @@ while (($#)); do
       ;;
     --targets=*) AI_CLI_TARGETS="${1#--targets=}" ;;
     -h|--help)
-      echo "Usage: $0 [--dry-run|--check] [--targets kimi,gpt,opencode,agy,claude,grok|all] [--install-missing]"
+      echo "Usage: $0 [--dry-run|--check] [--targets all|id,id (see rules/ai-clis.conf)] [--install-missing]"
       exit 0
       ;;
     *)
@@ -59,6 +59,11 @@ ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 command_with_timeout() {
   local timeout_seconds="$1"; shift
+  # timeout/gtimeout/perl first: on a fresh Mac, /usr/bin/python3 is a stub that opens an install dialog.
+  if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 || command -v perl >/dev/null 2>&1; then
+    aicm_timeout "${timeout_seconds%%.*}" "$@" 2>&1
+    return
+  fi
   if command -v python3 >/dev/null 2>&1; then
     python3 - "$timeout_seconds" "$@" <<'PY'
 import subprocess
@@ -181,6 +186,12 @@ target_enabled() {
   local target="$1"
   local normalized=",${AI_CLI_TARGETS//[[:space:]]/},"
   [[ "$normalized" == *,all,* || "$normalized" == *,"$target",* ]]
+}
+
+# True only when the id is named explicitly (not through "all"); used before installing anything new.
+target_named() {
+  local normalized=",${AI_CLI_TARGETS//[[:space:]]/},"
+  [[ "$normalized" == *,"$1",* ]]
 }
 
 gpt_target_enabled() {
@@ -379,13 +390,61 @@ install_or_update_grok_cli() {
 }
 
 update_grok_cli() {
-  if command -v grok >/dev/null 2>&1; then
+  if command -v grok >/dev/null 2>&1 && active_path_contains grok "/node_modules/" && is_npm_global_installed "@xai-official/grok"; then
+    update_npm_package "@xai-official/grok"
+  elif command -v grok >/dev/null 2>&1; then
     install_or_update_grok_cli
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
     install_or_update_grok_cli
   else
     pass_missing grok "command not found"
   fi
+}
+
+self_update_cli() { # command args...
+  local cmd="$1"; shift
+  command_with_timeout 300 "$cmd" "$@"
+}
+
+# Catalog CLIs without dedicated logic (rules/ai-clis.conf). Only installed ones are touched.
+EXTRA_IDX=()
+collect_catalog_extras() {
+  aicm_load_catalog "" "" || return 0
+  local i id
+  for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
+    id="${AICM_CLI_ID[$i]}"
+    aicm_is_builtin "$id" && continue
+    target_enabled "$id" || continue
+    [[ -n "${AICM_CLI_CMD[$i]}" ]] || continue
+    aicm_cli_install "$i"
+    if [[ "$CLI_INSTALLED" == true ]] || { [[ "$INSTALL_MISSING" == true && -n "${AICM_CLI_NPM[$i]}" ]] && target_named "$id"; }; then
+      EXTRA_IDX+=("$i")
+    fi
+  done
+}
+
+update_catalog_extra() {
+  local i="$1" name self_args
+  name="${AICM_CLI_NAME[$i]}"
+  aicm_cli_install "$i"
+  if [[ "$CLI_INSTALLED" != true ]]; then
+    run_step "$name via npm install" install_npm_package "${AICM_CLI_NPM[$i]}"
+    return 0
+  fi
+  case "$CLI_METHOD" in
+    npm) run_step "$name via npm" update_npm_package "${AICM_CLI_NPM[$i]}" ;;
+    brew)
+      if [[ -n "${AICM_CLI_BREW[$i]}" ]]; then run_step "$name via brew" update_brew_package "${AICM_CLI_BREW[$i]}"
+      else pass_missing "${AICM_CLI_ID[$i]}" "installed with Homebrew but the catalog has no Homebrew name"; fi ;;
+    *)
+      if [[ -n "${AICM_CLI_SELF[$i]}" && "${AICM_CLI_SELF[$i]}" != "@installer" ]]; then
+        read -r -a self_args <<< "${AICM_CLI_SELF[$i]}"
+        run_step "$name self-update" self_update_cli "${AICM_CLI_CMD[$i]}" "${self_args[@]}"
+      else
+        echo
+        echo "pass: $name is installed standalone without a self-update command; update it manually"
+      fi ;;
+  esac
 }
 
 update_kimi_cli() {
@@ -404,6 +463,7 @@ update_kimi_cli() {
 echo "[$(ts)] AI CLI update started"
 echo "host=$(hostname) user=$(id -un) dry_run=$DRY_RUN targets=$AI_CLI_TARGETS install_missing=$INSTALL_MISSING"
 cleanup_old_logs
+collect_catalog_extras
 
 echo
 echo "== before versions =="
@@ -413,6 +473,7 @@ target_enabled agy && version_of agy
 target_enabled kimi && version_of kimi
 target_enabled claude && version_of claude
 target_enabled grok && version_of grok
+for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx]}"; done
 
 if command -v "$BREW" >/dev/null 2>&1; then
   if { gpt_target_enabled && { is_brew_cask_installed codex || is_brew_formula_installed codex; }; } || { target_enabled opencode && { is_brew_cask_installed opencode || is_brew_formula_installed opencode; }; } || { target_enabled claude && { is_brew_cask_installed claude-code || is_brew_formula_installed claude-code; }; }; then
@@ -472,6 +533,10 @@ if target_enabled grok; then
   run_step "grok build" update_grok_cli
 fi
 
+for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do
+  update_catalog_extra "$idx"
+done
+
 echo
 echo "== after versions =="
 hash -r || true
@@ -481,6 +546,7 @@ target_enabled agy && version_of agy
 target_enabled kimi && version_of kimi
 target_enabled claude && version_of claude
 target_enabled grok && version_of grok
+for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx]}"; done
 
 # Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Failure is only a warning.
 POST_UPDATE_HOOK="$AICM_HOME/hooks/post-update.sh"

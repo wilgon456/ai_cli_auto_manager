@@ -52,10 +52,12 @@ try {
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 1 -and $r.Output -match 'no schedule installed') { Pass 'doctor flags missing schedule' } else { Fail "doctor without schedule: $($r.Output)" }
 
-  $r = Invoke-Aicm @('schedule', 'install', '-UpdateAt', '06:15', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')
+  $r = Invoke-Aicm @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')
   $update = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -ErrorAction SilentlyContinue
+  $inventory = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue
   $clean = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -ErrorAction SilentlyContinue
-  if ($update -and $clean) { Pass 'both tasks registered' } else { Fail "tasks missing: $($r.Output)" }
+  if ($update -and $inventory -and $clean) { Pass 'three tasks registered' } else { Fail "tasks missing: $($r.Output)" }
+  if ($inventory -and $inventory.Triggers[0].DaysOfWeek -eq 8 -and ([datetime]$inventory.Triggers[0].StartBoundary).ToString('HH:mm') -eq '11:40' -and $inventory.Actions[0].Arguments -match 'inventory_ai_clis\.ps1') { Pass 'inventory trigger (Wednesday) and arguments' } else { Fail 'inventory task' }
   if ($update -and $update.Actions[0].Arguments -match '-Targets "codex,claude"' -and $update.Actions[0].Arguments -match 'update_ai_clis\.ps1') { Pass 'update task arguments' } else { Fail 'update task arguments' }
   if ($update -and ([datetime]$update.Triggers[0].StartBoundary).ToString('HH:mm') -eq '06:15') { Pass 'update time' } else { Fail 'update time' }
   if ($clean -and $clean.Triggers[0].DaysOfWeek -eq 1 -and ([datetime]$clean.Triggers[0].StartBoundary).ToString('HH:mm') -eq '13:05') { Pass 'clean day and time (Sunday)' } else { Fail 'clean trigger' }
@@ -73,6 +75,10 @@ try {
   if (Test-Path -LiteralPath "$aicmHome\logs\latest.log") { Pass 'update log in new home' } else { Fail 'update log location' }
 
   Write-FreshUpdateState
+  $r = Invoke-Aicm @('doctor')
+  if ($r.ExitCode -eq 1 -and $r.Output -match 'no inventory run') { Pass 'doctor flags missing inventory run' } else { Fail "doctor without inventory: $($r.Output)" }
+  $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  "{`"finishedAt`":`"$stamp`",`"version`":`"x`",`"ok`":true,`"clis`":[]}" | Set-Content -LiteralPath "$aicmHome\state\inventory.json" -Encoding UTF8
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 0) { Pass 'doctor healthy after runs' } else { Fail "doctor after runs: $($r.Output)" }
 
@@ -95,7 +101,8 @@ try {
   } else {
     $r = Invoke-Script 'windows\install_scheduled_task.ps1' @('-At', '04:30')
     $legacy = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -ErrorAction SilentlyContinue
-    if ($legacy -and -not (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -ErrorAction SilentlyContinue)) { Pass 'legacy installer registers update only' } else { Fail "legacy installer: $($r.Output)" }
+    $others = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -ne 'Update' })
+    if ($legacy -and $others.Count -eq 0) { Pass 'legacy installer registers update only' } else { Fail "legacy installer: $($r.Output)" }
   }
 } finally {
   Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false

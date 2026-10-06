@@ -16,7 +16,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $aicm = Join-Path (Split-Path -Parent $PSScriptRoot) 'bin\aicm.ps1'
 Write-Host "note: windows\install_scheduled_task.ps1 is deprecated; use: .\bin\aicm.ps1 schedule install"
-$splat = @{ Command = 'schedule'; Action = 'install'; UpdateAt = $At; LogRetentionDays = $LogRetentionDays; NoClean = $true }
+$splat = @{ Command = 'schedule'; Action = 'install'; UpdateAt = $At; LogRetentionDays = $LogRetentionDays; NoClean = $true; NoInventory = $true }
 if ($Targets) { $splat.Targets = @($Targets) }
 if ($InstallMissing) { $splat.InstallMissing = $true }
 & $aicm @splat

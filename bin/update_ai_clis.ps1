@@ -12,7 +12,7 @@ param(
   [string]$LogDir = $(if ($env:LOG_DIR) { $env:LOG_DIR } else { Join-Path $(if ($env:AICM_HOME) { $env:AICM_HOME } else { Join-Path $env:USERPROFILE '.ai-cli-auto-manager' }) 'logs' }),
   [int]$LogRetentionDays = $(if ($env:LOG_RETENTION_DAYS) { [int]$env:LOG_RETENTION_DAYS } else { 30 }),
   [int]$VersionTimeoutSeconds = $(if ($env:VERSION_TIMEOUT_SECONDS) { [int]$env:VERSION_TIMEOUT_SECONDS } else { 10 }),
-  [string[]]$Targets = $(if ($env:AI_CLI_TARGETS) { $env:AI_CLI_TARGETS } else { 'kimi,gpt,opencode,agy,claude,grok' }),
+  [string[]]$Targets = $(if ($env:AI_CLI_TARGETS) { $env:AI_CLI_TARGETS } else { 'all' }),
   [switch]$InstallMissing
 )
 
@@ -27,48 +27,6 @@ function Get-Timestamp {
 function Ensure-Directory([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) {
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
-  }
-}
-
-function Join-ProcessArguments([string[]]$Arguments) {
-  $quoted = foreach ($arg in $Arguments) {
-    if ($null -eq $arg) {
-      '""'
-    } elseif ($arg -eq '') {
-      '""'
-    } elseif ($arg -notmatch '[\s"]') {
-      $arg
-    } else {
-      '"' + ($arg -replace '"', '\"') + '"'
-    }
-  }
-  return ($quoted -join ' ')
-}
-
-function Invoke-WithTimeout([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds) {
-  $cmd = Get-Command $Name -ErrorAction Stop
-  $stdoutFile = [System.IO.Path]::GetTempFileName()
-  $stderrFile = [System.IO.Path]::GetTempFileName()
-  try {
-    $argLine = Join-ProcessArguments $Arguments
-    $process = Start-Process -FilePath $cmd.Source -ArgumentList $argLine -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-      try { $process.Kill() } catch { }
-      $partialOutput = @(
-        if (Test-Path -LiteralPath $stdoutFile) { Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue }
-        if (Test-Path -LiteralPath $stderrFile) { Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue }
-        "TIMEOUT after ${TimeoutSeconds}s"
-      ) -join ''
-      return [pscustomobject]@{ ExitCode = 124; Output = $partialOutput }
-    }
-
-    $output = @(
-      Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
-      Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
-    ) -join ''
-    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $output }
-  } finally {
-    Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -96,6 +54,12 @@ function Remove-OldLogs([string]$Path, [int]$RetentionDays) {
 function Test-TargetEnabled([string]$Name) {
   $selected = @(($Targets -join ',') -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
   return ($selected -contains 'all') -or ($selected -contains $Name.ToLowerInvariant())
+}
+
+# True only when the id is named explicitly (not through 'all'); used before installing anything new.
+function Test-TargetNamed([string]$Name) {
+  $selected = @(($Targets -join ',') -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+  return ($selected -contains $Name.ToLowerInvariant())
 }
 
 function Test-GptTargetEnabled {
@@ -133,7 +97,7 @@ try {
     function Write-Version([string]$Name) {
       $path = Get-CommandPath $Name
       if ($path) {
-        $result = Invoke-WithTimeout $Name @('--version') $VersionTimeoutSeconds
+        $result = Invoke-AicmWithTimeout $Name @('--version') $VersionTimeoutSeconds
         $firstLine = (($result.Output -split "`r?`n") | Where-Object { $_ } | Select-Object -First 1)
         if ($result.ExitCode -eq 124) {
           Write-Host "${Name}: TIMEOUT after ${VersionTimeoutSeconds}s"
@@ -205,7 +169,7 @@ try {
 
     function Update-AgyCli {
       if (-not (Get-CommandPath 'agy')) { throw 'agy is not installed' }
-      $result = Invoke-WithTimeout 'agy' @('update') 300
+      $result = Invoke-AicmWithTimeout 'agy' @('update') 300
       if ($result.Output) { Write-Host $result.Output.TrimEnd() }
       if ($result.ExitCode -ne 0) { throw "agy update failed with exit code $($result.ExitCode)" }
     }
@@ -227,7 +191,7 @@ try {
       if (Test-NpmGlobalPackage '@anthropic-ai/claude-code') {
         Update-NpmPackage '@anthropic-ai/claude-code'
       } elseif (Get-CommandPath 'claude') {
-        $result = Invoke-WithTimeout 'claude' @('update') 300
+        $result = Invoke-AicmWithTimeout 'claude' @('update') 300
         if ($result.Output) { Write-Host $result.Output.TrimEnd() }
         if ($result.ExitCode -ne 0) { throw "claude update failed with exit code $($result.ExitCode)" }
       } elseif ($InstallMissing) {
@@ -241,7 +205,7 @@ try {
       if (Test-NpmGlobalPackage 'opencode-ai') {
         Update-NpmPackage 'opencode-ai'
       } elseif (Get-CommandPath 'opencode') {
-        $result = Invoke-WithTimeout 'opencode' @('upgrade') 300
+        $result = Invoke-AicmWithTimeout 'opencode' @('upgrade') 300
         if ($result.Output) { Write-Host $result.Output.TrimEnd() }
         if ($result.ExitCode -ne 0) { throw "opencode upgrade failed with exit code $($result.ExitCode)" }
       } elseif ($InstallMissing) {
@@ -252,18 +216,46 @@ try {
     }
 
     function Install-OrUpdate-GrokCli {
-      $result = Invoke-WithTimeout 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', 'irm https://x.ai/cli/install.ps1 | iex') 300
+      $result = Invoke-AicmWithTimeout 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', 'irm https://x.ai/cli/install.ps1 | iex') 300
       if ($result.Output) { Write-Host $result.Output.TrimEnd() }
       if ($result.ExitCode -ne 0) { throw "grok installer failed with exit code $($result.ExitCode)" }
     }
 
     function Update-GrokCli {
-      if (Get-CommandPath 'grok') {
+      $grokPath = Get-CommandPath 'grok'
+      $npmPrefix = (Get-AicmNpmInfo).Prefix
+      if ($grokPath -and $npmPrefix -and (Test-AicmUnder $grokPath $npmPrefix) -and (Test-NpmGlobalPackage '@xai-official/grok')) {
+        Update-NpmPackage '@xai-official/grok'
+      } elseif ($grokPath) {
         Install-OrUpdate-GrokCli
       } elseif ($InstallMissing) {
         Install-OrUpdate-GrokCli
       } else {
         Pass-Missing 'grok' 'command not found'
+      }
+    }
+
+    function Update-WingetPackage([string]$Id) {
+      $result = Invoke-AicmWithTimeout 'winget' @('upgrade', '--id', $Id, '--exact', '--source', 'winget', '--accept-source-agreements', '--accept-package-agreements', '--silent', '--disable-interactivity') 900
+      if ($result.Output) { Write-Host $result.Output.TrimEnd() }
+      $noUpdate = ($result.ExitCode -eq -1978335189) -or ($result.Output -match '(?i)no (applicable|available) upgrade|no newer package')
+      if ($result.ExitCode -ne 0 -and -not $noUpdate) { throw "winget upgrade $Id failed with exit code $($result.ExitCode)" }
+    }
+
+    function Invoke-SelfUpdate($Entry) {
+      $selfArgs = @($Entry.SelfUpdate -split '\s+' | Where-Object { $_ })
+      $result = Invoke-AicmWithTimeout $Entry.Command $selfArgs 300
+      if ($result.Output) { Write-Host $result.Output.TrimEnd() }
+      if ($result.ExitCode -ne 0) { throw "$($Entry.Command) $($Entry.SelfUpdate) failed with exit code $($result.ExitCode)" }
+    }
+
+    # Catalog CLIs without dedicated logic (rules\ai-clis.conf). Only installed ones are touched.
+    $catalogExtras = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @(Read-AicmCatalog | Where-Object { -not $_.Builtin })) {
+      if (-not (Test-TargetEnabled $entry.Id)) { continue }
+      $install = Get-AicmCliInstall $entry
+      if ($install.Installed -or ($InstallMissing -and $entry.Npm -and (Test-TargetNamed $entry.Id))) {
+        $catalogExtras.Add([pscustomobject]@{ Entry = $entry; Install = $install })
       }
     }
 
@@ -279,6 +271,7 @@ try {
     if (Test-TargetEnabled 'kimi') { Write-Version kimi }
     if (Test-TargetEnabled 'claude') { Write-Version claude }
     if (Test-TargetEnabled 'grok') { Write-Version grok }
+    foreach ($x in $catalogExtras) { if ($x.Entry.Command) { Write-Version $x.Entry.Command } else { Write-Host "$($x.Entry.Name): $(Get-AicmWingetVersion $x.Entry.Winget) (winget)" } }
 
     if (Test-GptTargetEnabled) {
       if (Test-NpmGlobalPackage '@openai/codex') {
@@ -316,6 +309,25 @@ try {
       Invoke-Step 'grok build' { Update-GrokCli }
     }
 
+    foreach ($x in $catalogExtras) {
+      $e = $x.Entry
+      if (-not $x.Install.Installed) {
+        Invoke-Step "$($e.Name) via npm install" { Install-NpmPackage $e.Npm }
+        continue
+      }
+      switch ($x.Install.Method) {
+        'npm' { Invoke-Step "$($e.Name) via npm" { Update-NpmPackage $e.Npm } }
+        'winget' {
+          if ($e.Winget) { Invoke-Step "$($e.Name) via winget" { Update-WingetPackage $e.Winget } }
+          else { Pass-Missing $e.Id 'installed with winget but the catalog has no winget id' }
+        }
+        default {
+          if ($e.SelfUpdate -and $e.SelfUpdate -ne '@installer') { Invoke-Step "$($e.Name) self-update" { Invoke-SelfUpdate $e } }
+          else { Write-Host ""; Write-Host "pass: $($e.Name) is installed standalone without a self-update command; update it manually" }
+        }
+      }
+    }
+
     Write-Host ""
     Write-Host "== after versions =="
     if (Test-GptTargetEnabled) { Write-Version codex }
@@ -324,6 +336,8 @@ try {
     if (Test-TargetEnabled 'kimi') { Write-Version kimi }
     if (Test-TargetEnabled 'claude') { Write-Version claude }
     if (Test-TargetEnabled 'grok') { Write-Version grok }
+    $script:AicmWingetText = $null
+    foreach ($x in $catalogExtras) { if ($x.Entry.Command) { Write-Version $x.Entry.Command } else { Write-Host "$($x.Entry.Name): $(Get-AicmWingetVersion $x.Entry.Winget) (winget)" } }
 
     # Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Failure is only a warning.
     $hook = Join-Path (Get-AicmHome) 'hooks\post-update.ps1'
@@ -348,7 +362,7 @@ try {
         finishedAt = Get-AicmTimestamp
         version = Get-AicmVersion
         ok = ($script:failures.Count -eq 0)
-        failures = @($script:failures)
+        failures = $script:failures.ToArray()
         logFile = $logFile
       })
       $attention = @($script:failures | ForEach-Object { "update failed: $_" }) + $problems

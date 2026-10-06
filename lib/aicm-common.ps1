@@ -258,3 +258,194 @@ function Get-AicmScheduleProblems([string]$Skip = '') {
   }
   return $problems
 }
+
+# ---------------------------------------------------------------------------
+# Running CLIs and the AI CLI catalog
+# ---------------------------------------------------------------------------
+
+function Join-AicmProcessArguments([string[]]$Arguments) {
+  $quoted = foreach ($arg in $Arguments) {
+    if ($null -eq $arg -or $arg -eq '') { '""' }
+    elseif ($arg -notmatch '[\s"]') { $arg }
+    else { '"' + ($arg -replace '"', '\"') + '"' }
+  }
+  return ($quoted -join ' ')
+}
+
+# Returns a path that CreateProcess can start. npm writes name.ps1 next to name.cmd; the .ps1 cannot be
+# started directly, so the .cmd twin is preferred.
+function Resolve-AicmExecutable([string]$Name) {
+  if ([System.IO.Path]::IsPathRooted($Name) -and (Test-Path -LiteralPath $Name)) {
+    $path = $Name
+  } else {
+    $cmd = Get-Command $Name -CommandType Application, ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $cmd) { return $null }
+    $path = $cmd.Source
+  }
+  if ($path -like '*.ps1') {
+    $twin = [System.IO.Path]::ChangeExtension($path, '.cmd')
+    if (Test-Path -LiteralPath $twin) { return $twin }
+  }
+  return $path
+}
+
+function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds) {
+  $exe = Resolve-AicmExecutable $Name
+  if (-not $exe) { throw "command not found: $Name" }
+  if ($exe -like '*.ps1') {
+    $Arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $exe) + @($Arguments)
+    $exe = (Get-Command powershell.exe).Source
+  }
+  $stdoutFile = [System.IO.Path]::GetTempFileName()
+  $stderrFile = [System.IO.Path]::GetTempFileName()
+  try {
+    $startArgs = @{ FilePath = $exe; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $stdoutFile; RedirectStandardError = $stderrFile }
+    if (@($Arguments).Count -gt 0) { $startArgs.ArgumentList = (Join-AicmProcessArguments $Arguments) }
+    $process = Start-Process @startArgs
+    # Touch the handle now; otherwise ExitCode stays empty after a timed WaitForExit.
+    $null = $process.Handle
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+      try { $process.Kill() } catch { }
+      $partial = @(
+        Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
+        Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
+        "TIMEOUT after ${TimeoutSeconds}s"
+      ) -join ''
+      return [pscustomobject]@{ ExitCode = 124; Output = $partial }
+    }
+    $process.WaitForExit()
+    $output = @(
+      Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
+      Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
+    ) -join ''
+    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $output }
+  } finally {
+    Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Get-AicmSemver([string]$Text) {
+  if ($Text -match '(\d+\.\d+(\.\d+)?([-+][0-9A-Za-z.\-]+)?)') { return $Matches[1] }
+  return ''
+}
+
+# 1 when $A is newer, -1 when older, 0 when equal or not comparable.
+function Compare-AicmVersion([string]$A, [string]$B) {
+  if (-not $A -or -not $B -or $A -eq $B) { return 0 }
+  $va = $null; $vb = $null
+  if ([version]::TryParse(($A -replace '[-+].*$', ''), [ref]$va) -and [version]::TryParse(($B -replace '[-+].*$', ''), [ref]$vb)) {
+    return $va.CompareTo($vb)
+  }
+  return 0
+}
+
+$script:AicmBuiltinIds = @('claude', 'codex', 'opencode', 'grok', 'kimi', 'agy')
+
+function Read-AicmCatalog([string]$CatalogFile = '', [string]$LocalFile = '') {
+  if (-not $CatalogFile) { $CatalogFile = Join-Path (Get-AicmRoot) 'rules\ai-clis.conf' }
+  if (-not $LocalFile) { $LocalFile = Join-Path (Get-AicmHome) 'ai-clis.local.conf' }
+  $ordered = New-Object System.Collections.Generic.List[string]
+  $byId = @{}
+  foreach ($file in @($CatalogFile, $LocalFile)) {
+    if (-not (Test-Path -LiteralPath $file)) { continue }
+    $source = Split-Path -Leaf $file
+    foreach ($line in (Get-Content -LiteralPath $file -Encoding UTF8)) {
+      $t = $line.Trim()
+      if (-not $t -or $t.StartsWith('#')) { continue }
+      $c = @($line.Split('|') | ForEach-Object { $v = $_.Trim(); if ($v -eq '-') { '' } else { $v } })
+      if ($c.Count -lt 7) { throw "invalid catalog row in ${source}: expected 8 columns: $t" }
+      while ($c.Count -lt 8) { $c += '' }
+      if ($c[0] -notmatch '^[a-z0-9][a-z0-9-]*$') { throw "invalid catalog id '$($c[0])' in $source" }
+      if (-not $c[1] -and -not $c[5]) { throw "catalog row '$($c[0])' in $source needs a command or a winget id" }
+      $entry = [pscustomobject]@{
+        Id = $c[0]; Command = $c[1]; Name = $(if ($c[2]) { $c[2] } else { $c[0] }); Npm = $c[3]; Brew = $c[4]; Winget = $c[5]
+        SelfUpdate = $c[6]; Note = $c[7]; Builtin = ($script:AicmBuiltinIds -contains $c[0])
+      }
+      if (-not $byId.ContainsKey($entry.Id)) { $ordered.Add($entry.Id) }
+      $byId[$entry.Id] = $entry
+    }
+  }
+  foreach ($id in $ordered) { $byId[$id] }
+}
+
+$script:AicmNpmInfo = $null
+# Global npm prefix and installed global packages (name -> version), cached per run.
+function Get-AicmNpmInfo {
+  if ($script:AicmNpmInfo) { return $script:AicmNpmInfo }
+  $info = [pscustomobject]@{ Available = $false; Prefix = ''; Packages = @{} }
+  if (Resolve-AicmExecutable 'npm') {
+    $info.Available = $true
+    $prefix = Invoke-AicmWithTimeout 'npm' @('prefix', '-g') 30
+    if ($prefix.ExitCode -eq 0) {
+      $first = @($prefix.Output -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+      if ($first) { $info.Prefix = $first.Trim() }
+    }
+    $list = Invoke-AicmWithTimeout 'npm' @('ls', '-g', '--depth=0', '--json') 60
+    try {
+      $deps = ($list.Output | ConvertFrom-Json).dependencies
+      if ($deps) { foreach ($p in $deps.PSObject.Properties) { $info.Packages[$p.Name] = [string]$p.Value.version } }
+    } catch { }
+  }
+  $script:AicmNpmInfo = $info
+  return $info
+}
+
+$script:AicmWingetText = $null
+function Get-AicmWingetText {
+  if ($null -ne $script:AicmWingetText) { return $script:AicmWingetText }
+  $script:AicmWingetText = ''
+  if (Resolve-AicmExecutable 'winget') {
+    $r = Invoke-AicmWithTimeout 'winget' @('list', '--accept-source-agreements', '--disable-interactivity') 120
+    if ($r.ExitCode -eq 0) { $script:AicmWingetText = $r.Output }
+  }
+  return $script:AicmWingetText
+}
+
+function Get-AicmWingetVersion([string]$Id) {
+  foreach ($line in ((Get-AicmWingetText) -split "`r?`n")) {
+    if ($line -match ('(?i)(^|\s)' + [regex]::Escape($Id) + '\s+(\S+)')) { return $Matches[2] }
+  }
+  return ''
+}
+
+# Where the copy on PATH came from (npm | winget | standalone), plus a stale npm copy hidden behind it.
+function Get-AicmCliInstall($Entry) {
+  $result = [ordered]@{ Installed = $false; Path = ''; Method = ''; NpmCopy = '' }
+  $npm = Get-AicmNpmInfo
+  $npmVersion = ''
+  if ($Entry.Npm -and $npm.Packages.ContainsKey($Entry.Npm)) { $npmVersion = $npm.Packages[$Entry.Npm] }
+  if (-not $Entry.Command) {
+    if ($Entry.Winget -and (Get-AicmWingetVersion $Entry.Winget)) { $result.Installed = $true; $result.Method = 'winget' }
+    return [pscustomobject]$result
+  }
+  $cmd = Get-Command $Entry.Command -CommandType Application, ExternalScript -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $cmd) {
+    if ($npmVersion) { $result.Installed = $true; $result.Method = 'npm'; $result.Path = '(npm package, command not on PATH)' }
+    return [pscustomobject]$result
+  }
+  $result.Installed = $true
+  $result.Path = $cmd.Source
+  if ($npm.Prefix -and (Test-AicmUnder $cmd.Source $npm.Prefix)) { $result.Method = 'npm' }
+  elseif ($cmd.Source -match '\\WinGet\\') { $result.Method = 'winget' }
+  else { $result.Method = 'standalone' }
+  if ($result.Method -ne 'npm' -and $npmVersion) { $result.NpmCopy = $npmVersion }
+  return [pscustomobject]$result
+}
+
+# Whether the daily update keeps the copy on PATH current: 'yes' or 'no: <why>'.
+function Get-AicmUpdateCoverage($Entry, $Install) {
+  switch ($Install.Method) {
+    'npm' { if ($Entry.Npm) { return 'yes' } else { return 'no: unknown npm package' } }
+    'winget' { if ($Entry.Winget) { return 'yes' } else { return 'no: add its winget id to the catalog' } }
+    'standalone' {
+      # The dedicated updaters for these prefer the npm copy when one exists.
+      if ($Entry.Builtin -and $Install.NpmCopy -and (@('claude', 'codex', 'opencode', 'kimi') -contains $Entry.Id)) {
+        return 'no: the update refreshes the npm copy, not the one on PATH'
+      }
+      if ($Entry.SelfUpdate) { return 'yes' }
+      if ($Entry.Note) { return "no: $($Entry.Note)" }
+      return 'no: installed standalone without a self-update command'
+    }
+  }
+  return 'no'
+}
