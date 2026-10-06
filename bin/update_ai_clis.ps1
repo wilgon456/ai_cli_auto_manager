@@ -15,7 +15,10 @@ param(
   [string[]]$Targets = $(if ($env:AI_CLI_TARGETS) { $env:AI_CLI_TARGETS } else { 'all' }),
   [switch]$InstallMissing,
   # npm releases younger than this are not installed yet (env AICM_MIN_RELEASE_AGE_DAYS, default 3; 0 = newest).
-  [int]$MinReleaseAgeDays = -1
+  [int]$MinReleaseAgeDays = -1,
+  # Set by the scheduled task, which also retries during the day: a run after a complete success the
+  # same day exits right away.
+  [switch]$Scheduled
 )
 
 Set-StrictMode -Version Latest
@@ -89,7 +92,25 @@ try {
       exit 0
     }
 
+    if ($Scheduled -and -not $DryRun) {
+      $last = Read-AicmState 'last-update'
+      $lastPending = $last -and $last.PSObject.Properties['pending'] -and $last.pending
+      if ($last -and $last.ok -and -not $lastPending) {
+        $lastDay = $null
+        try { $lastDay = [datetime]::Parse($last.finishedAt).ToLocalTime().Date } catch { }
+        if ($lastDay -eq (Get-Date).Date) {
+          Write-Host "[$(Get-Timestamp)] already updated today ($($last.finishedAt)); nothing to retry"
+          exit 0
+        }
+      }
+    }
+
     $script:failures = New-Object System.Collections.Generic.List[string]
+    $script:deferred = [ordered]@{}
+    $script:updated = New-Object System.Collections.Generic.List[string]
+    $script:pending = $false
+    $script:registryOk = $null
+    $script:processCache = $null
 
     function Get-CommandPath([string]$Name) {
       $cmd = Get-Command $Name -ErrorAction SilentlyContinue
@@ -155,8 +176,37 @@ try {
 
     # Only releases at least $MinReleaseAgeDays old are installed, and only after they look like the
     # installed release (provenance kept, no new install scripts) and pass a staged signature check.
+    # Registry reachable? Checked once per run; when it is not, npm updates are skipped, not failed.
+    function Test-NpmRegistry {
+      if ($null -eq $script:registryOk) {
+        $r = Invoke-AicmWithTimeout 'npm' @('ping') 30
+        $script:registryOk = ($r.ExitCode -eq 0)
+        if (-not $script:registryOk) { Write-Host 'registry unreachable: npm updates are skipped this run and retried later' }
+      }
+      return $script:registryOk
+    }
+
+    # Processes running from a global npm package. Windows cannot replace their files (EBUSY).
+    function Get-NpmPackageUsers([string]$Package) {
+      if ($null -eq $script:processCache) {
+        $script:processCache = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId, Name, ExecutablePath, CommandLine)
+      }
+      $prefix = (Get-AicmNpmInfo).Prefix
+      if (-not $prefix) { return @() }
+      $dir = (Join-Path $prefix ('node_modules\' + $Package.Replace('/', '\'))) + '\'
+      return @($script:processCache | Where-Object {
+        ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) -or
+        ($_.CommandLine -and $_.CommandLine.IndexOf($dir, [StringComparison]::OrdinalIgnoreCase) -ge 0) })
+    }
+
+    function Add-Deferred([string]$Package, [string]$Why) {
+      Write-Host "deferred: $Package $Why; retried on the next run"
+      $script:deferred[$Package] = $Why
+    }
+
     function Update-NpmPackage([string]$Package) {
       if (-not (Get-CommandPath 'npm')) { throw 'npm is not installed' }
+      if (-not (Test-NpmRegistry)) { $script:pending = $true; return }
       $installed = Get-NpmInstalledVersion $Package
       $target = Get-AicmNpmTarget $Package $MinReleaseAgeDays
       if (-not $target) {
@@ -169,9 +219,23 @@ try {
         return
       }
       Write-Host "candidate: $Package $installed -> $target"
+      $users = @(Get-NpmPackageUsers $Package)
+      if ($users.Count -gt 0) {
+        Add-Deferred $Package "is running ($($users.Count) processes, e.g. $($users[0].Name) pid $($users[0].ProcessId))"
+        return
+      }
       Test-AicmNpmRelease $Package $installed $target
-      & npm install -g "$Package@$target"
-      if ($LASTEXITCODE -ne 0) { throw "npm install failed for $Package with exit code $LASTEXITCODE" }
+      # npm writes errors to stderr; keep them as text instead of turning them into a terminating error.
+      $ErrorActionPreference = 'Continue'
+      $out = @(& npm install -g "$Package@$target" 2>&1 | ForEach-Object { "$_" })
+      $rc = $LASTEXITCODE
+      $out | ForEach-Object { Write-Host $_ }
+      if ($rc -ne 0) {
+        # A file still held by a process that started meanwhile: try again later instead of failing.
+        if (($out -join "`n") -match 'EBUSY|EPERM|resource busy|operation not permitted') { Add-Deferred $Package 'files are in use'; return }
+        throw "npm install failed for $Package with exit code $rc"
+      }
+      $script:updated.Add($Package)
     }
 
     function Install-NpmPackage([string]$Package) {
@@ -268,6 +332,16 @@ try {
       if ($grokPath -and $npmPrefix -and (Test-AicmUnder $grokPath $npmPrefix) -and (Test-NpmGlobalPackage '@xai-official/grok')) {
         Update-NpmPackage '@xai-official/grok'
       } elseif ($grokPath) {
+        # The vendor installer is a remote script; run it only when a newer release (past the waiting
+        # period) exists. The npm package carries the same version numbers.
+        if ((Get-CommandPath 'npm') -and (Test-NpmRegistry)) {
+          $have = Get-AicmSemver (Invoke-AicmWithTimeout $grokPath @('--version') 15).Output
+          $want = Get-AicmNpmTarget '@xai-official/grok' $MinReleaseAgeDays
+          if ($have -and (-not $want -or (Compare-AicmVersion $have $want) -ge 0)) {
+            Write-Host "already current: grok $have (newest release at least $MinReleaseAgeDays days old: $want)"
+            return
+          }
+        }
         Install-OrUpdate-GrokCli
         Write-ShadowWarning 'grok'
       } elseif ($InstallMissing) {
@@ -410,15 +484,31 @@ try {
     $problems = @(Get-AicmScheduleProblems -Skip 'Update') + $procAttention
     foreach ($p in $problems) { Write-Host "problem: $p" }
     if (-not $DryRun) {
+      # Remember since when each package has been deferred; remind when it stays stuck for 5+ days.
+      $prevDeferred = Read-AicmState 'update-deferred'
+      $since = [ordered]@{}
+      foreach ($k in @($script:deferred.Keys)) {
+        $first = Get-AicmTimestamp
+        if ($prevDeferred -and $prevDeferred.PSObject.Properties[$k]) { $first = [string]$prevDeferred.PSObject.Properties[$k].Value }
+        $since[$k] = $first
+        $days = 0
+        try { $days = [int]((Get-Date).ToUniversalTime() - [datetime]::Parse($first).ToUniversalTime()).TotalDays } catch { }
+        if ($days -ge 5) { $problems += "$k has not been updated for $days days because it is always running; close its sessions for a moment or run 'aicm update' when it is idle" }
+      }
+      Write-AicmState 'update-deferred' $since
+      Remove-AicmNpmLeftovers
+      Update-AicmAppCopy
       Write-AicmState 'last-update' ([ordered]@{
         finishedAt = Get-AicmTimestamp
         version = Get-AicmVersion
         ok = ($script:failures.Count -eq 0)
+        pending = ($script:pending -or $script:deferred.Count -gt 0)
+        deferred = @($script:deferred.Keys)
         failures = $script:failures.ToArray()
         logFile = $logFile
       })
       $attention = @($script:failures | ForEach-Object { "update failed: $_" }) + $problems
-      if ($attention.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($attention -join '; ') }
+      Send-AicmAttention 'update' $attention
     }
 
     if ($script:failures.Count -gt 0) {

@@ -156,7 +156,7 @@ try {
   # Notify once when a duplicate problem appears, not every week while it lasts (doctor keeps reporting it).
   foreach ($s in $newShadow) { $attention.Add(($s -split '\. fix:')[0]) }
   foreach ($p in (Get-AicmScheduleProblems -Skip 'Inventory')) { Write-Host "problem: $p"; $attention.Add($p) }
-  if ($attention.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($attention -join '; ') }
+  Send-AicmAttention 'inventory' $attention.ToArray()
 
   if ($LogRetentionDays -gt 0) {
     $cutoff = (Get-Date).AddDays(-$LogRetentionDays)
@@ -168,7 +168,7 @@ try {
 } catch {
   Write-Host "error: $($_.Exception.Message)"
   Write-AicmState 'inventory-error' ([ordered]@{ finishedAt = Get-AicmTimestamp; ok = $false; error = $_.Exception.Message })
-  Send-AicmNotification 'AI CLI Auto Manager' "inventory failed: $($_.Exception.Message)"
+  Send-AicmAttention 'inventory-error' @("inventory failed: $($_.Exception.Message)")
   $exitCode = 1
 } finally {
   Stop-Transcript | Out-Null

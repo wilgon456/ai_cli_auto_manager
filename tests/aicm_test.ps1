@@ -62,6 +62,10 @@ try {
   if ($update -and ([datetime]$update.Triggers[0].StartBoundary).ToString('HH:mm') -eq '06:15') { Pass 'update time' } else { Fail 'update time' }
   if ($clean -and $clean.Triggers[0].DaysOfWeek -eq 1 -and ([datetime]$clean.Triggers[0].StartBoundary).ToString('HH:mm') -eq '13:05') { Pass 'clean day and time (Sunday)' } else { Fail 'clean trigger' }
   if ($clean -and $clean.Actions[0].Arguments -match 'clean_ai_leftovers\.ps1') { Pass 'clean task arguments' } else { Fail 'clean task arguments' }
+  $appDir = Join-Path $aicmHome 'app'
+  if ((Test-Path -LiteralPath "$appDir\bin\update_ai_clis.ps1") -and (Test-Path -LiteralPath "$appDir\SOURCE")) { Pass 'jobs run an installed copy, not the clone' } else { Fail 'installed copy' }
+  if ($update -and $update.Actions[0].Execute -eq 'wscript.exe' -and $update.Actions[0].Arguments -like "*$appDir\windows\run-hidden.vbs*" -and $update.Actions[0].Arguments -like "*$appDir\bin\update_ai_clis.ps1*") { Pass 'tasks start hidden from the installed copy' } else { Fail "task action: $($update.Actions[0].Execute) $($update.Actions[0].Arguments)" }
+  if ($update -and $update.Actions[0].Arguments -match '-Scheduled' -and $update.Triggers[0].Repetition.Interval -eq 'PT3H') { Pass 'update task retries every 3 hours' } else { Fail 'update retry' }
 
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 1 -and $r.Output -match 'no update run') { Pass 'doctor flags missing update run' } else { Fail "doctor before runs: $($r.Output)" }
@@ -89,6 +93,13 @@ try {
   $r = Invoke-Script 'bin\update_ai_clis.ps1' @('-Targets', 'none')
   if ($r.Output -match "notify: .*'Clean' is missing") { Pass 'update run notifies about the deleted task' } else { Fail "update did not notify: $($r.Output)" }
 
+  # A registered job that has not completed for too long is caught by the others.
+  $sched = Get-Content -LiteralPath "$aicmHome\state\schedule.json" -Raw | ConvertFrom-Json
+  $sched.installedAt = (Get-Date).ToUniversalTime().AddDays(-20).ToString('o')
+  $sched | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$aicmHome\state\schedule.json" -Encoding UTF8
+  Remove-Item -LiteralPath "$aicmHome\state\inventory.json" -ErrorAction SilentlyContinue
+  $r = Invoke-Script 'bin\update_ai_clis.ps1' @('-Targets', 'none')
+  if ($r.Output -match "'Inventory' has not completed for over 9 days") { Pass 'a job that stopped completing is reported by another job' } else { Fail "stale job: $($r.Output)" }
   $null = Invoke-Aicm @('schedule', 'remove')
   if (-not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'schedule remove' } else { Fail 'schedule remove' }
 
@@ -98,6 +109,13 @@ try {
     $r = Invoke-Aicm @('processes')
     if ($r.Output -match 'left-behind agent processes') { Pass 'aicm processes runs the node module' } else { Fail "aicm processes: $($r.Output)" }
   }
+  $null = Invoke-Aicm @('schedule', 'install', '-KeepLegacyTask')
+  $null = Invoke-Aicm @('uninstall')
+  if (-not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath (Join-Path $aicmHome 'app')) -and (Test-Path -LiteralPath (Join-Path $aicmHome 'state'))) { Pass 'uninstall removes tasks and the copy, keeps state' } else { Fail 'uninstall' }
+  $null = Invoke-Aicm @('uninstall', '-Purge')
+  if (-not (Test-Path -LiteralPath $aicmHome)) { Pass 'uninstall -Purge removes everything' } else { Fail 'purge' }
+  New-Item -ItemType Directory -Path $aicmHome -Force | Out-Null
+
   $r = Invoke-Aicm @('status')
   if ($r.Output -match '== disk use by cleanup rule ==' -and $r.Output -match 'codex-sessions') { Pass 'status shows rules' } else { Fail "status output: $($r.Output)" }
 

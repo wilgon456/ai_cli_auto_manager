@@ -70,6 +70,7 @@ cd ai_cli_auto_manager
 | `aicm doctor` | Exits 1 with a list of problems when a schedule is missing or a run is overdue or failed |
 | `aicm schedule install` | Registers the update, inventory and clean jobs; running it again replaces them |
 | `aicm schedule remove` | Removes the jobs |
+| `aicm uninstall` | Removes the jobs and the installed copy; `--purge` (`-Purge`) also removes logs, state and archives |
 | `aicm version` | Prints the version |
 
 On Windows use `.\bin\aicm.ps1 <command>` with PowerShell-style options such as `-DryRun`, `-Targets`, `-Rules`.
@@ -125,6 +126,14 @@ Official AI tools have shipped malicious releases. The Amazon Q extension 1.84.0
 | `AICM_ALLOW` | Releases you reviewed and want to accept despite red flags, e.g. `AICM_ALLOW=cline@3.1.0` |
 
 Security fixes also arrive as updates, so a long waiting period has a cost. Three days avoids the incidents so far while still picking up fixes quickly.
+
+### Unattended runs that keep working
+
+- **A CLI that is running is not overwritten.** On Windows a running program's files cannot be replaced (npm fails with `EBUSY`), and agent sessions often run all day. Such an update is recorded as *deferred*, not failed, and the scheduled job retries every 3 hours for 15 hours; a later run on a day that already succeeded exits immediately. If a CLI stays deferred for 5 days you get one reminder to close its sessions for a moment.
+- **No registry, no failure.** When the npm registry cannot be reached the run is recorded as pending and retried; it is not reported as a failed update.
+- **Leftovers of interrupted installs are removed.** npm leaves staging folders (`node_modules/.<name>-XXXXXXXX`, hundreds of MB) behind when an install fails half way; those older than a day are removed after each update.
+- **Vendor install scripts run only when needed.** Grok Build's install script is fetched only when a newer release (past the waiting period) exists, not every day.
+- **One notification per problem.** A problem is notified when it first appears and then at most once a week while it lasts.
 
 ### Post-update hook
 
@@ -222,10 +231,12 @@ Links inside the worktree (for example a `node_modules` junction to a shared cop
 | macOS | `~/Library/LaunchAgents/io.github.wilgon456.ai-cli-auto-manager.{update,inventory,clean}.plist` | `--update-at 05:00 --inventory-day mon --inventory-at 12:00 --clean-day mon --clean-at 12:30` |
 | Linux | user crontab (only lines tagged `# aicm:update`, `# aicm:inventory`, `# aicm:clean` are touched) | same as macOS |
 
+`schedule install` copies the tool to `~/.ai-cli-auto-manager/app` and the jobs run that copy, so moving or deleting your git clone cannot stop them. When the clone gets a newer version (`git pull`), the next daily update refreshes the copy. On Windows the jobs start through a small launcher (`windows/run-hidden.vbs`), so no PowerShell window flashes on screen.
+
 On Windows a run missed while the PC was off starts at the next boot; on macOS a run missed during sleep starts on wake.
 Leave out jobs you do not want with `--no-update`, `--no-inventory`, `--no-clean` (`-NoUpdate`, `-NoInventory`, `-NoClean`).
 
-Scheduled jobs can disappear silently. The jobs installed are recorded at install time, and every run checks that the others still exist and shows a desktop notification when one is gone. Set `AICM_NOTIFY=0` to turn notifications off.
+Scheduled jobs can disappear or stop working silently. The jobs installed are recorded at install time, and every run checks that the others still exist and have completed recently (update within 3 days, inventory and clean within 9), and shows a desktop notification when one is gone or stuck. State files are written atomically, so a crash never leaves a half-written file behind. Set `AICM_NOTIFY=0` to turn notifications off.
 
 ## Logs and state
 

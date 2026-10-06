@@ -35,7 +35,7 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "[$(aicm_ts)] AI CLI inventory started (version=$(aicm_version), offline=$OFFLINE)"
 if ! aicm_load_catalog "$CATALOG_FILE" "$LOCAL_CATALOG_FILE"; then
-  aicm_notify "AI CLI Auto Manager" "inventory failed: catalog error"
+  aicm_attention inventory-error "inventory failed: catalog error"
   exit 1
 fi
 
@@ -175,10 +175,7 @@ if ((${#changes[@]})); then
 fi
 if ((${#new_shadow[@]})); then attention+=("${new_shadow[@]}"); fi
 while IFS= read -r p; do [[ -n "$p" ]] && { echo "problem: $p"; attention+=("$p"); }; done < <(aicm_schedule_problems inventory)
-if ((${#attention[@]})); then
-  joined="$(printf '%s; ' "${attention[@]}")"
-  aicm_notify "AI CLI Auto Manager" "${joined%; }"
-fi
+aicm_attention inventory ${attention[@]+"${attention[@]}"}
 
 if [[ "$LOG_RETENTION_DAYS" =~ ^[0-9]+$ ]] && ((LOG_RETENTION_DAYS > 0)); then
   find "$LOG_DIR" -type f -name 'inventory-*.log' -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true

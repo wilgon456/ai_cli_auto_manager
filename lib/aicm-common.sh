@@ -5,6 +5,7 @@
 # Must keep working on the bash 3.2 that ships with macOS (no associative arrays, no mapfile, no ${x,,}).
 
 AICM_ROOT="${AICM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+AICM_HOME_SET="${AICM_HOME:+1}"
 AICM_HOME="${AICM_HOME:-${HOME:-/tmp}/.ai-cli-auto-manager}"
 
 aicm_version() {
@@ -175,16 +176,42 @@ AICM_PROTECT_ARGS=(
   ! -iname '*.env' ! -iname .env ! -path '*/memory/*'
 )
 
+# Writes to a temp file and renames it into place, so a crash mid-write never leaves a half-written state file.
 aicm_state_write() {
-  local name="$1" body="$2"
+  local name="$1" body="$2" file
   mkdir -p "$AICM_HOME/state"
-  printf '%s\n' "$body" > "$AICM_HOME/state/$name.json"
+  file="$AICM_HOME/state/$name.json"
+  printf '%s\n' "$body" > "$file.$$.tmp" && mv -f "$file.$$.tmp" "$file"
 }
 
 aicm_json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"
   printf '%s' "$s"
+}
+
+# Notifies the items that are new or were last announced 7+ days ago, so a lasting problem does not
+# raise a notification every day. Items that went away are forgotten.
+aicm_attention() { # key items...
+  local key="$1" file now item last out="" joined
+  shift
+  local due=()
+  file="$AICM_HOME/state/attention-$key.tsv"
+  now="$(date +%s)"
+  mkdir -p "$AICM_HOME/state"
+  for item in "$@"; do
+    [[ -n "$item" ]] || continue
+    last=""
+    [[ -f "$file" ]] && last="$(I="$item" awk -F '\t' '$2 == ENVIRON["I"] { print $1; exit }' "$file")"
+    if [[ -z "$last" ]] || ((now - last >= 7 * 86400)); then due+=("$item"); last="$now"; fi
+    out+="$last"$'\t'"$item"$'\n'
+  done
+  printf '%s' "$out" > "$file.$$.tmp" && mv -f "$file.$$.tmp" "$file"
+  if ((${#due[@]})); then
+    joined="$(printf '%s; ' "${due[@]}")"
+    aicm_notify "AI CLI Auto Manager" "${joined%; }"
+  fi
+  return 0
 }
 
 # Desktop notification. Never fails the caller. Disable with AICM_NOTIFY=0.
@@ -268,6 +295,46 @@ PY
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# Installed copy: scheduled jobs run ~/.ai-cli-auto-manager/app, not the git clone, so moving or
+# deleting the clone cannot stop them. The daily update refreshes the copy when the clone has a
+# newer VERSION.
+# ---------------------------------------------------------------------------
+
+AICM_APP_DIR="$AICM_HOME/app"
+
+# Copies bin, lib, rules and VERSION from $1 into the app folder via a swap; prints the app folder.
+aicm_sync_app_copy() {
+  local src="$1" app="$AICM_APP_DIR" d f
+  if [[ "$(cd "$src" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]]; then echo "$app"; return 0; fi
+  rm -rf -- "${app:?}.new" "${app:?}.old"
+  mkdir -p "$app.new"
+  for d in bin lib rules windows; do [[ -d "$src/$d" ]] && cp -R "$src/$d" "$app.new/$d"; done
+  for f in VERSION LICENSE README.md; do [[ -f "$src/$f" ]] && cp "$src/$f" "$app.new/$f"; done
+  printf '%s\n' "$src" > "$app.new/SOURCE"
+  [[ -d "$app" ]] && mv "$app" "$app.old"
+  mv "$app.new" "$app"
+  rm -rf -- "${app:?}.old"
+  echo "$app"
+}
+
+# Called at the end of the daily update when it runs from the installed copy.
+aicm_update_app_copy() {
+  local app="$AICM_APP_DIR" src new
+  [[ "$(cd "$AICM_ROOT" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]] || return 0
+  [[ -f "$app/SOURCE" ]] || return 0
+  src="$(head -n 1 "$app/SOURCE")"
+  if [[ ! -f "$src/VERSION" || ! -x "$src/bin/aicm" ]]; then
+    echo "installed copy: source $src is gone; keeping version $(aicm_version)"
+    return 0
+  fi
+  new="$(head -n 1 "$src/VERSION" | tr -d '[:space:]')"
+  [[ "$new" == "$(aicm_version)" ]] && return 0
+  if aicm_sync_app_copy "$src" >/dev/null 2>&1; then echo "installed copy: updated to $new from $src"
+  else echo "installed copy: could not refresh; trying again next run"; fi
+  return 0
+}
+
 AICM_LAUNCHD_PREFIX="io.github.wilgon456.ai-cli-auto-manager"
 
 aicm_job_exists() {
@@ -281,12 +348,21 @@ aicm_job_exists() {
 }
 
 # Prints one line per scheduled job that was installed but is now missing.
+# Also flags a job that is registered but has not completed for too long (its script is gone, it keeps
+# crashing, ...), once the schedule has existed that long. Second argument "nostale": existence only.
 aicm_schedule_problems() {
-  local skip="${1:-}" file="$AICM_HOME/state/schedule.json" job
+  local skip="${1:-}" nostale="${2:-}" file="$AICM_HOME/state/schedule.json" job state limit
   [[ -f "$file" ]] || return 0
   for job in $(grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean|inventory)$'); do
     [[ "$job" == "$skip" ]] && continue
-    aicm_job_exists "$job" || echo "scheduled job '$job' is missing; run: aicm schedule install"
+    if ! aicm_job_exists "$job"; then echo "scheduled job '$job' is missing; run: aicm schedule install"; continue; fi
+    [[ "$nostale" == nostale ]] && continue
+    case "$job" in update) state="last-update"; limit=3 ;; inventory) state="inventory"; limit=9 ;; *) state="last-clean"; limit=9 ;; esac
+    # schedule.json older than the limit and the job's state missing or older than the limit.
+    if [[ -n "$(find "$file" -mmin +"$((limit * 1440))" 2>/dev/null)" ]] &&
+       { [[ ! -f "$AICM_HOME/state/$state.json" ]] || [[ -n "$(find "$AICM_HOME/state/$state.json" -mmin +"$((limit * 1440))" 2>/dev/null)" ]]; }; then
+      echo "scheduled job '$job' has not completed for over $limit days; see $AICM_HOME/logs"
+    fi
   done
 }
 
@@ -493,6 +569,20 @@ aicm_npm_view_file() {
   f="$(mktemp)"
   if ! AICM_NPM_TIMEOUT=90 aicm_npm view "$@" --json > "$f" 2>/dev/null; then rm -f "$f"; return 1; fi
   echo "$f"
+}
+
+# npm leaves its staging folders (node_modules/.<name>-XXXXXXXX) behind when an install fails half way.
+# Removes those older than a day. rm -rf removes links inside as links; it never follows them.
+aicm_npm_leftovers() {
+  aicm_npm_cache
+  local root="$AICM_NPM_ROOT_CACHE" d name
+  [[ -n "$root" && -d "$root" && ! -L "$root" ]] || return 0
+  while IFS= read -r -d '' d; do
+    name="$(basename "$d")"
+    [[ "$name" =~ ^\.[^.].*-[A-Za-z0-9]{8}$ ]] || continue
+    if rm -rf -- "${d:?}" 2>/dev/null; then echo "removed npm leftover $d"; else echo "kept npm leftover $d (in use)"; fi
+  done < <(find "$root" -mindepth 1 -maxdepth 2 -type d -name '.*-*' -mmin +1440 -print0 2>/dev/null)
+  return 0
 }
 
 # The version to install: the newest stable release at least N days old (empty when none is).

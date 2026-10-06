@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aicm-common.sh
 . "$SCRIPT_DIR/../lib/aicm-common.sh"
 
-LOCK_DIR="${LOCK_DIR:-/tmp/ai-cli-auto-manager-update.lockdir}"
+LOCK_DIR="${LOCK_DIR:-$(aicm_temp_dir)/ai-cli-auto-manager-update-$(id -u).lockdir}"
 LOG_DIR="${LOG_DIR:-$AICM_HOME/logs}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 BREW="${BREW:-$(command -v brew 2>/dev/null || echo /usr/local/bin/brew)}"
@@ -29,6 +29,7 @@ AI_CLI_TARGETS="${AI_CLI_TARGETS:-all}"
 INSTALL_MISSING="${INSTALL_MISSING:-false}"
 PATH="/usr/local/bin:/opt/homebrew/bin:${HOME:-}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 DRY_RUN=false
+SCHEDULED=false
 MIN_RELEASE_AGE_DAYS="$(aicm_min_release_age_days)"
 VERSION_TIMEOUT_SECONDS="${VERSION_TIMEOUT_SECONDS:-10}"
 if [[ ! "$VERSION_TIMEOUT_SECONDS" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "$VERSION_TIMEOUT_SECONDS" == 0 || "$VERSION_TIMEOUT_SECONDS" == 0.0 ]]; then
@@ -38,6 +39,7 @@ while (($#)); do
   case "$1" in
     --dry-run|--check) DRY_RUN=true ;;
     --install-missing) INSTALL_MISSING=true ;;
+    --scheduled) SCHEDULED=true ;;
     --targets)
       shift
       [[ "${1:-}" ]] || { echo "missing value for --targets" >&2; exit 2; }
@@ -140,6 +142,16 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 fi
 printf '%s\n' "$$" > "$LOCK_DIR/pid"
 trap 'rm -f "$LOCK_DIR/pid" 2>/dev/null || true; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+# The scheduled job retries during the day; after a complete success today there is nothing to do.
+if [[ "$SCHEDULED" == true && "$DRY_RUN" != true && -f "$AICM_HOME/state/last-update.json" ]]; then
+  last_state="$(cat "$AICM_HOME/state/last-update.json")"
+  last_day="$(printf '%s' "$last_state" | sed -n 's/.*"finishedAt":"\([0-9-]*\)T.*/\1/p')"
+  if [[ "$last_state" == *'"ok":true'* && "$last_state" != *'"pending":true'* && "$last_day" == "$(date -u +%Y-%m-%d)" ]]; then
+    echo "[$(ts)] already updated today; nothing to retry" | tee -a "$LOG_FILE"
+    exit 0
+  fi
+fi
 
 # Mirror all output to a timestamped log and latest.log.
 : > "$LATEST_LOG"
@@ -335,8 +347,19 @@ npm_installed_version() {
 
 # Only releases at least MIN_RELEASE_AGE_DAYS old are installed, and only after they look like the
 # installed release (provenance kept, no new install scripts) and pass a staged signature check.
+# Registry reachable? Checked once per run; when it is not, npm updates are skipped, not failed.
+REGISTRY_OK=""
+PENDING=false
+registry_ok() {
+  if [[ -z "$REGISTRY_OK" ]]; then
+    if aicm_timeout 30 "$NPM" ping >/dev/null 2>&1; then REGISTRY_OK=yes; else REGISTRY_OK=no; echo "registry unreachable: npm updates are skipped this run and retried later"; fi
+  fi
+  [[ "$REGISTRY_OK" == yes ]]
+}
+
 update_npm_package() {
   local pkg="$1" installed target
+  if ! registry_ok; then PENDING=true; return 0; fi
   if is_npm_global_installed "$pkg"; then
     installed="$(npm_installed_version "$pkg")"
     target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS")" || { echo "could not read the release list of $pkg"; return 1; }
@@ -434,6 +457,17 @@ update_grok_cli() {
   if command -v grok >/dev/null 2>&1 && active_path_contains grok "/node_modules/" && is_npm_global_installed "@xai-official/grok"; then
     update_npm_package "@xai-official/grok"
   elif command -v grok >/dev/null 2>&1; then
+    # The vendor installer is a remote script; run it only when a newer release (past the waiting
+    # period) exists. The npm package carries the same version numbers.
+    if command -v "$NPM" >/dev/null 2>&1 && registry_ok; then
+      local have want
+      have="$(aicm_timeout 15 grok --version 2>&1 | aicm_semver || true)"
+      want="$(aicm_npm_target "@xai-official/grok" "$MIN_RELEASE_AGE_DAYS" || true)"
+      if [[ -n "$have" ]] && { [[ -z "$want" ]] || ! aicm_version_older "$have" "$want"; }; then
+        echo "already current: grok $have (newest release at least $MIN_RELEASE_AGE_DAYS days old: $want)"
+        return 0
+      fi
+    fi
     install_or_update_grok_cli || return $?
     shadow_warning grok
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
@@ -624,13 +658,15 @@ fi
 
 if [[ "$DRY_RUN" != "true" ]]; then
   update_ok=true; [[ -z "$failure_summary" ]] || update_ok=false
-  aicm_state_write last-update "{\"finishedAt\":\"$(ts)\",\"version\":\"$(aicm_version)\",\"ok\":$update_ok,\"failures\":\"$(aicm_json_escape "$failure_summary")\",\"logFile\":\"$(aicm_json_escape "$LOG_FILE")\"}"
-  attention="${failure_summary:+update failed: $failure_summary}"
-  if ((${#problems[@]})); then
-    attention="${attention:+$attention; }$(printf '%s; ' "${problems[@]}")"
-    attention="${attention%; }"
-  fi
-  [[ -z "$attention" ]] || aicm_notify "AI CLI Auto Manager" "$attention"
+  aicm_npm_leftovers
+  aicm_update_app_copy
+  aicm_state_write last-update "{\"finishedAt\":\"$(ts)\",\"version\":\"$(aicm_version)\",\"ok\":$update_ok,\"pending\":$PENDING,\"failures\":\"$(aicm_json_escape "$failure_summary")\",\"logFile\":\"$(aicm_json_escape "$LOG_FILE")\"}"
+  notes=()
+  # The step name without its exit code, so the same failure keeps the same key from day to day.
+  if ((${#failures[@]})); then for f in "${failures[@]}"; do notes+=("update failed: ${f% rc=*}"); done; fi
+  if ((${#version_failures[@]})); then for f in "${version_failures[@]}"; do notes+=("update failed: $f"); done; fi
+  if ((${#problems[@]})); then notes+=("${problems[@]}"); fi
+  aicm_attention update ${notes[@]+"${notes[@]}"}
 fi
 
 if [[ -n "$failure_summary" ]]; then
