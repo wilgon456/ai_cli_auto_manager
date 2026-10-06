@@ -43,7 +43,9 @@ cat > "$WORK/fakebin/codex" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$WORK/codex-calls.log"
 id="\${@: -1}"
-[[ "\$id" == ffffffff* ]] && { echo "Error: failed to \$1 session" >&2; exit 1; }
+[[ "\$id" == ffffffff* || "\$id" == eeeeeeee* ]] && { echo "Error: failed to \$1 session" >&2; exit 1; }
+# Deleting session 55555555-... also deletes its sub-agent session eeeeeeee-..., like the real Codex does.
+[[ "\$1" == delete && "\$id" == 55555555* && -x "$WORK/dbdel" ]] && "$WORK/dbdel" eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
 case "\$1" in
   archive) f="\$(find "$HOME/.codex/sessions" -name "*\$id*" | head -n 1)"; [[ -n "\$f" ]] || exit 1; mkdir -p "$HOME/.codex/archived_sessions"; mv "\$f" "$HOME/.codex/archived_sessions/" ;;
   delete) rm -f "$HOME"/.codex/archived_sessions/*"\$id"* "$HOME"/.codex/sessions/*/*/*/*"\$id"* ;;
@@ -55,6 +57,7 @@ export PATH="$WORK/fakebin:$PATH"
 U1=11111111-1111-4111-8111-111111111111; U2=22222222-2222-4222-8222-222222222222
 U3=33333333-3333-4333-8333-333333333333; U4=44444444-4444-4444-8444-444444444444
 UX=ffffffff-ffff-4fff-8fff-ffffffffffff; UO=55555555-5555-4555-8555-555555555555; UY=66666666-6666-4666-8666-666666666666
+UE=eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
 
 # age rule: old scratch file goes, new one stays, protected names stay, links are not followed.
 make_file "$HOME/.codex/.tmp/2026/08/old.bin" 40
@@ -92,12 +95,23 @@ DB_OK=false
 db_sql="create table threads (id text, rollout_path text, updated_at integer, archived integer);
 insert into threads values ('$U1', '$HOME/.codex/sessions/x-$U1.jsonl', $(( $(date +%s) - 40 * 86400 )), 0);
 insert into threads values ('$UO', '$HOME/.codex/sessions/gone-$UO.jsonl', $(( $(date +%s) - 100 * 86400 )), 0);
-insert into threads values ('$UY', '$HOME/.codex/sessions/gone-$UY.jsonl', $(( $(date +%s) - 50 * 86400 )), 0);"
+insert into threads values ('$UY', '$HOME/.codex/sessions/gone-$UY.jsonl', $(( $(date +%s) - 50 * 86400 )), 0);
+insert into threads values ('$UE', '$HOME/.codex/sessions/gone-$UE.jsonl', $(( $(date +%s) - 100 * 86400 )), 0);"
+DB="$HOME/.codex/state_5.sqlite"
 if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 "$HOME/.codex/state_5.sqlite" "$db_sql" && DB_OK=true
+  sqlite3 "$DB" "$db_sql" && DB_OK=true
+  cat > "$WORK/dbdel" <<EOF
+#!/usr/bin/env bash
+sqlite3 "$DB" "delete from threads where id = '\$1'"
+EOF
 elif command -v python3 >/dev/null 2>&1 && python3 -c 'import sqlite3' >/dev/null 2>&1; then
-  python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.commit()' "$HOME/.codex/state_5.sqlite" "$db_sql" && DB_OK=true
+  python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.commit()' "$DB" "$db_sql" && DB_OK=true
+  cat > "$WORK/dbdel" <<EOF
+#!/usr/bin/env bash
+python3 -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("delete from threads where id = ?", (sys.argv[2],)); c.commit()' "$DB" "\$1"
+EOF
 fi
+[[ -f "$WORK/dbdel" ]] && chmod +x "$WORK/dbdel"
 
 cat > "$AICM_HOME/clean-rules.local.conf" <<'EOF'
 codex-trace-db      | all   | cap         | ~/.codex                | logs_*.sqlite | 30 | 1 | on |
@@ -147,6 +161,7 @@ expect_exists "$HOME/.codex/archived_sessions/rollout-2026-08-01T10-00-00-$U4.js
 if [[ "$DB_OK" == true ]]; then
   grep -qx "delete --force $UO" "$WORK/codex-calls.log" && pass "session whose file is gone and unused 90+ days deleted" || fail "orphan delete"
   ! grep -q "$UY" "$WORK/codex-calls.log" && pass "session whose file is gone but used within 90 days kept" || fail "young orphan touched"
+  grep -E '^codex-sessions ' <<< "$out" | grep -qv 'in use or failed' && pass "sub-agent session removed with its parent is not reported as failed" || fail "sub-agent recount: $(grep -E '^codex-sessions ' <<< "$out")"
   expect_gone "$HOME/.codex/archived_sessions/rollout-2026-05-01T10-00-00-$UX.jsonl" "file Codex does not know is removed directly"
 else
   echo "skip - Codex database checks (no sqlite3 or python3 here)"
