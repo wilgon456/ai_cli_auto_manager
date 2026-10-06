@@ -417,7 +417,17 @@ try {
     Remove-OldCleanLogs
   }
 
-  $problems = @($errors) + @(Get-AicmScheduleProblems -Skip 'Clean')
+  # Worktrees and branches agents left behind (lib\worktrees.js). Skipped when single rules are run.
+  $wtAttention = @()
+  if ($env:AICM_WORKTREES -ne '0' -and -not $Report -and $selected.Count -eq 0) {
+    Write-Host ''
+    Write-Host '== worktrees and branches =='
+    $wtArgs = @()
+    if (-not $DryRun) { $wtArgs += '--apply' }
+    $wtAttention = @((Invoke-AicmNodeModule 'worktrees' $wtArgs).Attention)
+  }
+
+  $problems = @($errors) + @(Get-AicmScheduleProblems -Skip 'Clean') + $wtAttention
   if ($problems.Count -gt 0) {
     foreach ($p in $problems) { Write-Host "problem: $p" }
     if (-not $DryRun) { Send-AicmNotification 'AI CLI Auto Manager' ("cleanup needs attention: " + ($problems -join '; ')) }

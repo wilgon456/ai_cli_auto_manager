@@ -23,9 +23,9 @@ AI 코딩 CLI를 몇 달 쓰면 세 가지가 헷갈리기 시작합니다. 무�
 
 | 작업 | 주기 (기본 시각) | 하는 일 |
 | --- | --- | --- |
-| 목록 | 매주 (월 12:00) | 깔린 AI CLI를 찾아 버전, 최신 버전, 설치 방식, 매일 업데이트가 실제로 닿는지를 표로 남깁니다. 새로 생기거나 사라진 CLI는 알림으로 알려 줍니다 |
-| 업데이트 | 매일 (05:00) | 깔린 CLI를 모두 올립니다. npm으로 깐 CLI는 나온 지 3일 지난 버전만, 이상 징후와 서명을 확인한 뒤 깝니다. 하나가 실패해도 나머지는 계속합니다 |
-| 정리 | 매주 (월 12:30) | 30일 동안 쓰지 않은 대화 기록과 날짜가 지난 임시 파일·캐시를 지웁니다. 링크는 따라가지 않고, 메모리·인증·설정 파일은 지우지 않습니다 |
+| 목록 | 매주 (월 12:00) | 깔린 AI CLI를 찾아 버전, 최신 버전, 설치 방식, 매일 업데이트가 실제로 닿는지를 표로 남깁니다. CLI끼리 MCP 서버와 스킬이 어긋났는지도 봅니다. 새로 생기거나 사라진 CLI는 알림으로 알려 줍니다 |
+| 업데이트 | 매일 (05:00) | 깔린 CLI를 모두 올립니다. npm으로 깐 CLI는 나온 지 3일 지난 버전만, 이상 징후와 서명을 확인한 뒤 깝니다. 하나가 실패해도 나머지는 계속합니다. 세션이 끝난 뒤에도 남아 도는 MCP 서버·브라우저·에이전트 CLI를 알려 줍니다 |
+| 정리 | 매주 (월 12:30) | 30일 동안 쓰지 않은 대화 기록과 날짜가 지난 임시 파일·캐시를 지우고, 작업이 이미 합쳐진 git worktree와 가지를 정리합니다. 링크는 따라가지 않고, 메모리·인증·설정 파일과 올리지 않은 작업은 건드리지 않습니다 |
 
 세 작업은 실행될 때마다 나머지 둘이 아직 등록돼 있는지 확인합니다. 예약이 사라졌거나 실행이 실패하면 바탕화면 알림을 띄웁니다.
 
@@ -63,6 +63,9 @@ cd ai_cli_auto_manager
 | `aicm inventory` | 깔린 AI CLI 목록을 만듭니다. `--offline`(`-Offline`)이면 최신 버전 조회를 건너뜁니다 |
 | `aicm update` | 깔린 AI CLI를 올립니다. `--dry-run`, `--targets codex,claude`, `--install-missing`, `--min-release-age-days N` |
 | `aicm clean` | 오래된 찌꺼기를 지웁니다. `--dry-run`, `--rules codex-sessions,os-temp` |
+| `aicm worktrees` | 세션들이 남긴 worktree와 가지. `--apply`(`-Apply`)를 줘야만 지웁니다. `--days 14` |
+| `aicm config` | 깔린 CLI끼리 MCP 서버와 스킬 비교 |
+| `aicm processes` | 세션이 끝난 뒤에도 남아 도는 에이전트 프로세스. `--kill`(`-Kill`)이면 끕니다 |
 | `aicm status` | 예약 상태, 마지막 실행 결과, 마지막 목록, 규칙별 용량과 지울 수 있는 양을 보여 줍니다 |
 | `aicm doctor` | 예약이 사라졌거나 실행이 밀렸거나 실패했으면 문제를 적고 종료 코드 1을 냅니다 |
 | `aicm schedule install` | 업데이트·목록·정리 예약을 등록합니다. 다시 실행하면 같은 작업을 덮어씁니다 |
@@ -187,6 +190,28 @@ my-notebook-cache   | all     | age         | ~/.cache/my-tool              | *.
 
 `kind`는 여섯 가지입니다. `age`는 날짜보다 오래된 파일을 지우고 빈 폴더를 정리합니다. `codex`는 Codex 공식 명령으로 지우거나(`limit` 0) 아카이브 후 지웁니다. `archive`는 아카이브로 옮겼다가 `limit`일 뒤 지웁니다. `cap`은 바로 아래 파일 중 날짜가 지났거나 크기(MB)를 넘은 것을 지웁니다. `keep-latest`는 `이름-숫자` 꼴 폴더에서 이름별로 최신 몇 개만 남깁니다. `command`는 도구가 제공하는 정리 명령을 실행합니다.
 
+## 여러 세션을 돌릴 때 (Paseo, Orca 등)
+
+에이전트 세션을 여러 개 동시에 돌리는 도구는 세 가지 잔재를 남깁니다. 이 점검들은 Node.js가 필요하고(npm으로 CLI를 깔았다면 이미 있습니다), 없으면 건너뜁니다.
+
+**worktree와 가지** (매주 정리 때, 또는 `aicm worktrees`). `~/.ai-cli-auto-manager/repos.conf`에 한 줄에 하나씩 적은 폴더, 없으면 홈 폴더의 흔한 코드 폴더(`Desktop`, `dev`, `code`, `src`, `projects`, `repos`, `Documents/GitHub`, `Documents/Codex` 등) 아래에서 저장소를 찾습니다. 연결된 worktree는 아래 조건을 모두 만족할 때만 지웁니다.
+
+- 커밋하지 않은 변경이나 추적 안 된 파일이 없고, 잠겨 있지 않고, 14일 동안 안 건드렸습니다.
+- 작업이 이미 안전하게 올라가 있습니다. 기본 가지에 합쳐졌거나, GitHub PR이 바로 이 커밋으로 합쳐졌거나(`gh`가 필요하고, 커밋을 하나로 합치는 squash 병합도 잡습니다), 모든 커밋이 원격에 있습니다.
+
+worktree 안의 링크(공용 `node_modules`로 이어진 정션 등)는 먼저 링크만 끊어서, `git worktree remove`가 링크가 가리키는 원본을 지우는 일이 없게 합니다. `--force`는 쓰지 않습니다. 폴더가 사라진 worktree 기록은 정리하고, 같은 증거가 있고 어디에도 체크아웃되지 않은 로컬 가지는 지웁니다. 메인 worktree와 그 현재 가지, `main`·`master`·`develop`은 건드리지 않습니다. 커밋하지 않은 변경이 30일 넘게 방치된 worktree는 잊힌 작업으로 한 번 알립니다.
+
+**CLI끼리 설정 비교** (매주 목록 때, 또는 `aicm config`). 깔린 CLI(Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Cursor, Copilot CLI)별 사용자 MCP 서버와 스킬 폴더(`~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills` 등)를 비교합니다. 일부 CLI에만 있는 MCP 서버, 일부 CLI에서 안 보이는 스킬, 이름은 같은데 내용이 다른 스킬(어느 쪽이 쓰일지는 폴더 순서에 달림)을 보여 줍니다. 보고만 하고, 마지막 경우는 한 번 알립니다.
+
+**남아 도는 프로세스** (매일 업데이트 때, 또는 `aicm processes`). 부모 세션이 사라진 뒤 2시간 넘게 돌고 있는 MCP 서버, 자동화 브라우저(Chrome DevTools MCP, Playwright), 에이전트 CLI를 찾습니다. 일부러 따로 도는 데몬(Paseo, Codex app-server, 샌드박스, 언어 서버)과 이 도구 자신은 제외하고, 더 뺄 것은 `AICM_PROCESS_IGNORE`(정규식)로 적습니다. 보고만 하고, `AICM_KILL_ORPHANS=1`을 두거나 `aicm processes --kill`을 실행하면 하위 프로세스까지 함께 끕니다.
+
+| 환경 변수 | 뜻 |
+| --- | --- |
+| `AICM_WORKTREES=0` | 정리 작업에서 worktree·가지 정리를 건너뜀 |
+| `AICM_PROCESSES=0` | 업데이트 작업에서 프로세스 점검을 건너뜀 |
+| `AICM_KILL_ORPHANS=1` | 남은 프로세스를 보고만 하지 않고 끔 |
+| `AICM_ORPHAN_MIN_AGE_HOURS` | 남은 것으로 칠 최소 시간(기본 2) |
+
 ## 예약 실행
 
 `aicm schedule install`이 운영체제에 맞게 등록합니다. 시각은 바꿀 수 있습니다.
@@ -226,13 +251,14 @@ Windows는 PC가 꺼져 있어 시각을 놓치면 다음에 켜질 때 실행�
 
 ## 개발과 테스트
 
-모든 테스트는 임시로 만든 가짜 홈 폴더에서 돌고, 실제 홈 폴더와 실제 예약 작업은 건드리지 않습니다. 목록·업데이트·정리 테스트는 가짜 CLI, 가짜 npm, 가짜 codex를 써서 실제 CLI를 실행하거나 올리지 않습니다.
+모든 테스트는 임시로 만든 가짜 홈 폴더에서 돌고, 실제 홈 폴더와 실제 예약 작업은 건드리지 않습니다. 목록·업데이트·정리 테스트는 가짜 CLI, 가짜 npm, 가짜 codex를 써서 실제 CLI를 실행하거나 올리지 않습니다. Node 테스트는 임시 git 저장소와 주입한 프로세스 목록을 쓰고, 실제로 끄는 프로세스는 없습니다.
 
 ```bash
 shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
 bash tests/clean_test.sh
 bash tests/aicm_test.sh
 bash tests/inventory_test.sh
+node --test tests/node/*.test.js
 ```
 
 ```powershell

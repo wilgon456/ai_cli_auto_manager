@@ -23,9 +23,9 @@ This tool schedules three jobs that take care of all of that. Clone the reposito
 
 | Job | Runs (default) | What it does |
 | --- | --- | --- |
-| Inventory | weekly (Mon 12:00) | Lists the installed AI CLIs with version, latest version, install method, and whether the daily update actually reaches the copy on PATH. Notifies you when a CLI appears or disappears |
-| Update | daily (05:00) | Updates every installed CLI. npm-installed CLIs only get releases at least 3 days old, after red-flag and signature checks. One failure does not stop the rest |
-| Clean | weekly (Mon 12:30) | Deletes conversation history unused for 30 days and expired temp files and caches. Never follows links and never deletes memory, credential or settings files |
+| Inventory | weekly (Mon 12:00) | Lists the installed AI CLIs with version, latest version, install method, and whether the daily update actually reaches the copy on PATH. Compares MCP servers and skills across the CLIs. Notifies you when a CLI appears or disappears |
+| Update | daily (05:00) | Updates every installed CLI. npm-installed CLIs only get releases at least 3 days old, after red-flag and signature checks. One failure does not stop the rest. Also reports MCP servers, browsers and agent CLIs left running after their session ended |
+| Clean | weekly (Mon 12:30) | Deletes conversation history unused for 30 days and expired temp files and caches, and removes git worktrees and branches whose work is already merged. Never follows links and never deletes memory, credential, settings files or unpushed work |
 
 Every run checks that the other two jobs are still registered, and shows a desktop notification when a job is gone or a run fails.
 
@@ -63,6 +63,9 @@ cd ai_cli_auto_manager
 | `aicm inventory` | Lists the installed AI CLIs. `--offline` (`-Offline`) skips the latest-version lookups |
 | `aicm update` | Updates installed AI CLIs. `--dry-run`, `--targets codex,claude`, `--install-missing`, `--min-release-age-days N` |
 | `aicm clean` | Removes stale leftovers. `--dry-run`, `--rules codex-sessions,os-temp` |
+| `aicm worktrees` | Worktrees and branches agent sessions left behind. Report only unless `--apply` (`-Apply`); `--days 14` |
+| `aicm config` | MCP servers and skills compared across the installed CLIs |
+| `aicm processes` | Agent processes left running after their session ended. `--kill` (`-Kill`) ends them |
 | `aicm status` | Schedules, last run results, the last inventory, disk use per rule and what can be freed |
 | `aicm doctor` | Exits 1 with a list of problems when a schedule is missing or a run is overdue or failed |
 | `aicm schedule install` | Registers the update, inventory and clean jobs; running it again replaces them |
@@ -187,6 +190,28 @@ my-notebook-cache   | all     | age         | ~/.cache/my-tool              | *.
 
 There are six kinds. `age` deletes files older than `days` and prunes empty folders. `codex` deletes through Codex's commands (`limit` 0) or archives first. `archive` moves files to the archive and deletes them `limit` days later. `cap` deletes files directly in the folder when older than `days` or larger than `limit` MB. `keep-latest` keeps the newest `limit` versioned folders (`name-1234`) per name. `command` runs a tool's own cleanup command.
 
+## Running many sessions (Paseo, Orca, ...)
+
+Tools that run several agent sessions at once leave three kinds of leftovers. These checks need Node.js (already there for npm-installed CLIs) and are skipped without it.
+
+**Worktrees and branches** (weekly with Clean, or `aicm worktrees`). Repositories are found under the folders listed in `~/.ai-cli-auto-manager/repos.conf` (one per line), or under common code folders in your home directory (`Desktop`, `dev`, `code`, `src`, `projects`, `repos`, `Documents/GitHub`, `Documents/Codex`, ...). A linked worktree is removed only when all of these hold:
+
+- no uncommitted or untracked changes, not locked, and untouched for 14 days;
+- its work is safely upstream: merged into the default branch, or its GitHub pull request was merged with exactly this commit (needs `gh`; this covers squash merges), or every commit is on a remote.
+
+Links inside the worktree (for example a `node_modules` junction to a shared copy) are unlinked first, so `git worktree remove` can never delete what they point to. `--force` is never used. Worktrees whose folder is gone are pruned, and local branches with the same proof that are not checked out anywhere are deleted. The main worktree, its current branch and `main`/`master`/`develop` are never touched. A worktree with uncommitted changes untouched for 30 days is reported once as forgotten work.
+
+**Configuration across CLIs** (weekly with Inventory, or `aicm config`). Lists the user-level MCP servers of each installed CLI (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Cursor, Copilot CLI) and the skill folders (`~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, ...): servers set up in some CLIs only, skills some CLIs cannot see, and skills with the same name but different content in two folders (which copy wins depends on folder order). Report only; the last case is notified once.
+
+**Processes left behind** (daily with Update, or `aicm processes`). Finds MCP servers, automation browsers (Chrome DevTools MCP, Playwright) and agent CLIs that have run for 2 hours or more after their parent session is gone. Daemons that run detached on purpose (Paseo, Codex app-server, sandboxes, language servers) and this tool's own processes are ignored; add more with `AICM_PROCESS_IGNORE` (a regular expression). Report only; set `AICM_KILL_ORPHANS=1` or run `aicm processes --kill` to end them with their children.
+
+| Environment variable | Meaning |
+| --- | --- |
+| `AICM_WORKTREES=0` | Skip worktree and branch cleanup in the Clean job |
+| `AICM_PROCESSES=0` | Skip the process check in the Update job |
+| `AICM_KILL_ORPHANS=1` | End left-behind processes instead of only reporting them |
+| `AICM_ORPHAN_MIN_AGE_HOURS` | Minimum age before a process counts (default 2) |
+
 ## Scheduling
 
 `aicm schedule install` registers the jobs for your OS. Times can be changed.
@@ -226,13 +251,14 @@ Logs are kept for 30 days; change that with `LOG_RETENTION_DAYS` (or `-LogRetent
 
 ## Development and tests
 
-All tests run in a throwaway home folder and never touch your real home folder or real scheduled tasks. Inventory, update and clean tests use fake CLIs, a fake npm and a fake codex, so no real CLI is run or updated.
+All tests run in a throwaway home folder and never touch your real home folder or real scheduled tasks. Inventory, update and clean tests use fake CLIs, a fake npm and a fake codex, so no real CLI is run or updated. The Node tests build throwaway git repositories and use injected process lists; nothing is ever killed.
 
 ```bash
 shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
 bash tests/clean_test.sh
 bash tests/aicm_test.sh
 bash tests/inventory_test.sh
+node --test tests/node/*.test.js
 ```
 
 ```powershell

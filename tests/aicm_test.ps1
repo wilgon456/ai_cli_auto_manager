@@ -21,7 +21,7 @@ function Invoke-Script([string]$Script, [string[]]$Arguments) {
   foreach ($k in $names) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
   try {
     $env:USERPROFILE = $fakeHome; $env:TEMP = "$work\tmp"; $env:TMP = "$work\tmp"; $env:LOCALAPPDATA = "$fakeHome\AppData\Local"
-    $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_TASK_PATH = $taskPath
+    $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'; $env:AICM_TASK_PATH = $taskPath
     $ErrorActionPreference = 'Continue'
     $output = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root $Script) @Arguments 2>&1 | Out-String
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
@@ -92,6 +92,12 @@ try {
   $null = Invoke-Aicm @('schedule', 'remove')
   if (-not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'schedule remove' } else { Fail 'schedule remove' }
 
+  if (Get-Command node -ErrorAction SilentlyContinue) {
+    $r = Invoke-Aicm @('config')
+    if ($r.Output -match 'MCP servers per CLI') { Pass 'aicm config runs the node module' } else { Fail "aicm config: $($r.Output)" }
+    $r = Invoke-Aicm @('processes')
+    if ($r.Output -match 'left-behind agent processes') { Pass 'aicm processes runs the node module' } else { Fail "aicm processes: $($r.Output)" }
+  }
   $r = Invoke-Aicm @('status')
   if ($r.Output -match '== disk use by cleanup rule ==' -and $r.Output -match 'codex-sessions') { Pass 'status shows rules' } else { Fail "status output: $($r.Output)" }
 

@@ -11,6 +11,8 @@ trap 'rm -rf "$WORK"' EXIT
 export HOME="$WORK/home" TMPDIR="$WORK/tmp" AICM_HOME="$WORK/home/.ai-cli-auto-manager" AICM_OS=linux AICM_NOTIFY=0
 # If a real codex were ever reached, it would only see the throwaway home.
 export CODEX_HOME="$WORK/home/.codex" USERPROFILE="$WORK/home"
+# The node checks have their own tests (tests/node); keep these runs away from real processes and repos.
+export AICM_PROCESSES=0 AICM_WORKTREES=0
 mkdir -p "$HOME" "$TMPDIR" "$WORK/fakebin"
 
 # Fake crontab that keeps its table in a file.
@@ -75,6 +77,11 @@ grep -q "notify: .*'clean' is missing" <<< "$out" && pass "update run notifies a
 "$AICM" schedule remove >/dev/null
 ! grep -q '# aicm:' "$WORK/crontab.txt" && grep -q '# keep me' "$WORK/crontab.txt" && pass "schedule remove" || fail "schedule remove"
 
+if command -v node >/dev/null 2>&1; then
+  mkdir -p "$WORK/norepos"
+  "$AICM" worktrees --root "$WORK/norepos" 2>&1 | grep -q '0 repositories' && pass "aicm worktrees runs the node module" || fail "aicm worktrees"
+  "$AICM" config 2>&1 | grep -q 'MCP servers per CLI' && pass "aicm config runs the node module" || fail "aicm config"
+fi
 "$AICM" status > "$WORK/status.txt" 2>&1 || true
 grep -q '== disk use by cleanup rule ==' "$WORK/status.txt" && grep -q 'codex-sessions' "$WORK/status.txt" && pass "status shows rules" || fail "status output"
 
