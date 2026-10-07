@@ -550,7 +550,10 @@ aicm_cli_install() {
   real="$(aicm_realpath "$CLI_PATH")"
   aicm_npm_cache
   brew_prefix="$(aicm_brew_prefix)"
-  if [[ "$real" == */node_modules/* ]] || { [[ -n "$AICM_NPM_PREFIX_CACHE" ]] && [[ "$CLI_PATH" == "$AICM_NPM_PREFIX_CACHE/bin/"* ]]; }; then
+  # npm only when it lives in npm's own global folder: pnpm, bun and volta also keep node_modules
+  # folders, but `npm install -g` would only add a second copy that PATH does not run.
+  if { [[ -n "$AICM_NPM_ROOT_CACHE" ]] && [[ "$real" == "$(aicm_realpath "$AICM_NPM_ROOT_CACHE")/"* ]]; } ||
+     { [[ -n "$AICM_NPM_PREFIX_CACHE" ]] && [[ "$CLI_PATH" == "$AICM_NPM_PREFIX_CACHE/bin/"* ]]; }; then
     CLI_METHOD=npm
   elif [[ "$real" == */Cellar/* || "$real" == */Caskroom/* ]] || { [[ -n "$brew_prefix" ]] && [[ "$real" == "$brew_prefix/"* ]]; }; then
     CLI_METHOD=brew
