@@ -191,13 +191,13 @@ Write rows in the same format to `~/.ai-cli-auto-manager/clean-rules.local.conf`
 ```text
 # id                | os      | kind        | path                          | pattern   | days | limit | default | note
 playwright-browsers | windows | keep-latest | {localappdata}/ms-playwright  | *         |      | 2     | on      | clean old builds
-codex-sessions      | all     | codex       | ~/.codex                      | rollout-* | 30   | 60    | on      | archive at 30 days, delete at 90
+codex-sessions      | all     | codex       | {codex}                       | rollout-* | 30   | 60    | on      | archive at 30 days, delete at 90
 claude-transcripts  | all     | archive     | ~/.claude/projects            | *.jsonl   | 30   | 60    | on      | archive Claude transcripts too
 os-temp             | windows | age         | {temp}                        | *         | 7    |       | off     | turn off
 my-notebook-cache   | all     | age         | ~/.cache/my-tool              | *.tmp     | 14   |       | on      | add your own
 ```
 
-There are six kinds. `age` deletes files older than `days` and prunes empty folders. `codex` deletes through Codex's commands (`limit` 0) or archives first. `archive` moves files to the archive and deletes them `limit` days later. `cap` deletes files directly in the folder when older than `days` or larger than `limit` MB. `keep-latest` keeps the newest `limit` versioned folders (`name-1234`) per name. `command` runs a tool's own cleanup command.
+There are seven kinds. `age` treats each entry directly in the folder (a session folder, a file) as one unit and deletes it once nothing inside it changed for `days`, so a folder still in use is never thinned out. `age-files` deletes single files older than `days` anywhere below the folder (for caches whose entries stand alone). `codex` deletes through Codex's commands (`limit` 0) or archives first. `archive` moves files to the archive and deletes them `limit` days later. `cap` deletes files directly in the folder when older than `days` or larger than `limit` MB. `keep-latest` keeps the newest `limit` versioned folders (`name-1234`) per name. `command` runs a tool's own cleanup command.
 
 ## Running many sessions (Paseo, Orca, ...)
 

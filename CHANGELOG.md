@@ -1,5 +1,58 @@
 # Changelog
 
+## 2.6.0 - 2026-10-07
+
+A round of fixes from three critical reviews (update path, cleanup and inventory, scheduling and
+health checks). Several of them could have deleted user data or silently stopped the jobs.
+
+### Fixed: cleanup could delete what it should not
+- Worktree cleanup kept no eye on ignored files: `git worktree remove` deletes them although
+  `git status` calls the tree clean, so a `.env` or a local database went with it. A worktree with
+  ignored files other than build output is now kept. Proofs need a successful fetch of every remote,
+  a merged PR counts only for origin's own repository and when it was merged into the default branch,
+  a folder in use is kept (rename test), and every removed commit stays under
+  `refs/aicm-deleted/<date>/` for 90 days.
+- A TEMP/TMPDIR pointing at a drive root, `/`, the home folder or a folder above it made the temp rule
+  sweep the home folder. The temp folder now counts only when it really is one; paths compare by their
+  long names.
+- Age rules deleted old files one by one inside folders still in use (an open session, a plugin
+  checkout). Each entry in a rule's folder is now one unit and goes only when nothing in it changed.
+  New kind `age-files` keeps per-file deletion for content-addressed caches (npm, pip).
+- A clock far off (earlier than the last run, or 400+ days past it) deletes nothing.
+- More protected names: `.npmrc`, `.netrc`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`...; `memory`
+  folders in any letter case, never pruned.
+- Codex: `{codex}` follows `CODEX_HOME`; the newest state DB is chosen by number; unknown layouts and
+  non-numeric dates are left alone; a thread counts as orphaned only when no file with its id exists.
+- `uninstall --purge` removes only what this tool wrote, and only in a folder it marked as its own.
+- The left-behind process check no longer flags macOS app bundles, programs whose arguments merely
+  mention an agent name, sessions under WSL's per-session init, or processes of unknown age.
+
+### Fixed: the daily update
+- Windows: an npm warning on stderr no longer breaks the release check (stdout and stderr are kept apart).
+- A timeout ends the whole process tree, not just the launcher. `npm install -g` and brew have time
+  limits; a run holding the lock for 3+ hours is reported instead of blocking every later run quietly.
+- The waiting period also covers dependencies (`npm install --before=<date>`); unpublished and
+  deprecated versions are never picked; prereleases sort below their release.
+- Registries without signing keys are reported once as "signatures not checkable", not as failures.
+- "Already updated today" uses the local date on both platforms and only counts a run that covered
+  the same CLIs; no-op retries write no log.
+- npm's rollback backup is never deleted while the package itself is missing; a managed CLI that
+  disappears is reinstalled from it or reported.
+- Logs written by cron and launchd are trimmed.
+
+### Fixed: scheduling and health checks
+- cron and launchd jobs get the PATH recorded at install (nvm, volta, Homebrew on Apple Silicon...).
+- Windows tasks fall back to `powershell -WindowStyle Hidden` when Windows Script Host is disabled;
+  the doctor reports it.
+- The installed copy is never downgraded, is swapped atomically with rollback, and the jobs are
+  re-registered after an update when their definition changed (`aicm schedule refresh`).
+- Health checks also see disabled tasks, missing scripts, failed last results and a stopped cron daemon.
+- On cron, weekly jobs catch up after the machine slept through their time.
+- Linux notifications reach the desktop from cron; every notification is also logged
+  (`logs/notifications.log`, shown in `status` and `doctor`).
+- The legacy Windows installer no longer removes the Inventory and Clean tasks.
+- Times outside 00:00-23:59 are rejected; notification texts no longer change between runs.
+
 ## 2.5.1 - 2026-10-07
 
 ### Fixed

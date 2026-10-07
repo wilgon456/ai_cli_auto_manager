@@ -191,13 +191,13 @@ paseo reload
 ```text
 # id                | os      | kind        | path                          | pattern   | days | limit | default | note
 playwright-browsers | windows | keep-latest | {localappdata}/ms-playwright  | *         |      | 2     | on      | 옛 빌드 정리 켜기
-codex-sessions      | all     | codex       | ~/.codex                      | rollout-* | 30   | 60    | on      | 30일 뒤 아카이브, 90일 뒤 삭제
+codex-sessions      | all     | codex       | {codex}                       | rollout-* | 30   | 60    | on      | 30일 뒤 아카이브, 90일 뒤 삭제
 claude-transcripts  | all     | archive     | ~/.claude/projects            | *.jsonl   | 30   | 60    | on      | Claude 대화도 지우기 전에 아카이브
 os-temp             | windows | age         | {temp}                        | *         | 7    |       | off     | 끄기
 my-notebook-cache   | all     | age         | ~/.cache/my-tool              | *.tmp     | 14   |       | on      | 내 규칙 추가
 ```
 
-`kind`는 여섯 가지입니다. `age`는 날짜보다 오래된 파일을 지우고 빈 폴더를 정리합니다. `codex`는 Codex 공식 명령으로 지우거나(`limit` 0) 아카이브 후 지웁니다. `archive`는 아카이브로 옮겼다가 `limit`일 뒤 지웁니다. `cap`은 바로 아래 파일 중 날짜가 지났거나 크기(MB)를 넘은 것을 지웁니다. `keep-latest`는 `이름-숫자` 꼴 폴더에서 이름별로 최신 몇 개만 남깁니다. `command`는 도구가 제공하는 정리 명령을 실행합니다.
+`kind`는 일곱 가지입니다. `age`는 폴더 바로 아래 항목(세션 폴더, 파일) 하나를 한 덩어리로 보고, 그 안이 `days` 동안 하나도 안 바뀌었을 때만 통째로 지웁니다. 그래서 쓰고 있는 폴더를 파일 몇 개만 지워 망가뜨리지 않습니다. `age-files`는 폴더 아래 어디든 `days`보다 오래된 파일을 하나씩 지웁니다(항목이 서로 독립인 캐시용). `codex`는 Codex 공식 명령으로 지우거나(`limit` 0) 아카이브 후 지웁니다. `archive`는 아카이브로 옮겼다가 `limit`일 뒤 지웁니다. `cap`은 바로 아래 파일 중 날짜가 지났거나 크기(MB)를 넘은 것을 지웁니다. `keep-latest`는 `이름-숫자` 꼴 폴더에서 이름별로 최신 몇 개만 남깁니다. `command`는 도구가 제공하는 정리 명령을 실행합니다.
 
 ## 여러 세션을 돌릴 때 (Paseo, Orca 등)
 
