@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.6.1 - 2026-10-07
+
+### Fixed
+- The scheduled update on macOS and Linux put `/usr/local/bin` and `/opt/homebrew/bin` in front of the
+  PATH captured at install, so it updated a stale copy instead of the one the user runs (a Claude Code
+  in Homebrew's npm prefix instead of the nvm one, failing on permissions; an old brew `grok` instead
+  of `~/.grok/bin/grok`). The captured PATH now comes first and the system folders only widen it.
+
 ## 2.6.0 - 2026-10-07
 
 A round of fixes from three critical reviews (update path, cleanup and inventory, scheduling and
