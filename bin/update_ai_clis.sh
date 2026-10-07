@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 # Auto-update local AI coding CLIs.
 # Targets:
-#   - GPT/Codex CLI: Homebrew cask/formula when present; npm global only if it is the active command
+#   - GPT/Codex CLI: Homebrew cask/formula when present; npm global only if it is the active command;
+#     codex update for the official installer's copy
 #   - OpenCode CLI: Homebrew, npm, or built-in opencode upgrade
 #   - Antigravity CLI: agy built-in updater when present
 #   - Kimi Code CLI: npm @moonshot-ai/kimi-code when npm-managed
@@ -565,55 +566,69 @@ update_opencode_cli() {
     shadow_warning opencode
   elif is_brew_cask_installed opencode || is_brew_formula_installed opencode; then
     update_brew_package opencode
+  elif is_npm_global_installed "@opencode/cli"; then
+    # OpenCode 2.x is published as @opencode/cli; opencode-ai is the 1.x line.
+    update_npm_package "@opencode/cli"
   elif is_npm_global_installed "opencode-ai"; then
     update_npm_package "opencode-ai"
   elif command -v opencode >/dev/null 2>&1; then
     command_with_timeout 300 opencode upgrade
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
-    install_npm_package "opencode-ai"
+    install_npm_package "@opencode/cli"
   else
     pass_missing opencode "command not found and no supported package manager install detected"
   fi
 }
 
 # Limitation: the vendor updaters (claude update, opencode upgrade, agy update, brew, catalog
-# self-updates) and the Grok installer install whatever their vendor serves; the npm waiting period
-# and release checks cannot be applied to them. Only the Grok installer is gated (see update_grok_cli).
+# self-updates) install whatever their vendor serves; the npm waiting period and release checks cannot
+# be applied to them. The installer-backed updaters of Grok and Codex are gated (see installer_update_due).
 install_or_update_grok_cli() {
   command -v curl >/dev/null 2>&1 || { echo "curl is not installed"; return 1; }
   command_with_timeout 300 bash -c 'curl -fsSL https://x.ai/cli/install.sh | bash'
+}
+
+# A vendor installer is a remote script that always installs the newest release. Succeeds only when
+# the installed version is known, a newer release exists, and that newest release is itself past the
+# waiting period. The npm package carries the same version numbers and publish dates.
+installer_update_due() { # name command npm-package
+  local name="$1" cmd="$2" pkg="$3" have want newest
+  have="$(aicm_timeout 15 "$cmd" --version 2>&1 | aicm_semver || true)"
+  if [[ -z "$have" ]]; then
+    echo "skip: cannot read the installed $name version, so the installer is not run unattended; update it by hand"
+    return 1
+  fi
+  if ! command -v "$NPM" >/dev/null 2>&1; then
+    echo "skip: npm is needed to look up $name release dates; the installer is not run unattended. Update $name by hand"
+    return 1
+  fi
+  if ! registry_ok; then PENDING=true; return 1; fi
+  want="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS" || true)"
+  if [[ -z "$want" ]] || ! aicm_version_older "$have" "$want"; then
+    echo "already current: $name $have (newest release at least $MIN_RELEASE_AGE_DAYS days old: $want)"
+    return 1
+  fi
+  if ((MIN_RELEASE_AGE_DAYS > 0)); then
+    newest="$(AICM_NPM_TIMEOUT=60 aicm_npm view "$pkg" version 2>/dev/null | aicm_semver || true)"
+    if [[ -n "$newest" && "$newest" != "$want" ]]; then
+      echo "hold: $name $want is old enough, but the installer would install $newest, which is still in its $MIN_RELEASE_AGE_DAYS-day waiting period"
+      return 1
+    fi
+  fi
+  echo "candidate: $name $have -> $want"
+}
+
+# `codex update` reruns the official installer, so it is gated like the Grok installer.
+update_codex_standalone() { # codex path
+  installer_update_due codex "$1" "@openai/codex" || return 0
+  command_with_timeout 300 "$1" update
 }
 
 update_grok_cli() {
   if command -v grok >/dev/null 2>&1 && active_path_contains grok "/node_modules/" && is_npm_global_installed "@xai-official/grok"; then
     update_npm_package "@xai-official/grok"
   elif command -v grok >/dev/null 2>&1; then
-    # The vendor installer is a remote script that always installs the newest release. Run it only when
-    # the installed version is known, a newer release exists, and that newest release is itself past
-    # the waiting period. The npm package carries the same version numbers and publish dates.
-    local have want newest
-    have="$(aicm_timeout 15 grok --version 2>&1 | aicm_semver || true)"
-    if [[ -z "$have" ]]; then
-      echo "skip: cannot read the installed grok version, so the installer is not run unattended; update it by hand"
-      return 0
-    fi
-    if ! command -v "$NPM" >/dev/null 2>&1; then
-      echo "skip: npm is needed to look up Grok release dates; the installer is not run unattended. Update grok by hand"
-      return 0
-    fi
-    if ! registry_ok; then PENDING=true; return 0; fi
-    want="$(aicm_npm_target "@xai-official/grok" "$MIN_RELEASE_AGE_DAYS" || true)"
-    if [[ -z "$want" ]] || ! aicm_version_older "$have" "$want"; then
-      echo "already current: grok $have (newest release at least $MIN_RELEASE_AGE_DAYS days old: $want)"
-      return 0
-    fi
-    if ((MIN_RELEASE_AGE_DAYS > 0)); then
-      newest="$(AICM_NPM_TIMEOUT=60 aicm_npm view "@xai-official/grok" version 2>/dev/null | aicm_semver || true)"
-      if [[ -n "$newest" && "$newest" != "$want" ]]; then
-        echo "hold: grok $want is old enough, but the installer would install $newest, which is still in its $MIN_RELEASE_AGE_DAYS-day waiting period"
-        return 0
-      fi
-    fi
+    installer_update_due grok grok "@xai-official/grok" || return 0
     install_or_update_grok_cli || return $?
     shadow_warning grok
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
@@ -714,6 +729,9 @@ if gpt_target_enabled; then
     run_step "gpt/codex via brew" update_brew_package codex
   elif active_path_contains codex "/node_modules/" || is_npm_global_installed "@openai/codex"; then
     run_step "gpt/codex via npm" update_npm_package "@openai/codex"
+  elif active_install codex && [[ "$CLI_INSTALLED" == true ]] && aicm_codex_standalone "$CLI_PATH"; then
+    # The official installer (~/.codex/packages/standalone) updates itself; the desktop app's copy does not live there.
+    run_step "gpt/codex standalone" update_codex_standalone "$CLI_PATH"
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
     run_step "gpt/codex via npm install" install_npm_package "@openai/codex"
   else

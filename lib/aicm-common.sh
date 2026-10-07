@@ -737,6 +737,11 @@ aicm_shadow_fix() {
     "${AICM_NPM_PREFIX_CACHE:-<npm prefix>}" "$(dirname "$1")"
 }
 
+# True when the codex on PATH comes from the official installer, which `codex update` keeps current.
+aicm_codex_standalone() {
+  [[ "$(aicm_realpath "$1")" == */packages/standalone/* ]]
+}
+
 # Prints whether the daily update keeps the copy on PATH current: "yes" or "no: <why>".
 aicm_cli_coverage() {
   local i="$1" id
@@ -750,6 +755,7 @@ aicm_cli_coverage() {
       if aicm_is_builtin "$id" && [[ -n "$CLI_NPMCOPY" && " claude codex opencode kimi " == *" $id "* ]]; then
         echo "no: the update refreshes the npm copy, not the one on PATH"
       elif [[ -n "${AICM_CLI_SELF[$i]}" ]]; then echo yes
+      elif [[ "$id" == codex ]] && aicm_codex_standalone "$CLI_PATH"; then echo yes
       elif [[ -n "${AICM_CLI_NOTE[$i]}" ]]; then echo "no: ${AICM_CLI_NOTE[$i]}"
       else echo "no: installed standalone without a self-update command"; fi ;;
     *) echo no ;;
