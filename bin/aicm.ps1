@@ -65,7 +65,7 @@ function Show-Help {
   Write-Host '  aicm.ps1 processes [-Kill] [-MinAgeHours 2]'
   Write-Host '  aicm.ps1 status'
   Write-Host '  aicm.ps1 doctor'
-  Write-Host '  aicm.ps1 schedule  install|remove|show [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
+  Write-Host '  aicm.ps1 schedule  install|remove|show|refresh [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
   Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean]'
   Write-Host '  aicm.ps1 uninstall [-Purge]'
   Write-Host '  aicm.ps1 version'
@@ -312,6 +312,30 @@ function Remove-Schedule {
   if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
 }
 
+# What -Purge removes: only what this tool writes. Hooks, *.local.conf, repos.conf and anything else
+# the user put there stay, and the folder itself goes only when nothing is left in it. A folder
+# without the .aicm-home marker is purged only when it is the default .ai-cli-auto-manager.
+function Invoke-Purge([string]$HomeDir) {
+  if (-not (Test-Path -LiteralPath $HomeDir)) { Write-Host "nothing to purge: $HomeDir does not exist"; return }
+  if (-not (Test-Path -LiteralPath (Join-Path $HomeDir '.aicm-home')) -and (Split-Path -Leaf $HomeDir) -ne '.ai-cli-auto-manager') {
+    throw "refusing to purge ${HomeDir}: it has no .aicm-home marker, so it may not be an AI CLI Auto Manager folder"
+  }
+  foreach ($name in 'app', 'app.new', 'app.old', 'logs', 'state', 'archive', 'inventory.md') {
+    $item = Get-Item -LiteralPath (Join-Path $HomeDir $name) -Force -ErrorAction SilentlyContinue
+    if (-not $item) { continue }
+    if ($item -is [System.IO.DirectoryInfo]) { Remove-AicmTree $item } else { $item.Delete() }
+    Write-Host "removed $($item.FullName)"
+  }
+  $left = @(Get-ChildItem -LiteralPath $HomeDir -Force | Where-Object { $_.Name -ne '.aicm-home' })
+  if ($left.Count -eq 0) {
+    Remove-Item -LiteralPath (Join-Path $HomeDir '.aicm-home') -Force -ErrorAction SilentlyContinue
+    [System.IO.Directory]::Delete($HomeDir, $false)
+    Write-Host "removed $HomeDir"
+  } else {
+    Write-Host "kept $HomeDir, which still holds files you wrote: $(($left | ForEach-Object { $_.Name }) -join ' ')"
+  }
+}
+
 # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless -Purge.
 function Invoke-Uninstall {
   Remove-Schedule
@@ -319,14 +343,14 @@ function Invoke-Uninstall {
     Write-Host "note: the legacy task '\$legacyTaskName' is still registered; remove it with: Unregister-ScheduledTask -TaskName '$legacyTaskName'"
   }
   $app = Get-AicmAppDir
-  if ((Test-Path -LiteralPath $app) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
+  # Only a folder that holds an installed copy (it has the SOURCE file) is removed.
+  if ((Test-Path -LiteralPath (Join-Path $app 'SOURCE')) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
     Remove-AicmTree ([System.IO.DirectoryInfo]::new($app))
     Write-Host "removed installed copy: $app"
   }
   $homeDir = Get-AicmHome
   if ($Purge) {
-    if ((Split-Path -Leaf $homeDir) -ne '.ai-cli-auto-manager' -and -not $env:AICM_HOME) { throw "refusing to purge $homeDir" }
-    if (Test-Path -LiteralPath $homeDir) { Remove-AicmTree ([System.IO.DirectoryInfo]::new($homeDir)); Write-Host "removed $homeDir (logs, state, archive)" }
+    Invoke-Purge $homeDir
   } else {
     Write-Host "kept $homeDir (logs, state, archive, local rules); add -Purge to remove it too"
   }
@@ -373,10 +397,20 @@ function Get-DoctorProblems {
   return $problems
 }
 
+# The last $Count notifications (they may never have shown on screen).
+function Get-RecentNotifications([int]$Count) {
+  $log = Join-Path (Join-Path (Get-AicmHome) 'logs') 'notifications.log'
+  if (-not (Test-Path -LiteralPath $log)) { return @() }
+  return @(Get-Content -LiteralPath $log -Encoding UTF8 -Tail $Count)
+}
+
 function Invoke-Child([string]$Script, [hashtable]$Splat) {
   & (Join-Path $binDir $Script) @Splat
   exit $LASTEXITCODE
 }
+
+# The commands that write into AICM_HOME mark it as ours (uninstall never does).
+if ($Command -in @('update', 'inventory', 'clean', 'schedule')) { Set-AicmHomeMarker }
 
 switch ($Command) {
   'help' { Show-Help }
@@ -436,13 +470,23 @@ switch ($Command) {
       foreach ($c in @($inv.clis)) { Write-Host ("{0,-20} {1,-11} {2,-14} {3,-9} {4}" -f $c.name, $c.method, $c.version, $c.state, $c.autoUpdate) }
     }
     Write-Host ''
+    Write-Host '== recent notifications =='
+    $recent = @(Get-RecentNotifications 5)
+    if ($recent.Count -gt 0) { foreach ($l in $recent) { Write-Host $l } } else { Write-Host 'none' }
+    Write-Host ''
     Write-Host '== disk use by cleanup rule =='
     & (Join-Path $binDir 'clean_ai_leftovers.ps1') -Report
   }
   'doctor' {
     $problems = @(Get-DoctorProblems)
-    if ($problems.Count -eq 0) { Write-Host 'healthy: schedules registered, recent runs succeeded'; exit 0 }
+    if ($problems.Count -eq 0) { Write-Host 'healthy: schedules registered, recent runs succeeded' }
     foreach ($p in $problems) { Write-Host "problem: $p" }
+    $recent = @(Get-RecentNotifications 3)
+    if ($recent.Count -gt 0) {
+      Write-Host "recent notifications ($(Join-Path (Join-Path (Get-AicmHome) 'logs') 'notifications.log')):"
+      foreach ($l in $recent) { Write-Host "  $l" }
+    }
+    if ($problems.Count -eq 0) { exit 0 }
     exit 1
   }
   'schedule' {

@@ -18,7 +18,7 @@ AI CLI Auto Manager $(aicm_version)
   aicm processes [--kill] [--min-age-hours 2]   agent processes left running after their session ended
   aicm status    disk use per cleanup rule, schedules, last runs
   aicm doctor    exit 1 when a schedule is missing or a run is overdue or failed
-  aicm schedule  install|remove|show [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
+  aicm schedule  install|remove|show|refresh [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
                                      [--clean-day mon] [--clean-at 12:30] [--targets list]
                                      [--no-update] [--no-inventory] [--no-clean]
   aicm uninstall [--purge]
@@ -441,14 +441,48 @@ doctor() {
   fi
   if ((${#problems[@]} == 0)); then
     echo "healthy: schedules registered, recent runs succeeded"
+    recent_notifications 3
     return 0
   fi
   for p in "${problems[@]}"; do echo "problem: $p"; done
+  recent_notifications 3
   return 1
+}
+
+# The last N notifications (they may never have shown on screen, e.g. from cron).
+recent_notifications() { # count
+  local log="$LOG_DIR/notifications.log"
+  [[ -s "$log" ]] || return 0
+  echo "recent notifications ($log):"
+  tail -n "$1" "$log" | sed 's/^/  /'
+}
+
+# What --purge removes: only what this tool writes. Hooks, *.local.conf, repos.conf and anything else
+# the user put there stay, and the folder itself goes only when nothing is left in it. A folder
+# without the .aicm-home marker is purged only when it is the default ~/.ai-cli-auto-manager.
+purge_home() {
+  local h="$AICM_HOME" item
+  [[ -d "$h" ]] || { echo "nothing to purge: $h does not exist"; return 0; }
+  if [[ ! -f "$h/.aicm-home" && "$(basename "$h")" != .ai-cli-auto-manager ]]; then
+    echo "refusing to purge $h: it has no .aicm-home marker, so it may not be an AI CLI Auto Manager folder" >&2
+    exit 1
+  fi
+  for item in app app.new app.old logs state archive inventory.md; do
+    [[ -e "$h/$item" || -L "$h/$item" ]] || continue
+    rm -rf -- "${h:?}/$item" && echo "removed $h/$item"
+  done
+  if [[ -z "$(ls -A "$h" | grep -vx '.aicm-home' || true)" ]]; then
+    rm -f -- "$h/.aicm-home"
+    rmdir -- "$h" && echo "removed $h"
+  else
+    echo "kept $h, which still holds files you wrote: $(ls -A "$h" | grep -vx '.aicm-home' | tr '\n' ' ')"
+  fi
 }
 
 cmd="${1:-help}"
 (($#)) && shift
+# The commands that write into AICM_HOME mark it as ours (uninstall never does).
+case "$cmd" in update|inventory|clean|schedule|scheduled) aicm_mark_home ;; esac
 case "$cmd" in
   update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
   # Internal: what the crontab lines run.
@@ -478,6 +512,9 @@ case "$cmd" in
       grep '^| ' "$AICM_HOME/inventory.md" | tail -n +3 | awk -F '|' '{ for (i = 2; i <= 7; i++) gsub(/^ +| +$/, "", $i); printf "%-20s %-11s %-14s %-9s %s\n", $2, $3, $4, $6, $7 }'
     fi
     echo
+    echo "== recent notifications =="
+    if [[ -s "$LOG_DIR/notifications.log" ]]; then tail -n 5 "$LOG_DIR/notifications.log"; else echo "none"; fi
+    echo
     echo "== disk use by cleanup rule =="
     exec "$BIN_DIR/clean_ai_leftovers.sh" --report
     ;;
@@ -496,12 +533,12 @@ case "$cmd" in
   uninstall)
     # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless --purge.
     schedule_remove
-    if [[ -d "$AICM_APP_DIR" && "$(cd "$AICM_ROOT" && pwd -P)" != "$(cd "$AICM_APP_DIR" && pwd -P)" ]]; then
+    # Only a folder that holds an installed copy (it has the SOURCE file) is removed.
+    if [[ -f "$AICM_APP_DIR/SOURCE" && "$(cd "$AICM_ROOT" && pwd -P)" != "$(cd "$AICM_APP_DIR" && pwd -P)" ]]; then
       rm -rf -- "${AICM_APP_DIR:?}"; echo "removed installed copy: $AICM_APP_DIR"
     fi
     if [[ "${1:-}" == --purge ]]; then
-      [[ "$(basename "$AICM_HOME")" == .ai-cli-auto-manager || -n "${AICM_HOME_SET:-}" ]] || { echo "refusing to purge $AICM_HOME" >&2; exit 1; }
-      rm -rf -- "${AICM_HOME:?}"; echo "removed $AICM_HOME (logs, state, archive)"
+      purge_home
     else
       echo "kept $AICM_HOME (logs, state, archive, local rules); add --purge to remove it too"
     fi

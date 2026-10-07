@@ -189,6 +189,16 @@ try {
   if ($r.ExitCode -eq 1 -and $r.Output -match "'Clean' is missing") { Pass 'doctor notices a deleted task' } else { Fail "deleted task: $($r.Output)" }
   $r = Invoke-Script 'bin\update_ai_clis.ps1' @('-Targets', 'none')
   if ($r.Output -match "notify: .*'Clean' is missing") { Pass 'update run notifies about the deleted task' } else { Fail "update did not notify: $($r.Output)" }
+  $nlog = "$aicmHome\logs\notifications.log"
+  if ((Test-Path -LiteralPath $nlog) -and ((Get-Content -LiteralPath $nlog -Raw) -match "(?m)^\d{4}-\d{2}-\d{2} [\d:]{8} AI CLI Auto Manager - .*'Clean' is missing")) { Pass 'notifications are kept in notifications.log' } else { Fail 'notification log' }
+  $r = Invoke-Aicm @('doctor')
+  if ($r.Output -match 'recent notifications' -and $r.Output -match "'Clean' is missing") { Pass 'doctor shows the recent notifications' } else { Fail "doctor notifications: $($r.Output)" }
+  $keepLog = Get-Content -LiteralPath $nlog
+  Set-Content -LiteralPath $nlog -Value (1..650 | ForEach-Object { "old $_" })
+  $null = Invoke-Lib $root "Send-AicmNotification 'T' 'new one'"
+  $lines = @(Get-Content -LiteralPath $nlog)
+  if ($lines.Count -eq 500 -and $lines[-1] -match 'T - new one') { Pass 'notifications.log keeps the last 500 lines' } else { Fail "log trim: $($lines.Count)" }
+  Set-Content -LiteralPath $nlog -Value $keepLog
 
   # A registered job that has not completed for too long is caught by the others.
   $sched = Get-Content -LiteralPath "$aicmHome\state\schedule.json" -Raw | ConvertFrom-Json
@@ -209,8 +219,24 @@ try {
   $null = Invoke-Aicm @('schedule', 'install', '-KeepLegacyTask')
   $null = Invoke-Aicm @('uninstall')
   if (-not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath (Join-Path $aicmHome 'app')) -and (Test-Path -LiteralPath (Join-Path $aicmHome 'state'))) { Pass 'uninstall removes tasks and the copy, keeps state' } else { Fail 'uninstall' }
+  if (Test-Path -LiteralPath "$aicmHome\.aicm-home") { Pass 'the home folder is marked as ours' } else { Fail 'no .aicm-home marker' }
+  New-Item -ItemType Directory -Path "$aicmHome\hooks" -Force | Out-Null
+  Set-Content -LiteralPath "$aicmHome\hooks\post-update.ps1" -Value 'Write-Host hi'
+  Set-Content -LiteralPath "$aicmHome\ai-clis.local.conf" -Value '# mine'
+  $null = Invoke-Aicm @('uninstall', '-Purge')
+  if ((Test-Path -LiteralPath "$aicmHome\hooks\post-update.ps1") -and (Test-Path -LiteralPath "$aicmHome\ai-clis.local.conf") -and -not (Test-Path -LiteralPath "$aicmHome\state") -and -not (Test-Path -LiteralPath "$aicmHome\logs")) { Pass 'uninstall -Purge keeps hooks and local rules' } else { Fail "purge with user files: $(@(Get-ChildItem -LiteralPath $aicmHome -Force -ErrorAction SilentlyContinue).Name -join ' ')" }
+  Remove-Item -LiteralPath "$aicmHome\hooks", "$aicmHome\ai-clis.local.conf" -Recurse -Force
   $null = Invoke-Aicm @('uninstall', '-Purge')
   if (-not (Test-Path -LiteralPath $aicmHome)) { Pass 'uninstall -Purge removes everything' } else { Fail 'purge' }
+  # AICM_HOME pointed at a folder that is not ours: refused, nothing deleted.
+  $notOurs = Join-Path $work 'dotconfig'
+  New-Item -ItemType Directory -Path "$notOurs\state", "$notOurs\app" -Force | Out-Null
+  Set-Content -LiteralPath "$notOurs\state\other-app.json" -Value 'keep'
+  Set-Content -LiteralPath "$notOurs\app\x" -Value 'keep'
+  $savedHome = $aicmHome
+  $aicmHome = $notOurs
+  try { $r = Invoke-Aicm @('uninstall', '-Purge') } finally { $aicmHome = $savedHome }
+  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$notOurs\state\other-app.json") -and (Test-Path -LiteralPath "$notOurs\app\x")) { Pass 'uninstall -Purge refuses a folder without the marker' } else { Fail "unmarked purge: $($r.ExitCode) $($r.Output)" }
   New-Item -ItemType Directory -Path $aicmHome -Force | Out-Null
 
   $r = Invoke-Aicm @('status')

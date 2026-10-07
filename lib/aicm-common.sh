@@ -214,10 +214,19 @@ aicm_attention() { # key items...
   return 0
 }
 
-# Desktop notification. Never fails the caller. Disable with AICM_NOTIFY=0.
+# Desktop notification. Never fails the caller. Disable the desktop part with AICM_NOTIFY=0.
+# Every notification is also appended to logs/notifications.log (last 500 lines kept), so one that
+# never showed on screen can still be read with `aicm status`.
 aicm_notify() {
-  local title="$1" body="$2"
+  local title="$1" body="$2" log="$AICM_HOME/logs/notifications.log" n bus
   echo "notify: $title - $body"
+  if mkdir -p "$AICM_HOME/logs" 2>/dev/null; then
+    printf '%s %s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$title" "${body//$'\n'/ }" >> "$log" 2>/dev/null || true
+    n="$(wc -l < "$log" 2>/dev/null | tr -d ' ')"
+    if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 600)); then
+      { tail -n 500 "$log" > "$log.$$.tmp" && mv -f "$log.$$.tmp" "$log"; } 2>/dev/null || rm -f "$log.$$.tmp"
+    fi
+  fi
   [[ "${AICM_NOTIFY:-1}" == 0 ]] && return 0
   if command -v osascript >/dev/null 2>&1; then
     local t b
@@ -225,7 +234,11 @@ aicm_notify() {
     b="${body//\\/\\\\}"; b="${b//\"/\\\"}"
     osascript -e "display notification \"$b\" with title \"$t\"" >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send "$title" "$body" >/dev/null 2>&1 || true
+    # cron jobs have no session bus address; the user's bus is at a fixed place under systemd.
+    bus="${DBUS_SESSION_BUS_ADDRESS:-}"
+    if [[ -z "$bus" && -S "/run/user/$(id -u)/bus" ]]; then bus="unix:path=/run/user/$(id -u)/bus"; fi
+    if [[ -n "$bus" ]]; then DBUS_SESSION_BUS_ADDRESS="$bus" notify-send "$title" "$body" >/dev/null 2>&1 || true
+    else notify-send "$title" "$body" >/dev/null 2>&1 || true; fi
   fi
   return 0
 }
@@ -303,6 +316,14 @@ PY
 
 AICM_APP_DIR="$AICM_HOME/app"
 
+# Marks AICM_HOME as this tool's folder; `aicm uninstall --purge` removes only a marked folder (or
+# the default one), so AICM_HOME=~/.config can never wipe ~/.config.
+aicm_mark_home() {
+  [[ -f "$AICM_HOME/.aicm-home" ]] && return 0
+  mkdir -p "$AICM_HOME" 2>/dev/null && printf 'AI CLI Auto Manager home (logs, state, archive, installed copy)\n' > "$AICM_HOME/.aicm-home" 2>/dev/null
+  return 0
+}
+
 # Succeeds when copy $2 has every file of source $1 (bin, lib, rules, windows) with the same content,
 # plus the files every copy needs.
 aicm_app_copy_complete() { # source copy
@@ -323,6 +344,7 @@ aicm_app_copy_complete() { # source copy
 aicm_sync_app_copy() {
   local src="$1" app="$AICM_APP_DIR" d f
   if [[ "$(cd "$src" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]]; then echo "$app"; return 0; fi
+  aicm_mark_home
   # A run that stopped between the two renames left only app.old behind: put it back first.
   if [[ ! -d "$app" && -d "$app.old" ]]; then mv "$app.old" "$app" || return 1; fi
   rm -rf -- "${app:?}.new" "${app:?}.old" || return 1

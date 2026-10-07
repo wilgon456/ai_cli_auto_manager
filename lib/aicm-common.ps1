@@ -261,9 +261,20 @@ function Send-AicmAttention([string]$Key, [string[]]$Items) {
   if ($due.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($due.ToArray() -join '; ') }
 }
 
-# Desktop notification. Never fails the caller. Disable with AICM_NOTIFY=0.
+# Desktop notification. Never fails the caller. Disable the desktop part with AICM_NOTIFY=0.
+# Every notification is also appended to logs\notifications.log (last 500 lines kept), so one that
+# never showed on screen can still be read with `aicm.ps1 status`.
 function Send-AicmNotification([string]$Title, [string]$Body) {
   Write-Host "notify: $Title - $Body"
+  try {
+    $dir = Join-Path (Get-AicmHome) 'logs'
+    Initialize-AicmDirectory $dir
+    $log = Join-Path $dir 'notifications.log'
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::AppendAllText($log, ("{0} {1} - {2}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Title, ($Body -replace "`r?`n", ' ')), $utf8)
+    $lines = [System.IO.File]::ReadAllLines($log, $utf8)
+    if ($lines.Count -gt 600) { [System.IO.File]::WriteAllLines($log, [string[]]($lines[($lines.Count - 500)..($lines.Count - 1)]), $utf8) }
+  } catch { }
   if ($env:AICM_NOTIFY -eq '0') { return }
   try {
     [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
@@ -366,6 +377,17 @@ function Get-AicmCodexThreads([string]$CodexHome) {
 
 function Get-AicmAppDir { return (Join-Path (Get-AicmHome) 'app') }
 
+# Marks AICM_HOME as this tool's folder; `aicm.ps1 uninstall -Purge` removes only a marked folder (or
+# the default one), so AICM_HOME pointing at another folder can never wipe it.
+function Set-AicmHomeMarker {
+  try {
+    $marker = Join-Path (Get-AicmHome) '.aicm-home'
+    if (Test-Path -LiteralPath $marker) { return }
+    Initialize-AicmDirectory (Get-AicmHome)
+    [System.IO.File]::WriteAllText($marker, "AI CLI Auto Manager home (logs, state, archive, installed copy)`r`n")
+  } catch { }
+}
+
 # Antivirus scanners briefly lock freshly written files, so a folder move is retried a few times.
 function Move-AicmDirectory([string]$From, [string]$To) {
   for ($i = 1; ; $i++) {
@@ -401,6 +423,7 @@ function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
 function Sync-AicmAppCopy([string]$Source) {
   $app = Get-AicmAppDir
   if (Test-AicmSamePath $Source $app) { return $app }
+  Set-AicmHomeMarker
   $new = "$app.new"
   $old = "$app.old"
   # A run that stopped between the two moves left only app.old behind: put it back first.

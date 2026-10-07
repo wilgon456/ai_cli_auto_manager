@@ -139,6 +139,15 @@ out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 1 ]] && grep -q "'clean' is missing" <<< "$out" && pass "doctor notices a deleted job" || fail "deleted job: $out"
 out="$("$ROOT/bin/update_ai_clis.sh" --targets none 2>&1)" || true
 grep -q "notify: .*'clean' is missing" <<< "$out" && pass "update run notifies about the deleted job" || fail "update did not notify: $out"
+NLOG="$AICM_HOME/logs/notifications.log"
+grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} AI CLI Auto Manager - .*'clean' is missing" "$NLOG" && pass "notifications are kept in notifications.log" || fail "notification log: $(cat "$NLOG" 2>&1)"
+out="$("$AICM" doctor 2>&1)" || true
+grep -q "recent notifications" <<< "$out" && grep -q "'clean' is missing" <<< "$out" && pass "doctor shows the recent notifications" || fail "doctor notifications: $out"
+cp "$NLOG" "$WORK/nlog.keep"
+for i in $(seq 1 650); do echo "old $i"; done > "$NLOG"
+bash -c '. "$1/lib/aicm-common.sh"; aicm_notify T "new one"' _ "$ROOT" >/dev/null
+[[ "$(wc -l < "$NLOG" | tr -d ' ')" == 500 ]] && tail -n 1 "$NLOG" | grep -q 'T - new one' && pass "notifications.log keeps the last 500 lines" || fail "log trim: $(wc -l < "$NLOG")"
+cp "$WORK/nlog.keep" "$NLOG"
 
 [[ -x "$AICM_HOME/app/bin/update_ai_clis.sh" && -f "$AICM_HOME/app/SOURCE" ]] && pass "jobs run an installed copy, not the clone" || fail "installed copy"
 grep -q "$AICM_HOME/app/bin/aicm scheduled inventory" "$WORK/crontab.txt" && pass "cron points at the installed copy" || fail "cron path"
@@ -184,8 +193,18 @@ fi
 "$AICM" schedule install >/dev/null
 "$AICM" uninstall >/dev/null
 ! grep -q '# aicm:' "$WORK/crontab.txt" && [[ ! -d "$AICM_HOME/app" && -d "$AICM_HOME/state" ]] && pass "uninstall removes jobs and the copy, keeps state" || fail "uninstall"
+[[ -f "$AICM_HOME/.aicm-home" ]] && pass "the home folder is marked as ours" || fail "no .aicm-home marker"
+mkdir -p "$AICM_HOME/hooks" && echo 'echo hi' > "$AICM_HOME/hooks/post-update.sh" && echo '# mine' > "$AICM_HOME/ai-clis.local.conf"
+"$AICM" uninstall --purge >/dev/null
+[[ -f "$AICM_HOME/hooks/post-update.sh" && -f "$AICM_HOME/ai-clis.local.conf" && -f "$AICM_HOME/.aicm-home" && ! -e "$AICM_HOME/state" && ! -e "$AICM_HOME/logs" ]] && pass "uninstall --purge keeps hooks and local rules" || fail "purge with user files: $(ls -A "$AICM_HOME" 2>&1)"
+rm -rf "$AICM_HOME/hooks" "$AICM_HOME/ai-clis.local.conf"
 "$AICM" uninstall --purge >/dev/null
 [[ ! -d "$AICM_HOME" ]] && pass "uninstall --purge removes everything" || fail "purge"
+# AICM_HOME pointed at a folder that is not ours: refused, nothing deleted.
+mkdir -p "$WORK/dotconfig/state" "$WORK/dotconfig/app" && echo keep > "$WORK/dotconfig/state/other-app.json" && echo keep > "$WORK/dotconfig/app/x"
+if AICM_HOME="$WORK/dotconfig" "$AICM" uninstall --purge >/dev/null 2>&1; then fail "purge of an unmarked folder accepted"
+elif [[ -f "$WORK/dotconfig/state/other-app.json" && -f "$WORK/dotconfig/app/x" ]]; then pass "uninstall --purge refuses a folder without the marker"
+else fail "unmarked folder was changed"; fi
 mkdir -p "$AICM_HOME"
 grep -q '== disk use by cleanup rule ==' "$WORK/status.txt" && grep -q 'codex-sessions' "$WORK/status.txt" && pass "status shows rules" || fail "status output"
 
