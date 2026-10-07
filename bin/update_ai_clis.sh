@@ -20,6 +20,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aicm-common.sh
 . "$SCRIPT_DIR/../lib/aicm-common.sh"
+# shellcheck source=lib/codex-host.sh
+. "$SCRIPT_DIR/../lib/codex-host.sh"
 
 LOCK_DIR="${LOCK_DIR:-$(aicm_temp_dir)/ai-cli-auto-manager-update-$(id -u).lockdir}"
 LOG_DIR="${LOG_DIR:-$AICM_HOME/logs}"
@@ -750,6 +752,13 @@ if gpt_target_enabled; then
   fi
   # The Codex desktop app can put its own copy on PATH and updates it itself; say so when npm's copy is hidden.
   shadow_warning codex
+
+  # A Homebrew upgrade deletes the old cask folder that a running `codex app-server` (Paseo keeps one)
+  # still spawns its terminal host from (lib/codex-host.sh). Right after the upgrade: a later update
+  # can hang.
+  if [[ "${AICM_CODEX_RECYCLE:-1}" != 0 ]] && { is_brew_cask_installed codex || is_brew_formula_installed codex; }; then
+    run_step "stale codex app-servers" recycle_stale_codex_app_servers
+  fi
 fi
 
 if target_enabled opencode; then

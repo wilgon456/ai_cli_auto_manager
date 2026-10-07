@@ -34,6 +34,8 @@ jobs:
         run: bash tests/aicm_test.sh
       - name: Inventory and catalog update tests
         run: bash tests/inventory_test.sh
+      - name: Codex app-server recycle tests
+        run: bash tests/codex_host_test.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 22
