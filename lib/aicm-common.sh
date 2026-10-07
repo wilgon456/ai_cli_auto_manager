@@ -417,14 +417,36 @@ aicm_semver() {
   grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.-]+)?' | head -n 1
 }
 
-# Succeeds when version $1 is older than $2 (numeric compare of the dotted part).
+# Succeeds when version $1 is older than $2. Semver order: the dotted numbers first (missing parts
+# count as 0), then a prerelease (2.0.0-beta.3) is older than its release (2.0.0); two prereleases
+# compare part by part, numbers numerically and below words. Build metadata (+x) is ignored.
 aicm_version_older() {
-  local a="${1%%[-+]*}" b="${2%%[-+]*}"
+  local a="${1%%+*}" b="${2%%+*}"
+  a="${a#v}"; b="${b#v}"
   [[ -n "$a" && -n "$b" && "$a" != "$b" ]] || return 1
-  awk -v a="$a" -v b="$b" 'BEGIN {
-    n = split(a, x, "."); m = split(b, y, "."); k = (n > m) ? n : m
-    for (i = 1; i <= k; i++) { xi = x[i] + 0; yi = y[i] + 0; if (xi < yi) exit 0; if (xi > yi) exit 1 }
-    exit 1 }'
+  [[ "$a" =~ ^[0-9]+(\.[0-9]+)*(-.+)?$ && "$b" =~ ^[0-9]+(\.[0-9]+)*(-.+)?$ ]] || return 1
+  awk -v a="$a" -v b="$b" '
+    function pre(v) { i = index(v, "-"); return i ? substr(v, i + 1) : "" }
+    function num(v) { i = index(v, "-"); return i ? substr(v, 1, i - 1) : v }
+    BEGIN {
+      n = split(num(a), x, "."); m = split(num(b), y, "."); k = (n > m) ? n : m
+      for (i = 1; i <= k; i++) { xi = x[i] + 0; yi = y[i] + 0; if (xi < yi) exit 0; if (xi > yi) exit 1 }
+      ra = pre(a); rb = pre(b)
+      if (ra == rb) exit 1
+      if (ra == "") exit 1
+      if (rb == "") exit 0
+      n = split(ra, x, "."); m = split(rb, y, "."); k = (n > m) ? n : m
+      for (i = 1; i <= k; i++) {
+        if (i > n) exit 0
+        if (i > m) exit 1
+        dx = (x[i] ~ /^[0-9]+$/); dy = (y[i] ~ /^[0-9]+$/)
+        if (dx && dy) { if (x[i] + 0 < y[i] + 0) exit 0; if (x[i] + 0 > y[i] + 0) exit 1; continue }
+        if (dx) exit 0
+        if (dy) exit 1
+        if (x[i] < y[i]) exit 0
+        if (x[i] > y[i]) exit 1
+      }
+      exit 1 }'
 }
 
 aicm_realpath() {
@@ -597,36 +619,116 @@ aicm_npm_view_file() {
   echo "$f"
 }
 
-# npm leaves its staging folders (node_modules/.<name>-XXXXXXXX) behind when an install fails half way.
-# Removes those older than a day. rm -rf removes links inside as links; it never follows them.
+# Root of a global package, the scope folder for @scope/name.
+aicm_npm_pkg_parent() { # pkg -> parent folder of its install folder
+  aicm_npm_cache
+  [[ -n "$AICM_NPM_ROOT_CACHE" ]] || return 1
+  if [[ "$1" == */* ]]; then printf '%s/%s' "$AICM_NPM_ROOT_CACHE" "${1%%/*}"; else printf '%s' "$AICM_NPM_ROOT_CACHE"; fi
+}
+
+# npm's backup of a package it was replacing ([@scope/].<name>-XXXXXXXX with a package.json), left
+# behind when the install was interrupted. Prints its path; fails when there is none.
+aicm_npm_backup() { # pkg
+  local parent name d
+  parent="$(aicm_npm_pkg_parent "$1")" || return 1
+  name="${1##*/}"
+  for d in "$parent/.$name-"????????; do
+    [[ -d "$d" && ! -L "$d" && -f "$d/package.json" ]] || continue
+    [[ "${d##*/}" =~ ^\.[^/]+-[A-Za-z0-9]{8}$ ]] || continue
+    printf '%s\n' "$d"
+    return 0
+  done
+  return 1
+}
+
+# npm leaves folders named node_modules/.<name>-XXXXXXXX behind when an install stops half way: its
+# staging folder, or its backup of the copy it was replacing. Removes those older than a day, but only
+# while <name> itself is installed (has a package.json): otherwise the leftover may be the only good
+# copy of a CLI whose install was cut off. rm -rf removes links inside as links; it never follows them.
 aicm_npm_leftovers() {
   aicm_npm_cache
-  local root="$AICM_NPM_ROOT_CACHE" d name
+  local root="$AICM_NPM_ROOT_CACHE" d name owner
   [[ -n "$root" && -d "$root" && ! -L "$root" ]] || return 0
   while IFS= read -r -d '' d; do
     name="$(basename "$d")"
     [[ "$name" =~ ^\.[^.].*-[A-Za-z0-9]{8}$ ]] || continue
+    owner="${name#.}"; owner="${owner%-*}"
+    if [[ ! -f "$(dirname "$d")/$owner/package.json" ]]; then
+      echo "kept npm leftover $d ($owner is not installed; this may be its only copy)"
+      continue
+    fi
     if rm -rf -- "${d:?}" 2>/dev/null; then echo "removed npm leftover $d"; else echo "kept npm leftover $d (in use)"; fi
   done < <(find "$root" -mindepth 1 -maxdepth 2 -type d -name '.*-*' -mmin +1440 -print0 2>/dev/null)
   return 0
 }
 
 # The version to install: the newest stable release at least N days old (empty when none is).
-aicm_npm_target() { # pkg days
-  local pkg="$1" days="$2" f out
-  if ((days <= 0)); then
+# Unpublished versions never count. With an installed version as $3 (the updater), deprecated
+# releases newer than it are passed over; when every newer one is deprecated, $3 is printed.
+# Notes go to stderr: callers read the version from stdout.
+aicm_npm_target() { # pkg days [installed skip-deprecated]
+  local pkg="$1" days="$2" installed="${3:-}" skipdep="${4:-}" f out v why checked=0
+  if ((days <= 0)) && [[ -z "$skipdep" ]]; then
     AICM_NPM_TIMEOUT=60 aicm_npm view "$pkg" version 2>/dev/null | aicm_semver || true
     return 0
   fi
-  f="$(aicm_npm_view_file "$pkg" time dist-tags)" || return 1
-  out="$(node "$AICM_ROOT/lib/npm-guard.js" pick "$days" "$f")" || { rm -f "$f"; return 1; }
+  ((days < 0)) && days=0
+  f="$(aicm_npm_view_file "$pkg" time dist-tags versions)" || return 1
+  out="$(node "$AICM_ROOT/lib/npm-guard.js" candidates "$days" "$f")" || { rm -f "$f"; return 1; }
   rm -f "$f"
-  printf '%s' "$out" | head -n 1
+  if [[ -z "$skipdep" ]]; then printf '%s\n' "$out" | head -n 1; return 0; fi
+  while IFS= read -r v; do
+    [[ -n "$v" ]] || continue
+    if [[ -n "$installed" ]] && ! aicm_version_older "$installed" "$v"; then printf '%s\n' "$v"; return 0; fi
+    ((checked >= 5)) && break
+    checked=$((checked + 1))
+    why="$(AICM_NPM_TIMEOUT=60 aicm_npm view "$pkg@$v" deprecated 2>/dev/null)" || return 1
+    if [[ -z "${why//[[:space:]]/}" ]]; then printf '%s\n' "$v"; return 0; fi
+    echo "skip: $pkg@$v is deprecated ($why)" >&2
+  done <<< "$out"
+  [[ -n "$installed" ]] && printf '%s\n' "$installed"
+  return 0
+}
+
+# --before=<now minus the waiting period>: npm then resolves the dependencies, too, to versions published
+# before that moment, so the waiting period covers them (their install scripts run in the real install).
+# Prints nothing when there is no waiting period.
+aicm_npm_before() { # days
+  [[ "${1:-0}" =~ ^[0-9]+$ ]] && (($1 > 0)) || return 0
+  node -e 'console.log("--before=" + new Date(Date.now() - Number(process.argv[1]) * 86400000).toISOString())' "$1"
+}
+
+# Signature verdicts per package@version, kept for the day, so the scheduled retries do not download
+# and stage the same release again. Values: ok | unverifiable | bad: <summary>.
+aicm_npm_verdict() { # spec
+  local file="$AICM_HOME/state/npm-verdicts.tsv"
+  [[ -f "$file" ]] || return 0
+  D="$(date +%Y-%m-%d)" S="$1" awk -F '\t' '$1 == ENVIRON["D"] && $2 == ENVIRON["S"] { print $3; exit }' "$file"
+}
+
+aicm_npm_verdict_set() { # spec verdict
+  local file="$AICM_HOME/state/npm-verdicts.tsv" today
+  today="$(date +%Y-%m-%d)"
+  mkdir -p "$AICM_HOME/state"
+  {
+    [[ -f "$file" ]] && D="$today" S="$1" awk -F '\t' '$1 == ENVIRON["D"] && $2 != ENVIRON["S"]' "$file"
+    printf '%s\t%s\t%s\n' "$today" "$1" "${2//$'\t'/ }"
+  } > "$file.$$.tmp" && mv -f "$file.$$.tmp" "$file"
+}
+
+# Notes for the caller's attention list (stable texts, so they are announced once a week at most).
+AICM_NPM_NOTES=()
+AICM_NOKEYS_NOTE="the npm registry publishes no signing keys (a private registry?), so release signatures cannot be checked; updates go on without that check. Set AICM_VERIFY_SIGNATURES=0 to skip it"
+aicm_npm_note() {
+  local n
+  for n in ${AICM_NPM_NOTES[@]+"${AICM_NPM_NOTES[@]}"}; do [[ "$n" == "$1" ]] && return 0; done
+  AICM_NPM_NOTES+=("$1")
 }
 
 # Fails when the candidate looks unlike the installed release or fails the registry signature check.
-aicm_npm_check() { # pkg installed target
-  local pkg="$1" installed="$2" target="$3" old new flags stage summary rc
+aicm_npm_check() { # pkg installed target [min-age-days]
+  local pkg="$1" installed="$2" target="$3" days="${4:-}" old new flags stage summary rc verdict before
+  [[ -n "$days" ]] || days="$(aicm_min_release_age_days)"
   if [[ -n "$installed" ]]; then
     old="$(aicm_npm_view_file "$pkg@$installed")" || { echo "could not read $pkg@$installed from the registry"; return 1; }
     new="$(aicm_npm_view_file "$pkg@$target")" || { rm -f "$old"; echo "could not read $pkg@$target from the registry"; return 1; }
@@ -641,17 +743,38 @@ aicm_npm_check() { # pkg installed target
     fi
   fi
   [[ "${AICM_VERIFY_SIGNATURES:-1}" == 0 ]] && return 0
+  verdict="$(aicm_npm_verdict "$pkg@$target")"
+  case "$verdict" in
+    ok) echo "signatures ok (checked earlier today): $pkg@$target"; return 0 ;;
+    unverifiable) echo "signatures not checkable (checked earlier today): $pkg@$target"; aicm_npm_note "$AICM_NOKEYS_NOTE"; return 0 ;;
+    bad:*) echo "signature check failed for $pkg@$target (checked earlier today): ${verdict#bad: }"; return 1 ;;
+  esac
+  before="$(aicm_npm_before "$days")"
   stage="$(mktemp -d)"
   # --ignore-scripts: nothing from the candidate runs before it has passed the checks.
-  if ! aicm_npm install "$pkg@$target" --prefix "$stage" --ignore-scripts --no-audit --no-fund --loglevel=error >/dev/null 2>&1; then
+  if ! aicm_npm install "$pkg@$target" --prefix "$stage" --ignore-scripts --no-audit --no-fund --loglevel=error ${before:+"$before"} >/dev/null 2>&1; then
     rm -rf "$stage"; echo "staged install of $pkg@$target failed"; return 1
   fi
   rc=0
   summary="$(AICM_NPM_TIMEOUT=300 aicm_npm audit signatures --prefix "$stage" 2>&1)" || rc=$?
   rm -rf "$stage"
   summary="$(printf '%s\n' "$summary" | awk 'NF' | paste -sd '/' -)"
-  if ((rc != 0)); then echo "signature check failed for $pkg@$target: $summary"; return 1; fi
-  echo "signatures ok: $summary"
+  if ((rc == 0)); then
+    aicm_npm_verdict_set "$pkg@$target" ok
+    echo "signatures ok: $summary"
+    return 0
+  fi
+  # A registry without signing keys (Verdaccio and other private registries): nothing can be checked.
+  if [[ "$summary" == *"installed from a supported registry"* ]]; then
+    aicm_npm_verdict_set "$pkg@$target" unverifiable
+    echo "warn: signatures not checkable for $pkg@$target: $summary"
+    aicm_npm_note "$AICM_NOKEYS_NOTE"
+    return 0
+  fi
+  # Remember a real signature problem for the day; other errors (network) are tried again next run.
+  if printf '%s' "$summary" | grep -Eiq '(invalid|missing).*signature'; then aicm_npm_verdict_set "$pkg@$target" "bad: $summary"; fi
+  echo "signature check failed for $pkg@$target: $summary"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
