@@ -32,6 +32,20 @@ function Get-AicmLocalAppData {
   return (Join-Path (Get-AicmUserHome) 'AppData\Local')
 }
 
+# Per-user lock name. A separate AICM_HOME (tests, a second setup) gets its own lock, so it never
+# waits for or blocks the real scheduled runs.
+function Get-AicmLockName([string]$Kind) {
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $userPart = if ($identity -and $identity.User) { $identity.User.Value } else { $env:USERNAME }
+  $name = "Local\ai-cli-auto-manager-$Kind-$($userPart -replace '[^A-Za-z0-9._-]', '-')"
+  if ($env:AICM_HOME) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($env:AICM_HOME.ToLowerInvariant())) | Select-Object -First 6 | ForEach-Object { $_.ToString('x2') })
+    $name += "-$hash"
+  }
+  return $name
+}
+
 function Initialize-AicmDirectory([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) {
     New-Item -ItemType Directory -Path $Path -Force | Out-Null

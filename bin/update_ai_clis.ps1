@@ -80,9 +80,7 @@ Start-Transcript -Path $logFile -Force | Out-Null
 try {
   Copy-Item -LiteralPath $logFile -Destination $latestLog -Force -ErrorAction SilentlyContinue
 
-  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-  $userPart = if ($identity -and $identity.User) { $identity.User.Value -replace '[^A-Za-z0-9._-]', '-' } else { $env:USERNAME -replace '[^A-Za-z0-9._-]', '-' }
-  $mutexName = "Local\ai-cli-auto-manager-update-$userPart"
+  $mutexName = Get-AicmLockName 'update'
   $mutex = [System.Threading.Mutex]::new($false, $mutexName)
   $hasLock = $false
   try {

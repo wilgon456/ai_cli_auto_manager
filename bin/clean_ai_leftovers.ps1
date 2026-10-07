@@ -291,8 +291,7 @@ if (-not $Report) {
   Start-Transcript -Path $transcript -Force | Out-Null
 }
 
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$mutex = [System.Threading.Mutex]::new($false, "Local\ai-cli-auto-manager-clean-$($identity.User.Value)")
+$mutex = [System.Threading.Mutex]::new($false, (Get-AicmLockName 'clean'))
 $hasLock = $false
 $exitCode = 0
 try {
