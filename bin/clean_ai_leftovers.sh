@@ -362,6 +362,19 @@ run_codex_rule() { # root days limit dry
   rm -f "$arch" "$del" "$threads" "$present"
 }
 
+# Runs rule $1 on folder $2. Kept out of the $( ) below: bash 3.2 misreads case patterns there.
+run_rule() { # index root dry
+  local i="$1" root="$2" dry="$3"
+  case "${AICM_RULE_KIND[$i]}" in
+    age) run_age_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
+    age-files) run_age_files_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
+    cap) run_cap_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
+    keep-latest) run_keep_latest_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
+    archive) run_archive_rule "$root" "${AICM_RULE_ID[$i]}" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" "$DRY_RUN" ;;
+    codex) run_codex_rule "$root" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
+  esac
+}
+
 run_command_rule() {
   local cmd="$1" args="$2" dry="$3" out rc
   if ! command -v "$cmd" >/dev/null 2>&1; then R_STATUS="not installed"; return 0; fi
@@ -411,19 +424,7 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
       # Each rule runs in a subshell, so an unexpected failure in one rule (a full disk, a value it could
       # not read) is reported and the other rules still run. The results come back as variable lines.
       set +e
-      rule_out="$(
-        set -e
-        exec 4>&1 1>&2
-        case "$kind" in
-          age) run_age_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
-          age-files) run_age_files_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
-          cap) run_cap_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
-          keep-latest) run_keep_latest_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
-          archive) run_archive_rule "$root" "$id" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" "$DRY_RUN" ;;
-          codex) run_codex_rule "$root" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
-        esac
-        for v in $R_VARS; do printf '%s=%q\n' "$v" "${!v}"; done >&4
-      )"
+      rule_out="$(set -e; exec 4>&1 1>&2; run_rule "$i" "$root" "$dry"; for v in $R_VARS; do printf '%s=%q\n' "$v" "${!v}"; done >&4)"
       rc=$?
       set -e
       if ((rc == 0)); then eval "$rule_out"; else R_ERROR="stopped unexpectedly (exit $rc), see the log"; fi
