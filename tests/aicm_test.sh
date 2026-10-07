@@ -2,6 +2,7 @@
 # Tests for bin/aicm (dispatcher, schedule via a fake crontab, doctor) and the updater dry run.
 # Runs against a throwaway HOME and never touches the real crontab.
 # shellcheck disable=SC2015 # "check && pass || fail" is intended: pass never fails
+# shellcheck disable=SC2016 # code passed to bash -c is single-quoted on purpose
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
