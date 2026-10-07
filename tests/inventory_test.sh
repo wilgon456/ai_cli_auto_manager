@@ -186,14 +186,14 @@ out="$("$UPD" --targets fakenpm --scheduled 2>&1)" || true
 ! grep -q 'already updated today' <<< "$out" && pass "a pending day is retried by the scheduled run" || fail "pending day not retried"
 
 echo "# a timeout ends what the command started"
-for tool in default perl; do
+for timeout_tool in default perl; do
   rc=0
-  # shellcheck disable=SC1091
-  ( [[ "$tool" == perl ]] && export AICM_TIMEOUT_TOOL=perl; . "$ROOT/lib/aicm-common.sh"
-    aicm_timeout 2 bash -c "sleep 120 & echo \$! > '$WORK/grandchild'; wait" ) || rc=$?
+  forced=""; [[ "$timeout_tool" == perl ]] && forced=perl
+  # shellcheck disable=SC2016 # expanded by the inner bash
+  AICM_TIMEOUT_TOOL="$forced" bash -c '. "$1/lib/aicm-common.sh"; aicm_timeout 2 bash -c "sleep 120 & echo \$! > \"$2/grandchild\"; wait"' _ "$ROOT" "$WORK" || rc=$?
   sleep 1
-  if [[ "$rc" == 124 ]] && ! kill -0 "$(cat "$WORK/grandchild")" 2>/dev/null; then pass "timeout ($tool) returns 124 and no grandchild survives"
-  else fail "timeout ($tool): rc=$rc"; kill "$(cat "$WORK/grandchild")" 2>/dev/null || true; fi
+  if [[ "$rc" == 124 ]] && ! kill -0 "$(cat "$WORK/grandchild")" 2>/dev/null; then pass "timeout ($timeout_tool) returns 124 and no grandchild survives"
+  else fail "timeout ($timeout_tool): rc=$rc"; kill "$(cat "$WORK/grandchild")" 2>/dev/null || true; fi
 done
 
 echo "# semver order"

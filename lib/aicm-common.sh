@@ -499,7 +499,8 @@ aicm_schedule_problems() {
   if [[ -n "$job_path" ]]; then
     for tool in node npm; do
       grep -q "\"$tool\":\"" "$file" || continue
-      if ! (PATH="$job_path"; command -v "$tool" >/dev/null 2>&1); then
+      # shellcheck disable=SC2016 # $1 is expanded by the inner sh
+      if ! env PATH="$job_path" sh -c 'command -v "$1"' _ "$tool" >/dev/null 2>&1; then
         echo "$tool was found when the schedule was installed but the scheduled jobs no longer find it; reinstall it or run: aicm schedule install"
       fi
     done

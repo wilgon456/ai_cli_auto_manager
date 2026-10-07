@@ -143,18 +143,18 @@ run_targets() {
 # failures or pending work and covered every target of this run. A partial manual run
 # (aicm update --targets claude) therefore does not stop the full scheduled run.
 done_today() {
-  local file="$AICM_HOME/state/last-update.json" state day done want t
+  local file="$AICM_HOME/state/last-update.json" state day covered want t
   [[ -f "$file" ]] || return 1
   state="$(cat "$file")"
   [[ "$state" == *'"ok":true'* && "$state" != *'"pending":true'* ]] || return 1
   day="$(printf '%s' "$state" | sed -n 's/.*"localDate":"\([0-9-]*\)".*/\1/p')"
   [[ -n "$day" && "$day" == "$(date +%Y-%m-%d)" ]] || return 1
-  done="$(printf '%s' "$state" | sed -n 's/.*"targets":"\([^"]*\)".*/\1/p')"
-  [[ -n "$done" ]] || return 1
-  [[ ",$done," == *,all,* ]] && return 0
+  covered="$(printf '%s' "$state" | sed -n 's/.*"targets":"\([^"]*\)".*/\1/p')"
+  [[ -n "$covered" ]] || return 1
+  [[ ",$covered," == *,all,* ]] && return 0
   want="$(run_targets)"
   [[ "$want" == all ]] && return 1
-  for t in ${want//,/ }; do [[ ",$done," == *",$t,"* ]] || return 1; done
+  for t in ${want//,/ }; do [[ ",$covered," == *",$t,"* ]] || return 1; done
   return 0
 }
 
