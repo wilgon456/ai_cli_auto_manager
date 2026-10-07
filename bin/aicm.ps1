@@ -10,7 +10,7 @@
   aicm.ps1 processes [-Kill] [-MinAgeHours 2]   agent processes left running after their session ended
   aicm.ps1 status    disk use per cleanup rule, schedules, last runs
   aicm.ps1 doctor    exit 1 when a schedule is missing or a run is overdue or failed
-  aicm.ps1 schedule  install | remove | show   [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]
+  aicm.ps1 schedule  install | remove | show | refresh   [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]
                                                [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean]
   aicm.ps1 version
 #>
@@ -39,6 +39,7 @@ param(
   [switch]$NoInventory,
   [switch]$NoClean,
   [switch]$KeepLegacyTask,
+  [switch]$KeepOtherJobs,
   [switch]$Apply,
   [int]$Days = 0,
   [switch]$Kill,
@@ -64,8 +65,8 @@ function Show-Help {
   Write-Host '  aicm.ps1 processes [-Kill] [-MinAgeHours 2]'
   Write-Host '  aicm.ps1 status'
   Write-Host '  aicm.ps1 doctor'
-  Write-Host '  aicm.ps1 schedule  install|remove|show [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
-  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean]'
+  Write-Host '  aicm.ps1 schedule  install|remove|show|refresh [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
+  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean] [-KeepOtherJobs]'
   Write-Host '  aicm.ps1 uninstall [-Purge]'
   Write-Host '  aicm.ps1 version'
 }
@@ -88,63 +89,216 @@ function Get-StateAgeDays($State) {
   try { return ((Get-Date) - [datetime]::Parse($State.finishedAt).ToLocalTime()).TotalDays } catch { return [double]::PositiveInfinity }
 }
 
-# Tasks run the installed copy through windows\run-hidden.vbs, so no PowerShell window flashes on screen.
-function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra) {
+# Tasks run the installed copy through windows\run-hidden.vbs, so no PowerShell window flashes on screen
+# (//B: a script error never opens a dialog that would keep the task waiting). Where Windows Script Host
+# cannot run (turned off by policy, VBScript removed), they start PowerShell directly with a hidden window.
+function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra, [string]$Launcher = 'wscript') {
+  $ps = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $App "bin\$Script")`"") + $Extra
+  if ($Launcher -eq 'powershell') {
+    return (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ((@('-WindowStyle', 'Hidden') + $ps) -join ' '))
+  }
   $vbs = Join-Path $App 'windows\run-hidden.vbs'
-  $argList = @("`"$vbs`"", 'powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $App "bin\$Script")`"") + $Extra
-  return (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ($argList -join ' '))
+  return (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ((@('//B', '//Nologo', "`"$vbs`"", 'powershell.exe') + $ps) -join ' '))
 }
 
-function Install-Schedule {
-  if ($NoUpdate -and $NoInventory -and $NoClean) { throw 'nothing to install: -NoUpdate, -NoInventory and -NoClean were all given' }
+# 'wscript' when wscript.exe runs windows\run-hidden.vbs and passes the exit code back, else 'powershell'.
+# The test runs a trivial command in batch mode (no dialog) and gives up after 20 seconds.
+# AICM_WSCRIPT_EXE replaces wscript.exe for the test (used by the tests to simulate a broken launcher).
+function Get-TaskLauncher([string]$App) {
+  if (@(Get-AicmWshDisabled).Count -gt 0) { return 'powershell' }
+  $exe = if ($env:AICM_WSCRIPT_EXE) { $env:AICM_WSCRIPT_EXE } else { 'wscript.exe' }
+  $vbs = Join-Path $App 'windows\run-hidden.vbs'
+  try {
+    $p = Start-Process -FilePath $exe -ArgumentList @('//B', '//Nologo', "`"$vbs`"", 'cmd.exe', '/c', 'exit', '7') -WindowStyle Hidden -PassThru -ErrorAction Stop
+    $null = $p.Handle
+    if (-not $p.WaitForExit(20000)) { try { $p.Kill() } catch { }; return 'powershell' }
+    if ($p.ExitCode -eq 7) { return 'wscript' }
+  } catch { }
+  return 'powershell'
+}
+
+# HH:MM or H:MM with hour 0-23 and minute 0-59.
+function Test-TimeText([string]$Text) { return ($Text -match '^([01]?[0-9]|2[0-3]):[0-5][0-9]$') }
+
+$script:JobNames = @('Update', 'Inventory', 'Clean')
+$script:DayBits = [ordered]@{ Sunday = 1; Monday = 2; Tuesday = 4; Wednesday = 8; Thursday = 16; Friday = 32; Saturday = 64 }
+
+function Get-DefaultScheduleOptions {
+  return [ordered]@{ updateAt = '05:00'; inventoryDay = 'Monday'; inventoryAt = '12:00'; cleanDay = 'Monday'; cleanAt = '12:30'; targets = ''; installMissing = $false; logRetentionDays = 30 }
+}
+
+# The options given on the command line.
+function Get-ParamScheduleOptions {
+  return [ordered]@{
+    updateAt = $UpdateAt; inventoryDay = $InventoryDay; inventoryAt = $InventoryAt; cleanDay = $CleanDay; cleanAt = $CleanAt
+    targets = ($Targets -join ','); installMissing = [bool]$InstallMissing; logRetentionDays = $LogRetentionDays
+  }
+}
+
+# The options the schedule was installed with: stored in schedule.json, or (schedules installed by
+# 2.5.1 and older) read back from the registered tasks.
+function Get-InstalledScheduleOptions($Sched) {
+  $o = Get-DefaultScheduleOptions
+  if ($Sched -and $Sched.PSObject.Properties['options'] -and $Sched.options) {
+    foreach ($k in @($o.Keys)) { if ($Sched.options.PSObject.Properties[$k]) { $o[$k] = $Sched.options.$k } }
+    $o.installMissing = [bool]$o.installMissing
+    $o.logRetentionDays = [int]$o.logRetentionDays
+    return $o
+  }
+  $at = { param($Task) try { ([datetime]$Task.Triggers[0].StartBoundary).ToString('HH:mm') } catch { $null } }
+  $day = {
+    param($Task)
+    $bits = 0
+    if ($Task.Triggers[0].PSObject.Properties['DaysOfWeek']) { $bits = [int]$Task.Triggers[0].DaysOfWeek }
+    foreach ($k in $script:DayBits.Keys) { if ($bits -band $script:DayBits[$k]) { return $k } }
+    return $null
+  }
+  $u = Get-AicmTask 'Update'
+  if ($u) {
+    $t = & $at $u; if ($t) { $o.updateAt = $t }
+    $a = [string]$u.Actions[0].Arguments
+    if ($a -match '-Targets "([^"]*)"') { $o.targets = $Matches[1] }
+    if ($a -match '-LogRetentionDays (\d+)') { $o.logRetentionDays = [int]$Matches[1] }
+    $o.installMissing = ($a -match '-InstallMissing')
+  }
+  foreach ($pair in @(@('Inventory', 'inventory'), @('Clean', 'clean'))) {
+    $task = Get-AicmTask $pair[0]
+    if (-not $task) { continue }
+    $t = & $at $task; if ($t) { $o["$($pair[1])At"] = $t }
+    $d = & $day $task; if ($d) { $o["$($pair[1])Day"] = $d }
+  }
+  return $o
+}
+
+# Action and trigger of one job, built from the options.
+function Get-JobSpec([string]$Name, $Opt, [string]$App, [string]$Launcher) {
+  $retention = @('-LogRetentionDays', "$($Opt.logRetentionDays)")
+  switch ($Name) {
+    'Update' {
+      $extra = $retention
+      if ($Opt.targets) { $extra += @('-Targets', "`"$($Opt.targets)`"") }
+      if ($Opt.installMissing) { $extra += '-InstallMissing' }
+      $extra += '-Scheduled'
+      $trigger = New-ScheduledTaskTrigger -Daily -At $Opt.updateAt
+      # Retry every 3 hours for 15 hours: a CLI that was running at 05:00 is updated once it is closed.
+      # A run after a complete success the same day exits right away.
+      $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At $Opt.updateAt -RepetitionInterval (New-TimeSpan -Hours 3) -RepetitionDuration (New-TimeSpan -Hours 15)).Repetition
+      return @{ Action = (New-TaskAction $App 'update_ai_clis.ps1' $extra $Launcher); Trigger = $trigger
+        Description = 'AI CLI Auto Manager: update installed AI coding CLIs'; Text = "daily at $($Opt.updateAt) (retried every 3 hours until it succeeds)" }
+    }
+    'Inventory' {
+      return @{ Action = (New-TaskAction $App 'inventory_ai_clis.ps1' $retention $Launcher); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.inventoryDay -At $Opt.inventoryAt)
+        Description = 'AI CLI Auto Manager: list installed AI coding CLIs'; Text = "every $($Opt.inventoryDay) at $($Opt.inventoryAt)" }
+    }
+    'Clean' {
+      return @{ Action = (New-TaskAction $App 'clean_ai_leftovers.ps1' $retention $Launcher); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.cleanDay -At $Opt.cleanAt)
+        Description = 'AI CLI Auto Manager: remove stale AI CLI leftovers'; Text = "every $($Opt.cleanDay) at $($Opt.cleanAt)" }
+    }
+  }
+}
+
+# What decides whether a registered task already matches: program, arguments, trigger kind, time, days, repetition.
+function Get-TaskSignature($Action, $Trigger) {
+  $at = ''
+  try { $at = ([datetime]$Trigger.StartBoundary).ToString('HH:mm') } catch { }
+  $days = ''
+  if ($Trigger.PSObject.Properties['DaysOfWeek']) { $days = [string]$Trigger.DaysOfWeek }
+  $rep = ''
+  if ($Trigger.PSObject.Properties['Repetition'] -and $Trigger.Repetition -and $Trigger.Repetition.Interval) { $rep = "$($Trigger.Repetition.Interval)/$($Trigger.Repetition.Duration)" }
+  return "$($Action.Execute)|$($Action.Arguments)|$($Trigger.CimClass.CimClassName)|$at|$days|$rep"
+}
+
+# The clone the installed copy came from (when this runs from the installed copy itself).
+function Get-ScheduleSource([string]$App) {
+  $sourceFile = Join-Path $App 'SOURCE'
+  if ((Test-AicmSamePath (Get-AicmRoot) $App) -and (Test-Path -LiteralPath $sourceFile)) { return (Get-Content -LiteralPath $sourceFile -TotalCount 1).Trim() }
+  return (Get-AicmRoot)
+}
+
+# Registers $Want with the options $Opt; tasks that already match are left alone, so running it again
+# changes nothing. Jobs not in $Want are removed, or kept as they are with -KeepOthers.
+# -Refresh: called after the installed copy was updated; keeps installedAt and does not touch the legacy task.
+function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$Refresh) {
+  if (@($Want).Count -eq 0) { throw 'nothing to install: -NoUpdate, -NoInventory and -NoClean were all given' }
+  foreach ($k in 'updateAt', 'inventoryAt', 'cleanAt') {
+    if (-not (Test-TimeText $Opt[$k])) { throw "invalid time '$($Opt[$k])' for $k`: use HH:MM with hour 0-23 and minute 0-59, like 05:00" }
+  }
+  $prev = Read-AicmState 'schedule'
   $jobs = New-Object System.Collections.Generic.List[string]
   $app = Sync-AicmAppCopy (Get-AicmRoot)
-  Write-Host "installed copy: $app (version $(Get-AicmVersion))"
+  if (-not $Refresh) { Write-Host "installed copy: $app (version $(Get-AicmVersion))" }
+  $launcher = Get-TaskLauncher $app
+  if ($launcher -ne 'wscript') { Write-Host 'note: wscript.exe cannot run windows\run-hidden.vbs here (Windows Script Host turned off?); the tasks start PowerShell directly with a hidden window, which may flash briefly' }
   $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-  if (-not $NoUpdate) {
-    $extra = @('-LogRetentionDays', "$LogRetentionDays")
-    $targetText = ($Targets -join ',')
-    if ($targetText) { $extra += @('-Targets', "`"$targetText`"") }
-    if ($InstallMissing) { $extra += '-InstallMissing' }
-    $extra += '-Scheduled'
-    $action = New-TaskAction $app 'update_ai_clis.ps1' $extra
-    $trigger = New-ScheduledTaskTrigger -Daily -At $UpdateAt
-    # Retry every 3 hours for 15 hours: a CLI that was running at 05:00 is updated once it is closed.
-    # A run after a complete success the same day exits right away.
-    $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At $UpdateAt -RepetitionInterval (New-TimeSpan -Hours 3) -RepetitionDuration (New-TimeSpan -Hours 15)).Repetition
-    Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Update' -Action $action -Trigger $trigger -Settings $settings -Description 'AI CLI Auto Manager: update installed AI coding CLIs' -Force | Out-Null
-    $jobs.Add('Update')
-    Write-Host "registered: $($script:AicmTaskPath)Update     daily at $UpdateAt (retried every 3 hours until it succeeds)"
-  } elseif (Get-AicmTask 'Update') {
-    Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Update' -Confirm:$false
-    Write-Host "removed: $($script:AicmTaskPath)Update"
+  $changed = $false
+  foreach ($name in $script:JobNames) {
+    $existing = Get-AicmTask $name
+    if ($Want -contains $name) {
+      $spec = Get-JobSpec $name $Opt $app $launcher
+      $same = $existing -and (Get-TaskSignature $existing.Actions[0] $existing.Triggers[0]) -eq (Get-TaskSignature $spec.Action $spec.Trigger)
+      # A plain install also turns a disabled task back on; a refresh leaves that choice alone.
+      if ($same -and ($Refresh -or $existing.State -ne 'Disabled')) {
+        if (-not $Refresh) { Write-Host ("unchanged:  {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text) }
+      } else {
+        Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Action $spec.Action -Trigger $spec.Trigger -Settings $settings -Description $spec.Description -Force | Out-Null
+        Write-Host ("registered: {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text)
+        $changed = $true
+      }
+      $jobs.Add($name)
+    } elseif ($KeepOthers) {
+      if ($existing) { $jobs.Add($name) }
+    } elseif ($existing) {
+      Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Confirm:$false
+      Write-Host "removed: $($script:AicmTaskPath)$name"
+      $changed = $true
+    }
   }
-  if (-not $NoInventory) {
-    $action = New-TaskAction $app 'inventory_ai_clis.ps1' @('-LogRetentionDays', "$LogRetentionDays")
-    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $InventoryDay -At $InventoryAt
-    Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Inventory' -Action $action -Trigger $trigger -Settings $settings -Description 'AI CLI Auto Manager: list installed AI coding CLIs' -Force | Out-Null
-    $jobs.Add('Inventory')
-    Write-Host "registered: $($script:AicmTaskPath)Inventory  every $InventoryDay at $InventoryAt"
-  } elseif (Get-AicmTask 'Inventory') {
-    Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Inventory' -Confirm:$false
-    Write-Host "removed: $($script:AicmTaskPath)Inventory"
-  }
-  if (-not $NoClean) {
-    $action = New-TaskAction $app 'clean_ai_leftovers.ps1' @('-LogRetentionDays', "$LogRetentionDays")
-    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $CleanDay -At $CleanAt
-    Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Clean' -Action $action -Trigger $trigger -Settings $settings -Description 'AI CLI Auto Manager: remove stale AI CLI leftovers' -Force | Out-Null
-    $jobs.Add('Clean')
-    Write-Host "registered: $($script:AicmTaskPath)Clean      every $CleanDay at $CleanAt"
-  } elseif (Get-AicmTask 'Clean') {
-    Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName 'Clean' -Confirm:$false
-    Write-Host "removed: $($script:AicmTaskPath)Clean"
-  }
-  if (-not $KeepLegacyTask -and -not $NoUpdate -and (Get-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
+  if (-not $Refresh -and -not $KeepLegacyTask -and $Want -contains 'Update' -and (Get-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
     Unregister-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -Confirm:$false
     Write-Host "removed legacy task: \$legacyTaskName (replaced by $($script:AicmTaskPath)Update)"
   }
-  Write-AicmState 'schedule' ([ordered]@{ installedAt = Get-AicmTimestamp; version = Get-AicmVersion; app = $app; source = (Get-AicmRoot); jobs = $jobs.ToArray() })
-  Write-Host 'Each run checks that the other jobs still exist and shows a desktop notification if one is gone.'
+  $installedAt = Get-AicmTimestamp
+  if ($Refresh -and $prev -and $prev.PSObject.Properties['installedAt']) { $installedAt = [string]$prev.installedAt }
+  Write-AicmState 'schedule' ([ordered]@{
+    installedAt = $installedAt; version = Get-AicmVersion; app = $app; source = (Get-ScheduleSource $app)
+    jobs = $jobs.ToArray(); launcher = $launcher; options = $Opt
+  })
+  if ($Refresh) {
+    if (-not $changed) { Write-Host 'scheduled tasks already match the installed copy' }
+  } else {
+    Write-Host 'Each run checks that the other jobs still exist and shows a desktop notification if one is gone.'
+  }
+}
+
+# Jobs asked for on the command line.
+function Get-WantedJobs {
+  $want = @()
+  if (-not $NoUpdate) { $want += 'Update' }
+  if (-not $NoInventory) { $want += 'Inventory' }
+  if (-not $NoClean) { $want += 'Clean' }
+  return $want
+}
+
+function Invoke-ScheduleInstall {
+  $opt = Get-ParamScheduleOptions
+  if ($KeepOtherJobs) {
+    # Jobs that are not being installed keep the days and times they were installed with.
+    $base = Get-InstalledScheduleOptions (Read-AicmState 'schedule')
+    if ($NoInventory) { $opt.inventoryDay = $base.inventoryDay; $opt.inventoryAt = $base.inventoryAt }
+    if ($NoClean) { $opt.cleanDay = $base.cleanDay; $opt.cleanAt = $base.cleanAt }
+    if ($NoUpdate) { foreach ($k in 'updateAt', 'targets', 'installMissing', 'logRetentionDays') { $opt[$k] = $base[$k] } }
+  }
+  Install-Schedule $opt @(Get-WantedJobs) -KeepOthers:$KeepOtherJobs
+}
+
+# Re-registers the installed jobs with their stored options (run by the update after it refreshed
+# the installed copy). Changes nothing when the tasks already match.
+function Invoke-ScheduleRefresh {
+  $sched = Read-AicmState 'schedule'
+  if (-not $sched) { Write-Host 'no schedule installed; nothing to refresh'; return }
+  $want = @(@($sched.jobs) | Where-Object { $script:JobNames -contains $_ })
+  if ($want.Count -eq 0) { Write-Host 'no scheduled jobs recorded; nothing to refresh'; return }
+  Install-Schedule (Get-InstalledScheduleOptions $sched) $want -Refresh
 }
 
 function Remove-Schedule {
@@ -158,6 +312,30 @@ function Remove-Schedule {
   if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
 }
 
+# What -Purge removes: only what this tool writes. Hooks, *.local.conf, repos.conf and anything else
+# the user put there stay, and the folder itself goes only when nothing is left in it. A folder
+# without the .aicm-home marker is purged only when it is the default .ai-cli-auto-manager.
+function Invoke-Purge([string]$HomeDir) {
+  if (-not (Test-Path -LiteralPath $HomeDir)) { Write-Host "nothing to purge: $HomeDir does not exist"; return }
+  if (-not (Test-Path -LiteralPath (Join-Path $HomeDir '.aicm-home')) -and (Split-Path -Leaf $HomeDir) -ne '.ai-cli-auto-manager') {
+    throw "refusing to purge ${HomeDir}: it has no .aicm-home marker, so it may not be an AI CLI Auto Manager folder"
+  }
+  foreach ($name in 'app', 'app.new', 'app.old', 'logs', 'state', 'archive', 'inventory.md') {
+    $item = Get-Item -LiteralPath (Join-Path $HomeDir $name) -Force -ErrorAction SilentlyContinue
+    if (-not $item) { continue }
+    if ($item -is [System.IO.DirectoryInfo]) { Remove-AicmTree $item } else { $item.Delete() }
+    Write-Host "removed $($item.FullName)"
+  }
+  $left = @(Get-ChildItem -LiteralPath $HomeDir -Force | Where-Object { $_.Name -ne '.aicm-home' })
+  if ($left.Count -eq 0) {
+    Remove-Item -LiteralPath (Join-Path $HomeDir '.aicm-home') -Force -ErrorAction SilentlyContinue
+    [System.IO.Directory]::Delete($HomeDir, $false)
+    Write-Host "removed $HomeDir"
+  } else {
+    Write-Host "kept $HomeDir, which still holds files you wrote: $(($left | ForEach-Object { $_.Name }) -join ' ')"
+  }
+}
+
 # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless -Purge.
 function Invoke-Uninstall {
   Remove-Schedule
@@ -165,14 +343,14 @@ function Invoke-Uninstall {
     Write-Host "note: the legacy task '\$legacyTaskName' is still registered; remove it with: Unregister-ScheduledTask -TaskName '$legacyTaskName'"
   }
   $app = Get-AicmAppDir
-  if ((Test-Path -LiteralPath $app) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
+  # Only a folder that holds an installed copy (it has the SOURCE file) is removed.
+  if ((Test-Path -LiteralPath (Join-Path $app 'SOURCE')) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
     Remove-AicmTree ([System.IO.DirectoryInfo]::new($app))
     Write-Host "removed installed copy: $app"
   }
   $homeDir = Get-AicmHome
   if ($Purge) {
-    if ((Split-Path -Leaf $homeDir) -ne '.ai-cli-auto-manager' -and -not $env:AICM_HOME) { throw "refusing to purge $homeDir" }
-    if (Test-Path -LiteralPath $homeDir) { Remove-AicmTree ([System.IO.DirectoryInfo]::new($homeDir)); Write-Host "removed $homeDir (logs, state, archive)" }
+    Invoke-Purge $homeDir
   } else {
     Write-Host "kept $homeDir (logs, state, archive, local rules); add -Purge to remove it too"
   }
@@ -219,10 +397,20 @@ function Get-DoctorProblems {
   return $problems
 }
 
+# The last $Count notifications (they may never have shown on screen).
+function Get-RecentNotifications([int]$Count) {
+  $log = Join-Path (Join-Path (Get-AicmHome) 'logs') 'notifications.log'
+  if (-not (Test-Path -LiteralPath $log)) { return @() }
+  return @(Get-Content -LiteralPath $log -Encoding UTF8 -Tail $Count)
+}
+
 function Invoke-Child([string]$Script, [hashtable]$Splat) {
   & (Join-Path $binDir $Script) @Splat
   exit $LASTEXITCODE
 }
+
+# The commands that write into AICM_HOME mark it as ours (uninstall never does).
+if ($Command -in @('update', 'inventory', 'clean', 'schedule')) { Set-AicmHomeMarker }
 
 switch ($Command) {
   'help' { Show-Help }
@@ -282,21 +470,32 @@ switch ($Command) {
       foreach ($c in @($inv.clis)) { Write-Host ("{0,-20} {1,-11} {2,-14} {3,-9} {4}" -f $c.name, $c.method, $c.version, $c.state, $c.autoUpdate) }
     }
     Write-Host ''
+    Write-Host '== recent notifications =='
+    $recent = @(Get-RecentNotifications 5)
+    if ($recent.Count -gt 0) { foreach ($l in $recent) { Write-Host $l } } else { Write-Host 'none' }
+    Write-Host ''
     Write-Host '== disk use by cleanup rule =='
     & (Join-Path $binDir 'clean_ai_leftovers.ps1') -Report
   }
   'doctor' {
     $problems = @(Get-DoctorProblems)
-    if ($problems.Count -eq 0) { Write-Host 'healthy: schedules registered, recent runs succeeded'; exit 0 }
+    if ($problems.Count -eq 0) { Write-Host 'healthy: schedules registered, recent runs succeeded' }
     foreach ($p in $problems) { Write-Host "problem: $p" }
+    $recent = @(Get-RecentNotifications 3)
+    if ($recent.Count -gt 0) {
+      Write-Host "recent notifications ($(Join-Path (Join-Path (Get-AicmHome) 'logs') 'notifications.log')):"
+      foreach ($l in $recent) { Write-Host "  $l" }
+    }
+    if ($problems.Count -eq 0) { exit 0 }
     exit 1
   }
   'schedule' {
     switch ($Action) {
-      'install' { Install-Schedule }
+      'install' { Invoke-ScheduleInstall }
+      'refresh' { Invoke-ScheduleRefresh }
       'remove' { Remove-Schedule }
       { $_ -in @('show', '') } { Show-Schedule }
-      default { throw "unknown schedule action '$Action' (use install, remove or show)" }
+      default { throw "unknown schedule action '$Action' (use install, remove, show or refresh)" }
     }
   }
 }

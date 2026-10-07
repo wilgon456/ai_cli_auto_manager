@@ -240,10 +240,19 @@ aicm_attention() { # key items...
   return 0
 }
 
-# Desktop notification. Never fails the caller. Disable with AICM_NOTIFY=0.
+# Desktop notification. Never fails the caller. Disable the desktop part with AICM_NOTIFY=0.
+# Every notification is also appended to logs/notifications.log (last 500 lines kept), so one that
+# never showed on screen can still be read with `aicm status`.
 aicm_notify() {
-  local title="$1" body="$2"
+  local title="$1" body="$2" log="$AICM_HOME/logs/notifications.log" n bus
   echo "notify: $title - $body"
+  if mkdir -p "$AICM_HOME/logs" 2>/dev/null; then
+    printf '%s %s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$title" "${body//$'\n'/ }" >> "$log" 2>/dev/null || true
+    n="$(wc -l < "$log" 2>/dev/null | tr -d ' ')"
+    if [[ "$n" =~ ^[0-9]+$ ]] && ((n > 600)); then
+      { tail -n 500 "$log" > "$log.$$.tmp" && mv -f "$log.$$.tmp" "$log"; } 2>/dev/null || rm -f "$log.$$.tmp"
+    fi
+  fi
   [[ "${AICM_NOTIFY:-1}" == 0 ]] && return 0
   if command -v osascript >/dev/null 2>&1; then
     local t b
@@ -251,7 +260,11 @@ aicm_notify() {
     b="${body//\\/\\\\}"; b="${b//\"/\\\"}"
     osascript -e "display notification \"$b\" with title \"$t\"" >/dev/null 2>&1 || true
   elif command -v notify-send >/dev/null 2>&1; then
-    notify-send "$title" "$body" >/dev/null 2>&1 || true
+    # cron jobs have no session bus address; the user's bus is at a fixed place under systemd.
+    bus="${DBUS_SESSION_BUS_ADDRESS:-}"
+    if [[ -z "$bus" && -S "/run/user/$(id -u)/bus" ]]; then bus="unix:path=/run/user/$(id -u)/bus"; fi
+    if [[ -n "$bus" ]]; then DBUS_SESSION_BUS_ADDRESS="$bus" notify-send "$title" "$body" >/dev/null 2>&1 || true
+    else notify-send "$title" "$body" >/dev/null 2>&1 || true; fi
   fi
   return 0
 }
@@ -340,39 +353,112 @@ PY
 
 AICM_APP_DIR="$AICM_HOME/app"
 
-# Copies bin, lib, rules and VERSION from $1 into the app folder via a swap; prints the app folder.
+# Marks AICM_HOME as this tool's folder; `aicm uninstall --purge` removes only a marked folder (or
+# the default one), so AICM_HOME=~/.config can never wipe ~/.config.
+aicm_mark_home() {
+  [[ -f "$AICM_HOME/.aicm-home" ]] && return 0
+  mkdir -p "$AICM_HOME" 2>/dev/null && printf 'AI CLI Auto Manager home (logs, state, archive, installed copy)\n' > "$AICM_HOME/.aicm-home" 2>/dev/null
+  return 0
+}
+
+# Succeeds when copy $2 has every file of source $1 (bin, lib, rules, windows) with the same content,
+# plus the files every copy needs.
+aicm_app_copy_complete() { # source copy
+  local src="$1" copy="$2" f
+  for f in VERSION bin/aicm lib/aicm-common.sh; do [[ -s "$copy/$f" ]] || return 1; done
+  [[ -n "$(ls "$copy/rules" 2>/dev/null)" ]] || return 1
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    cmp -s "$src/$f" "$copy/$f" || return 1
+  done < <(cd "$src" && for d in bin lib rules windows; do [[ -d "$d" ]] && find "$d" -type f; done)
+  return 0
+}
+
+# Copies bin, lib, rules and VERSION from $1 into the app folder; prints the app folder. The new copy
+# is built next to the old one, every copy step is checked and the result compared with the source
+# before the swap; on any failure the old copy stays (or is put back) and this returns 1.
+# Every step checks its status itself: callers run this inside if/$( ), where errexit is off.
 aicm_sync_app_copy() {
   local src="$1" app="$AICM_APP_DIR" d f
   if [[ "$(cd "$src" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]]; then echo "$app"; return 0; fi
-  rm -rf -- "${app:?}.new" "${app:?}.old"
-  mkdir -p "$app.new"
-  for d in bin lib rules windows; do [[ -d "$src/$d" ]] && cp -R "$src/$d" "$app.new/$d"; done
-  for f in VERSION LICENSE README.md; do [[ -f "$src/$f" ]] && cp "$src/$f" "$app.new/$f"; done
-  printf '%s\n' "$src" > "$app.new/SOURCE"
-  [[ -d "$app" ]] && mv "$app" "$app.old"
-  mv "$app.new" "$app"
+  aicm_mark_home
+  # A run that stopped between the two renames left only app.old behind: put it back first.
+  if [[ ! -d "$app" && -d "$app.old" ]]; then mv "$app.old" "$app" || return 1; fi
+  rm -rf -- "${app:?}.new" "${app:?}.old" || return 1
+  mkdir -p "$app.new" || return 1
+  for d in bin lib rules windows; do
+    if [[ -d "$src/$d" ]]; then cp -R "$src/$d" "$app.new/$d" || { rm -rf -- "${app:?}.new"; return 1; }; fi
+  done
+  for f in VERSION LICENSE README.md; do
+    if [[ -f "$src/$f" ]]; then cp "$src/$f" "$app.new/$f" || { rm -rf -- "${app:?}.new"; return 1; }; fi
+  done
+  printf '%s\n' "$src" > "$app.new/SOURCE" || { rm -rf -- "${app:?}.new"; return 1; }
+  if ! aicm_app_copy_complete "$src" "$app.new"; then
+    echo "installed copy: the new copy of $src is incomplete; keeping the old one" >&2
+    rm -rf -- "${app:?}.new"
+    return 1
+  fi
+  if [[ -d "$app" ]]; then mv "$app" "$app.old" || { rm -rf -- "${app:?}.new"; return 1; }; fi
+  if ! mv "$app.new" "$app"; then
+    if [[ -d "$app.old" && ! -d "$app" ]]; then mv "$app.old" "$app"; fi
+    rm -rf -- "${app:?}.new"
+    return 1
+  fi
   rm -rf -- "${app:?}.old"
   echo "$app"
 }
 
-# Called at the end of the daily update when it runs from the installed copy.
+# Called at the end of the daily update when it runs from the installed copy. Copies only a newer
+# version (checking out an old tag in the clone never downgrades the jobs), then re-registers the
+# jobs from the new copy so changed script names or arguments take effect.
 aicm_update_app_copy() {
-  local app="$AICM_APP_DIR" src new
+  local app="$AICM_APP_DIR" src new cur
   [[ "$(cd "$AICM_ROOT" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]] || return 0
   [[ -f "$app/SOURCE" ]] || return 0
   src="$(head -n 1 "$app/SOURCE")"
+  cur="$(aicm_version)"
   if [[ ! -f "$src/VERSION" || ! -x "$src/bin/aicm" ]]; then
-    echo "installed copy: source $src is gone; keeping version $(aicm_version)"
+    echo "installed copy: source $src is gone; keeping version $cur"
     return 0
   fi
   new="$(head -n 1 "$src/VERSION" | tr -d '[:space:]')"
-  [[ "$new" == "$(aicm_version)" ]] && return 0
-  if aicm_sync_app_copy "$src" >/dev/null 2>&1; then echo "installed copy: updated to $new from $src"
-  else echo "installed copy: could not refresh; trying again next run"; fi
+  [[ "$new" == "$cur" ]] && return 0
+  if ! aicm_version_older "$cur" "$new"; then
+    echo "installed copy: $src has version $new, not newer than $cur; keeping $cur"
+    return 0
+  fi
+  if ! aicm_sync_app_copy "$src" >/dev/null; then
+    echo "installed copy: could not refresh; keeping $cur, trying again next run"
+    return 0
+  fi
+  echo "installed copy: updated $cur -> $new from $src"
+  [[ -f "$AICM_HOME/state/schedule.json" ]] || return 0
+  # AICM_ROOT cleared so the new copy finds its own files.
+  local out rc=0
+  out="$(AICM_ROOT="" /bin/bash "$app/bin/aicm" schedule refresh 2>&1)" || rc=$?
+  if [[ -n "$out" ]]; then printf '%s\n' "$out" | sed 's/^/schedule refresh: /'; fi
+  if ((rc != 0)); then echo "schedule refresh: failed (exit code $rc); run: aicm schedule install"; fi
   return 0
 }
 
 AICM_LAUNCHD_PREFIX="io.github.wilgon456.ai-cli-auto-manager"
+
+# crontab, or the command in AICM_CRONTAB (tests use a fake that keeps its table in a file; the
+# updater puts system folders first on PATH, so a fake found through PATH would not be enough).
+aicm_crontab() { "${AICM_CRONTAB:-crontab}" "$@"; }
+
+# One "key":"value" string field of a one-line JSON state file.
+aicm_json_field() { # file key
+  [[ -f "$1" ]] || return 0
+  sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1
+}
+
+# The jobs recorded in schedule.json, one per line.
+aicm_scheduled_jobs() {
+  local file="$AICM_HOME/state/schedule.json"
+  [[ -f "$file" ]] || return 0
+  sed -n 's/.*"jobs":\[\([^]]*\)\].*/\1/p' "$file" | tr ',' '\n' | tr -d '" ' | grep -E '^(update|clean|inventory)$' || true
+}
 
 aicm_job_exists() {
   local job="$1"
@@ -380,8 +466,25 @@ aicm_job_exists() {
     [[ -f "$HOME/Library/LaunchAgents/$AICM_LAUNCHD_PREFIX.$job.plist" ]] || return 1
     launchctl list 2>/dev/null | grep -q "$AICM_LAUNCHD_PREFIX.$job" || return 1
   else
-    crontab -l 2>/dev/null | grep -q "# aicm:$job\$" || return 1
+    aicm_crontab -l 2>/dev/null | grep -q "# aicm:$job\$" || return 1
   fi
+}
+
+# Fails only when it can tell that no cron daemon runs (WSL starts none by default). Without pgrep and
+# systemctl it cannot tell and succeeds.
+aicm_cron_running() {
+  local known=false
+  if command -v pgrep >/dev/null 2>&1; then
+    known=true
+    pgrep -x cron >/dev/null 2>&1 && return 0
+    pgrep -x crond >/dev/null 2>&1 && return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    known=true
+    systemctl is-active --quiet cron 2>/dev/null && return 0
+    systemctl is-active --quiet crond 2>/dev/null && return 0
+  fi
+  [[ "$known" == false ]]
 }
 
 # Prints one line per scheduled job that was installed but is now missing.
@@ -390,7 +493,21 @@ aicm_job_exists() {
 aicm_schedule_problems() {
   local skip="${1:-}" nostale="${2:-}" file="$AICM_HOME/state/schedule.json" job state limit
   [[ -f "$file" ]] || return 0
-  for job in $(grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean|inventory)$'); do
+  local job_path tool
+  # node and npm found at install time must still be found with the PATH the jobs get.
+  job_path="$(aicm_json_field "$file" path)"
+  if [[ -n "$job_path" ]]; then
+    for tool in node npm; do
+      grep -q "\"$tool\":\"" "$file" || continue
+      if ! (PATH="$job_path"; command -v "$tool" >/dev/null 2>&1); then
+        echo "$tool was found when the schedule was installed but the scheduled jobs no longer find it; reinstall it or run: aicm schedule install"
+      fi
+    done
+  fi
+  if [[ "$(aicm_os)" == linux && -n "$(aicm_scheduled_jobs)" ]] && ! aicm_cron_running; then
+    echo "cron is not running, so the scheduled jobs never start; start it (sudo service cron start) and have it start at boot (on WSL: [boot] command in /etc/wsl.conf)"
+  fi
+  for job in $(aicm_scheduled_jobs); do
     [[ "$job" == "$skip" ]] && continue
     if ! aicm_job_exists "$job"; then echo "scheduled job '$job' is missing; run: aicm schedule install"; continue; fi
     [[ "$nostale" == nostale ]] && continue

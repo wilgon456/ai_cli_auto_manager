@@ -300,9 +300,20 @@ function Send-AicmAttention([string]$Key, [string[]]$Items) {
   if ($due.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($due.ToArray() -join '; ') }
 }
 
-# Desktop notification. Never fails the caller. Disable with AICM_NOTIFY=0.
+# Desktop notification. Never fails the caller. Disable the desktop part with AICM_NOTIFY=0.
+# Every notification is also appended to logs\notifications.log (last 500 lines kept), so one that
+# never showed on screen can still be read with `aicm.ps1 status`.
 function Send-AicmNotification([string]$Title, [string]$Body) {
   Write-Host "notify: $Title - $Body"
+  try {
+    $dir = Join-Path (Get-AicmHome) 'logs'
+    Initialize-AicmDirectory $dir
+    $log = Join-Path $dir 'notifications.log'
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::AppendAllText($log, ("{0} {1} - {2}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Title, ($Body -replace "`r?`n", ' ')), $utf8)
+    $lines = [System.IO.File]::ReadAllLines($log, $utf8)
+    if ($lines.Count -gt 600) { [System.IO.File]::WriteAllLines($log, [string[]]($lines[($lines.Count - 500)..($lines.Count - 1)]), $utf8) }
+  } catch { }
   if ($env:AICM_NOTIFY -eq '0') { return }
   try {
     [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
@@ -407,42 +418,118 @@ function Get-AicmCodexThreads([string]$CodexHome) {
 
 function Get-AicmAppDir { return (Join-Path (Get-AicmHome) 'app') }
 
-# Copies bin, lib, rules, windows and VERSION from $Source into the app folder via a swap.
+# Marks AICM_HOME as this tool's folder; `aicm.ps1 uninstall -Purge` removes only a marked folder (or
+# the default one), so AICM_HOME pointing at another folder can never wipe it.
+function Set-AicmHomeMarker {
+  try {
+    $marker = Join-Path (Get-AicmHome) '.aicm-home'
+    if (Test-Path -LiteralPath $marker) { return }
+    Initialize-AicmDirectory (Get-AicmHome)
+    [System.IO.File]::WriteAllText($marker, "AI CLI Auto Manager home (logs, state, archive, installed copy)`r`n")
+  } catch { }
+}
+
+# Antivirus scanners briefly lock freshly written files, so a folder move is retried a few times.
+function Move-AicmDirectory([string]$From, [string]$To) {
+  for ($i = 1; ; $i++) {
+    try { Move-Item -LiteralPath $From -Destination $To -ErrorAction Stop; return }
+    catch { if ($i -ge 5) { throw }; Start-Sleep -Milliseconds (300 * $i) }
+  }
+}
+
+# Files of $Source (bin, lib, rules, windows) that are missing from $Copy or differ in size, plus the
+# files every copy needs. Empty when the copy is complete.
+function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
+  $gaps = New-Object System.Collections.Generic.List[string]
+  foreach ($f in 'VERSION', 'bin\aicm.ps1', 'lib\aicm-common.ps1', 'windows\run-hidden.vbs') {
+    if (-not (Test-Path -LiteralPath (Join-Path $Copy $f) -PathType Leaf)) { $gaps.Add($f) }
+  }
+  if (-not (Get-ChildItem -LiteralPath (Join-Path $Copy 'rules') -File -ErrorAction SilentlyContinue)) { $gaps.Add('rules') }
+  $base = [System.IO.Path]::GetFullPath($Source).TrimEnd('\')
+  foreach ($d in 'bin', 'lib', 'rules', 'windows') {
+    $dir = Join-Path $base $d
+    if (-not (Test-Path -LiteralPath $dir)) { continue }
+    foreach ($f in (Get-ChildItem -LiteralPath $dir -Recurse -File -Force)) {
+      $rel = $f.FullName.Substring($base.Length + 1)
+      $copied = Get-Item -LiteralPath (Join-Path $Copy $rel) -Force -ErrorAction SilentlyContinue
+      if (-not $copied -or $copied.Length -ne $f.Length) { $gaps.Add($rel) }
+    }
+  }
+  return $gaps.ToArray()
+}
+
+# Copies bin, lib, rules, windows and VERSION from $Source into the app folder. The new copy is built
+# next to the old one and checked file by file before the swap; when anything fails, the old copy
+# stays (or is put back), so the scheduled tasks never point at a missing or half-copied folder.
 function Sync-AicmAppCopy([string]$Source) {
   $app = Get-AicmAppDir
   if (Test-AicmSamePath $Source $app) { return $app }
+  Set-AicmHomeMarker
   $new = "$app.new"
   $old = "$app.old"
+  # A run that stopped between the two moves left only app.old behind: put it back first.
+  if (-not (Test-Path -LiteralPath $app) -and (Test-Path -LiteralPath $old)) { Move-AicmDirectory $old $app }
   foreach ($d in $new, $old) { if (Test-Path -LiteralPath $d) { Remove-AicmTree ([System.IO.DirectoryInfo]::new($d)) } }
-  New-Item -ItemType Directory -Path $new -Force | Out-Null
-  foreach ($d in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $Source $d) -Destination (Join-Path $new $d) -Recurse -Force }
-  foreach ($f in 'VERSION', 'LICENSE', 'README.md') {
-    $p = Join-Path $Source $f
-    if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force }
+  try {
+    New-Item -ItemType Directory -Path $new -Force | Out-Null
+    foreach ($d in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $Source $d) -Destination (Join-Path $new $d) -Recurse -Force -ErrorAction Stop }
+    foreach ($f in 'VERSION', 'LICENSE', 'README.md') {
+      $p = Join-Path $Source $f
+      if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force -ErrorAction Stop }
+    }
+    [System.IO.File]::WriteAllText((Join-Path $new 'SOURCE'), $Source)
+    $gaps = @(Get-AicmAppCopyGaps $Source $new)
+    if ($gaps.Count -gt 0) { throw "the new copy is incomplete (missing or different: $($gaps[0]))" }
+  } catch {
+    if (Test-Path -LiteralPath $new) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($new)) } catch { } }
+    throw
   }
-  [System.IO.File]::WriteAllText((Join-Path $new 'SOURCE'), $Source)
-  if (Test-Path -LiteralPath $app) { Move-Item -LiteralPath $app -Destination $old }
-  Move-Item -LiteralPath $new -Destination $app
+  if (Test-Path -LiteralPath $app) { Move-AicmDirectory $app $old }
+  try {
+    Move-AicmDirectory $new $app
+  } catch {
+    if (-not (Test-Path -LiteralPath $app) -and (Test-Path -LiteralPath $old)) { Move-AicmDirectory $old $app }
+    if (Test-Path -LiteralPath $new) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($new)) } catch { } }
+    throw
+  }
   if (Test-Path -LiteralPath $old) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($old)) } catch { } }
   return $app
 }
 
-# Called at the end of the daily update when it runs from the installed copy.
+# Called at the end of the daily update when it runs from the installed copy. Copies only a newer
+# version (checking out an old tag in the clone never downgrades the jobs), then re-registers the
+# scheduled tasks from the new copy so changed script names or arguments take effect.
 function Update-AicmAppCopy {
+  $ErrorActionPreference = 'Continue'
   $app = Get-AicmAppDir
   if (-not (Test-AicmSamePath (Get-AicmRoot) $app)) { return }
   $sourceFile = Join-Path $app 'SOURCE'
   if (-not (Test-Path -LiteralPath $sourceFile)) { return }
   $source = (Get-Content -LiteralPath $sourceFile -TotalCount 1).Trim()
+  $current = Get-AicmVersion
   $srcVersion = Join-Path $source 'VERSION'
   if (-not $source -or -not (Test-Path -LiteralPath $srcVersion) -or -not (Test-Path -LiteralPath (Join-Path $source 'bin\aicm.ps1'))) {
-    Write-Host "installed copy: source $source is gone; keeping version $(Get-AicmVersion)"
+    Write-Host "installed copy: source $source is gone; keeping version $current"
     return
   }
   $newVersion = (Get-Content -LiteralPath $srcVersion -TotalCount 1).Trim()
-  if ($newVersion -eq (Get-AicmVersion)) { return }
-  try { [void](Sync-AicmAppCopy $source); Write-Host "installed copy: updated $(Get-AicmVersion) -> $newVersion from $source" }
-  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); trying again next run" }
+  if ($newVersion -eq $current) { return }
+  if ((Compare-AicmVersion $newVersion $current) -le 0) {
+    Write-Host "installed copy: $source has version $newVersion, not newer than $current; keeping $current"
+    return
+  }
+  try { [void](Sync-AicmAppCopy $source) }
+  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); keeping $current, trying again next run"; return }
+  Write-Host "installed copy: updated $current -> $newVersion from $source"
+  if (-not (Read-AicmState 'schedule')) { return }
+  try {
+    $exe = (Get-Process -Id $PID).Path
+    $out = & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $app 'bin\aicm.ps1') schedule refresh 2>&1
+    foreach ($line in @($out)) { if ("$line".Trim()) { Write-Host "schedule refresh: $line" } }
+    if ($LASTEXITCODE -ne 0) { Write-Host "schedule refresh: failed (exit code $LASTEXITCODE); run: aicm.ps1 schedule install" }
+  } catch {
+    Write-Host "schedule refresh: failed ($($_.Exception.Message)); run: aicm.ps1 schedule install"
+  }
 }
 
 # AICM_TASK_PATH lets tests register throwaway tasks in their own folder.
@@ -450,6 +537,48 @@ $script:AicmTaskPath = if ($env:AICM_TASK_PATH) { $env:AICM_TASK_PATH } else { '
 
 function Get-AicmTask([string]$Name) {
   return (Get-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $Name -ErrorAction SilentlyContinue)
+}
+
+# Registry keys that turn Windows Script Host off (value Enabled = 0); the tasks normally start
+# through wscript.exe, so they cannot run then. AICM_WSH_KEYS (paths separated by ';') replaces the
+# two real keys in tests.
+function Get-AicmWshDisabled {
+  $keys = if ($env:AICM_WSH_KEYS) { $env:AICM_WSH_KEYS -split ';' } else {
+    @('HKCU:\Software\Microsoft\Windows Script Host\Settings', 'HKLM:\Software\Microsoft\Windows Script Host\Settings')
+  }
+  foreach ($k in $keys) {
+    if (-not $k) { continue }
+    $v = $null
+    try { $v = (Get-ItemProperty -LiteralPath $k -Name 'Enabled' -ErrorAction Stop).Enabled } catch { continue }
+    if ("$v".Trim() -eq '0') { $k }
+  }
+}
+
+# A registered task that cannot do its work: turned off, pointing at a file that is gone, or failed
+# on its last run. Result codes 0x41301 (running), 0x41303 (has not run yet) and 0x41325 (queued) are
+# not failures. Exit code 1 is the job reporting its own failure, which it already notified, so it is
+# only reported when the job did not get as far as writing its state file.
+function Get-AicmTaskProblems($Task, [string]$Job) {
+  if ($Task.State -eq 'Disabled') {
+    "scheduled task '$Job' is disabled; enable it in Task Scheduler or run: aicm.ps1 schedule install"
+  }
+  foreach ($a in @($Task.Actions)) {
+    $files = @([regex]::Matches([string]$a.Arguments, '"([^"]+\.(?:ps1|vbs))"') | ForEach-Object { $_.Groups[1].Value })
+    if ($a.Execute -and [System.IO.Path]::IsPathRooted([string]$a.Execute)) { $files += [string]$a.Execute }
+    foreach ($f in $files) {
+      if (-not (Test-Path -LiteralPath $f)) { "scheduled task '$Job' starts $f, which does not exist; run: aicm.ps1 schedule install"; break }
+    }
+  }
+  $info = $null
+  try { $info = $Task | Get-ScheduledTaskInfo -ErrorAction Stop } catch { return }
+  $code = [int64]$info.LastTaskResult
+  if ($code -in @(0, 0x41301, 0x41303, 0x41325)) { return }
+  if ($code -eq 1) {
+    $stateName = @{ Update = 'last-update'; Inventory = 'inventory'; Clean = 'last-clean' }[$Job]
+    $state = if ($stateName) { Read-AicmState $stateName } else { $null }
+    try { if ($state -and [datetime]::Parse($state.finishedAt) -ge $info.LastRunTime.AddMinutes(-1)) { return } } catch { }
+  }
+  "scheduled task '$Job' failed on its last run (result 0x{0:X}); see {1}" -f $code, (Join-Path (Get-AicmHome) 'logs')
 }
 
 # Checks that every scheduled job recorded at install time still exists.
@@ -463,12 +592,20 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
   $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9) }
   $installedDays = 0
   try { $installedDays = ((Get-Date).ToUniversalTime() - [datetime]::Parse($sched.installedAt).ToUniversalTime()).TotalDays } catch { }
+  $launcher = if ($sched.PSObject.Properties['launcher']) { [string]$sched.launcher } else { 'wscript' }
+  if ($launcher -eq 'wscript') {
+    foreach ($k in @(Get-AicmWshDisabled)) {
+      $problems.Add("Windows Script Host is turned off ($k = 0), so the scheduled tasks cannot start; run: aicm.ps1 schedule install (it then starts them through PowerShell)")
+    }
+  }
   foreach ($job in @($sched.jobs)) {
     if ($job -eq $Skip) { continue }
-    if (-not (Get-AicmTask $job)) {
+    $task = Get-AicmTask $job
+    if (-not $task) {
       $problems.Add("scheduled task '$job' is missing; run: aicm.ps1 schedule install")
       continue
     }
+    foreach ($p in @(Get-AicmTaskProblems $task $job)) { $problems.Add($p) }
     if ($NoStale -or -not $limits.ContainsKey($job)) { continue }
     $state = Read-AicmState $limits[$job][0]
     $days = [double]::PositiveInfinity
