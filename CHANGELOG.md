@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.7.0 - 2026-10-07
+
+### Added
+- After a Homebrew Codex upgrade, `codex app-server` processes that still map the replaced binary are
+  recycled. `brew upgrade` deletes the old cask folder, and such a server (Paseo keeps one) keeps
+  spawning `codex-code-mode-host` from there, so its terminal tools fail until it restarts. The Paseo
+  daemon is restarted first; servers still stale after that (reparented to launchd/init) are stopped
+  with TERM. Servers on the current Codex and the ChatGPT app's bundled copy are left alone.
+  `AICM_CODEX_RECYCLE=0` turns it off. Ported from the retired `ai_cli_auto_update` scripts.
+
 ## 2.6.2 - 2026-10-07
 
 ### Fixed: two CLIs the daily update did not reach

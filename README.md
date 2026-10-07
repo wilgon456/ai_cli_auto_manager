@@ -138,6 +138,7 @@ Security fixes also arrive as updates, so a long waiting period has a cost. Thre
 - **Leftovers of interrupted installs are removed, carefully.** npm leaves staging folders (`node_modules/.<name>-XXXXXXXX`, hundreds of MB) behind when an install fails half way; those older than a day are removed after each update, but only while the package itself is installed, because such a folder can be npm's only backup. A managed CLI that disappears is reinstalled at the same version from that backup, or reported once.
 - **"Done today" means done.** A retry ends immediately only when a run on the same local calendar day succeeded for the same CLIs; a manual `--targets claude` run does not stop the full scheduled run. Retries with nothing to do write no log. The logs that cron and launchd append to are trimmed.
 - **Vendor install scripts run only when needed.** The install scripts behind Grok Build and `codex update` (Codex from the official installer) run only when a newer release (past the waiting period) exists, not every day.
+- **A Homebrew Codex upgrade does not break running app-servers.** `brew upgrade` deletes the old cask folder, but a long-running `codex app-server` (Paseo keeps one) still starts its terminal host from there, so its terminal tools fail. Right after the Codex step, servers that still map a replaced Codex are found; the Paseo daemon is restarted (`paseo restart`), and any server still stale after that is stopped. Servers already on the current Codex and the ChatGPT app's own copy are left alone. `AICM_CODEX_RECYCLE=0` turns this off.
 - **One notification per problem.** A problem is notified when it first appears and then at most once a week while it lasts.
 
 ### Post-update hook
@@ -226,6 +227,7 @@ Links inside ignored folders (for example a `node_modules` junction to a shared 
 | --- | --- |
 | `AICM_WORKTREES=0` | Skip worktree and branch cleanup in the Clean job |
 | `AICM_PROCESSES=0` | Skip the process check in the Update job |
+| `AICM_CODEX_RECYCLE=0` | Do not restart Codex app-servers left on a replaced Homebrew Codex |
 | `AICM_KILL_ORPHANS=1` | End left-behind processes instead of only reporting them |
 | `AICM_ORPHAN_MIN_AGE_HOURS` | Minimum age before a process counts (default 2) |
 
