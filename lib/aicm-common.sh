@@ -411,12 +411,43 @@ aicm_job_exists() {
   fi
 }
 
+# Fails only when it can tell that no cron daemon runs (WSL starts none by default). Without pgrep and
+# systemctl it cannot tell and succeeds.
+aicm_cron_running() {
+  local known=false
+  if command -v pgrep >/dev/null 2>&1; then
+    known=true
+    pgrep -x cron >/dev/null 2>&1 && return 0
+    pgrep -x crond >/dev/null 2>&1 && return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    known=true
+    systemctl is-active --quiet cron 2>/dev/null && return 0
+    systemctl is-active --quiet crond 2>/dev/null && return 0
+  fi
+  [[ "$known" == false ]]
+}
+
 # Prints one line per scheduled job that was installed but is now missing.
 # Also flags a job that is registered but has not completed for too long (its script is gone, it keeps
 # crashing, ...), once the schedule has existed that long. Second argument "nostale": existence only.
 aicm_schedule_problems() {
   local skip="${1:-}" nostale="${2:-}" file="$AICM_HOME/state/schedule.json" job state limit
   [[ -f "$file" ]] || return 0
+  local job_path tool
+  # node and npm found at install time must still be found with the PATH the jobs get.
+  job_path="$(aicm_json_field "$file" path)"
+  if [[ -n "$job_path" ]]; then
+    for tool in node npm; do
+      grep -q "\"$tool\":\"" "$file" || continue
+      if ! (PATH="$job_path"; command -v "$tool" >/dev/null 2>&1); then
+        echo "$tool was found when the schedule was installed but the scheduled jobs no longer find it; reinstall it or run: aicm schedule install"
+      fi
+    done
+  fi
+  if [[ "$(aicm_os)" == linux && -n "$(aicm_scheduled_jobs)" ]] && ! aicm_cron_running; then
+    echo "cron is not running, so the scheduled jobs never start; start it (sudo service cron start) and have it start at boot (on WSL: [boot] command in /etc/wsl.conf)"
+  fi
   for job in $(aicm_scheduled_jobs); do
     [[ "$job" == "$skip" ]] && continue
     if ! aicm_job_exists "$job"; then echo "scheduled job '$job' is missing; run: aicm schedule install"; continue; fi

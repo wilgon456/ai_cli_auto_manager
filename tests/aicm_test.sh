@@ -25,6 +25,11 @@ if [[ "\${1:-}" == -r ]]; then rm -f "\$table"; exit 0; fi
 exit 2
 EOF
 chmod +x "$WORK/fakebin/crontab"
+# Fake pgrep and systemctl: the cron daemon "runs" unless $WORK/cron-stopped exists.
+for f in pgrep systemctl; do
+  printf '#!/usr/bin/env bash\n[[ ! -e "%s/cron-stopped" ]]\n' "$WORK" > "$WORK/fakebin/$f"
+  chmod +x "$WORK/fakebin/$f"
+done
 export PATH="$WORK/fakebin:$PATH" AICM_CRONTAB="$WORK/fakebin/crontab"
 printf '17 3 * * * /usr/bin/true # keep me\n' > "$WORK/crontab.txt"
 
@@ -46,9 +51,14 @@ done
 ! grep -q '# aicm:' "$WORK/crontab.txt" && pass "invalid times rejected before anything is registered" || fail "invalid time registered jobs"
 
 "$AICM" schedule install --update-at 06:15 --inventory-day wed --inventory-at 11:40 --clean-day sun --clean-at 13:05 --targets codex,claude >/dev/null
-grep -Eq '^15 6,9,12,15,18,21 \* \* \* /bin/bash \S*\.ai-cli-auto-manager/app/bin/update_ai_clis.sh --scheduled --targets codex\\?,claude .*# aicm:update$' "$WORK/crontab.txt" && pass "update cron line" || fail "update cron line: $(cat "$WORK/crontab.txt")"
-grep -q '^5 13 \* \* 0 .*clean_ai_leftovers.sh .*# aicm:clean$' "$WORK/crontab.txt" && pass "clean cron line (sunday = 0)" || fail "clean cron line"
-grep -q '^40 11 \* \* 3 .*inventory_ai_clis.sh .*# aicm:inventory$' "$WORK/crontab.txt" && pass "inventory cron line (wednesday = 3)" || fail "inventory cron line"
+grep -Eq '^15 6,9,12,15,18,21 \* \* \* /bin/bash \S*\.ai-cli-auto-manager/app/bin/aicm scheduled update --scheduled --targets codex\\?,claude .*# aicm:update$' "$WORK/crontab.txt" && pass "update cron line" || fail "update cron line: $(cat "$WORK/crontab.txt")"
+# cron skips missed runs, so the weekly jobs start daily and run once per week (sunday = 7).
+grep -q '^5 13 \* \* \* .*/app/bin/aicm scheduled clean --weekly 7 13:05 .*# aicm:clean$' "$WORK/crontab.txt" && pass "clean cron line (daily start, due sunday)" || fail "clean cron line"
+grep -q '^40 11 \* \* \* .*/app/bin/aicm scheduled inventory --weekly 3 11:40 .*# aicm:inventory$' "$WORK/crontab.txt" && pass "inventory cron line (daily start, due wednesday)" || fail "inventory cron line"
+grep -q "\"path\":\"[^\"]*$WORK/fakebin" "$AICM_HOME/state/schedule.json" && pass "the PATH at install is kept for the jobs" || fail "job path: $(cat "$AICM_HOME/state/schedule.json")"
+if command -v node >/dev/null 2>&1; then
+  grep -q '"tools":{"node":"/' "$AICM_HOME/state/schedule.json" && pass "where node was found is recorded" || fail "tools: $(cat "$AICM_HOME/state/schedule.json")"
+fi
 grep -q '# keep me' "$WORK/crontab.txt" && pass "other cron lines kept" || fail "other cron line lost"
 SCHED="$AICM_HOME/state/schedule.json"
 grep -q '"options":{"updateAt":"06:15","inventoryDay":"3","inventoryAt":"11:40","cleanDay":"7","cleanAt":"13:05","targets":"codex,claude"}' "$SCHED" && pass "schedule.json keeps the install options" || fail "options: $(cat "$SCHED")"
@@ -57,7 +67,7 @@ grep -q '"options":{"updateAt":"06:15","inventoryDay":"3","inventoryAt":"11:40",
 cp "$WORK/crontab.txt" "$WORK/crontab.want"
 out="$("$AICM" schedule install --update-at 06:15 --inventory-day wed --inventory-at 11:40 --clean-day sun --clean-at 13:05 --targets codex,claude 2>&1)"
 cmp -s "$WORK/crontab.want" "$WORK/crontab.txt" && grep -q '^unchanged: ' <<< "$out" && ! grep -q '^registered: ' <<< "$out" && pass "same install again leaves the jobs alone" || fail "reinstall: $out"
-sed 's/update_ai_clis\.sh/update_old_name.sh/' "$WORK/crontab.txt" > "$WORK/crontab.new" && mv "$WORK/crontab.new" "$WORK/crontab.txt"
+sed 's/scheduled update/scheduled update_old_name/' "$WORK/crontab.txt" > "$WORK/crontab.new" && mv "$WORK/crontab.new" "$WORK/crontab.txt"
 out="$("$AICM" schedule refresh 2>&1)" || true
 cmp -s "$WORK/crontab.want" "$WORK/crontab.txt" && pass "refresh puts a stale job back with the stored options" || fail "refresh: $out / $(cat "$WORK/crontab.txt")"
 out="$("$AICM" schedule refresh 2>&1)" || true
@@ -90,6 +100,39 @@ printf '{"finishedAt":"%s","version":"x","ok":true,"clis":[]}\n' "$(date -u +%Y-
 out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 ]] && pass "doctor healthy after runs" || fail "doctor after runs: $out"
 
+# No cron daemon (WSL default): nothing would ever start.
+touch "$WORK/cron-stopped"
+out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 1 ]] && grep -q 'cron is not running' <<< "$out" && pass "doctor notices that cron is not running" || fail "cron stopped: $out"
+rm -f "$WORK/cron-stopped"
+# node found at install but not with the jobs' PATH any more.
+if grep -q '"node":"' "$SCHED"; then
+  cp -p "$SCHED" "$WORK/schedule.keep"
+  sed 's/"path":"[^"]*"/"path":"\/nonexistent-aicm"/' "$WORK/schedule.keep" > "$SCHED"
+  out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
+  [[ "$rc" == 1 ]] && grep -q 'node was found when the schedule was installed but the scheduled jobs no longer find it' <<< "$out" && pass "doctor notices that the jobs no longer find node" || fail "node gone: $out"
+  cp -p "$WORK/schedule.keep" "$SCHED"
+fi
+# What the crontab lines run: the PATH from the install comes first, weekly jobs run once a week.
+cp -R "$AICM_HOME/app" "$WORK/fakeapp"
+printf '#!/usr/bin/env bash\necho "PATH=$PATH"\n' > "$WORK/fakeapp/bin/update_ai_clis.sh"
+printf '#!/usr/bin/env bash\necho "CLEAN RAN $*"\n' > "$WORK/fakeapp/bin/clean_ai_leftovers.sh"
+out="$(PATH=/usr/bin:/bin /bin/bash "$WORK/fakeapp/bin/aicm" scheduled update --scheduled 2>&1)" || true
+grep -q "^PATH=.*$WORK/fakebin" <<< "$out" && pass "a cron job gets the PATH captured at install" || fail "cron PATH: $out"
+weekly() { /bin/bash "$WORK/fakeapp/bin/aicm" scheduled clean --weekly "$1" "$2" --dry-run 2>&1 || true; }
+days_ago() { touch -t "$(date -d "-$1 days" +%Y%m%d%H%M 2>/dev/null || date -v-"$1"d +%Y%m%d%H%M)" "$AICM_HOME/state/last-clean.json"; }
+today="$(date +%u)"; tomorrow=$((today % 7 + 1))
+touch "$AICM_HOME/state/last-clean.json"
+grep -q 'already happened' <<< "$(weekly "$today" 00:00)" && pass "weekly job done today is skipped" || fail "weekly skip today"
+days_ago 8
+grep -q 'CLEAN RAN --dry-run' <<< "$(weekly "$today" 00:00)" && pass "weekly job missed last week runs" || fail "weekly run after 8 days"
+days_ago 3
+grep -q 'already happened' <<< "$(weekly "$tomorrow" 00:00)" && pass "weekly job done after its due day is skipped" || fail "weekly skip 3 days"
+days_ago 7
+grep -q 'CLEAN RAN' <<< "$(weekly "$tomorrow" 00:00)" && pass "weekly job whose due day passed without a run runs" || fail "weekly run 7 days"
+touch "$AICM_HOME/state/last-clean.json"
+rm -rf "$WORK/fakeapp"
+
 # Someone deletes the cleanup job: the next update run must notice.
 grep -v '# aicm:clean' "$WORK/crontab.txt" > "$WORK/crontab.new"; mv "$WORK/crontab.new" "$WORK/crontab.txt"
 out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
@@ -98,7 +141,7 @@ out="$("$ROOT/bin/update_ai_clis.sh" --targets none 2>&1)" || true
 grep -q "notify: .*'clean' is missing" <<< "$out" && pass "update run notifies about the deleted job" || fail "update did not notify: $out"
 
 [[ -x "$AICM_HOME/app/bin/update_ai_clis.sh" && -f "$AICM_HOME/app/SOURCE" ]] && pass "jobs run an installed copy, not the clone" || fail "installed copy"
-grep -q "$AICM_HOME/app/bin/inventory_ai_clis.sh" "$WORK/crontab.txt" && pass "cron points at the installed copy" || fail "cron path"
+grep -q "$AICM_HOME/app/bin/aicm scheduled inventory" "$WORK/crontab.txt" && pass "cron points at the installed copy" || fail "cron path"
 
 # The installed copy: never downgraded, swapped only when complete, the old copy kept on any failure.
 APP="$AICM_HOME/app"
@@ -108,10 +151,10 @@ out="$(run_lib "$APP" aicm_update_app_copy 2>&1)"
 [[ "$(cat "$APP/VERSION")" == 99.0.0 ]] && grep -q 'not newer' <<< "$out" && pass "an older version in the clone does not downgrade the copy" || fail "downgrade: $out"
 printf '0.0.1\n' > "$APP/VERSION"
 cp "$WORK/crontab.txt" "$WORK/crontab.before-update"
-sed 's/inventory_ai_clis\.sh/inventory_old_name.sh/' "$WORK/crontab.txt" > "$WORK/crontab.new" && mv "$WORK/crontab.new" "$WORK/crontab.txt"
+sed 's/scheduled inventory/scheduled inventory_old_name/' "$WORK/crontab.txt" > "$WORK/crontab.new" && mv "$WORK/crontab.new" "$WORK/crontab.txt"
 out="$(run_lib "$APP" aicm_update_app_copy 2>&1)"
 [[ "$(cat "$APP/VERSION")" == "$(cat "$ROOT/VERSION")" ]] && grep -q "updated 0.0.1 -> " <<< "$out" && pass "a newer version in the clone refreshes the copy" || fail "upgrade: $out"
-grep -q "$APP/bin/inventory_ai_clis.sh" "$WORK/crontab.txt" && ! grep -q inventory_old_name "$WORK/crontab.txt" && pass "after the copy is refreshed the jobs are re-registered" || fail "re-register after update: $out / $(cat "$WORK/crontab.txt")"
+grep -q "$APP/bin/aicm scheduled inventory" "$WORK/crontab.txt" && ! grep -q inventory_old_name "$WORK/crontab.txt" && pass "after the copy is refreshed the jobs are re-registered" || fail "re-register after update: $out / $(cat "$WORK/crontab.txt")"
 echo old > "$APP/MARKER"
 out="$(run_lib "$ROOT" 'cp() { return 1; }; aicm_sync_app_copy "$AICM_ROOT"' 2>&1)" && rc=0 || rc=$?
 [[ "$rc" != 0 && -f "$APP/MARKER" && ! -e "$APP.new" ]] && pass "a failed copy keeps the old copy" || fail "failed copy rc=$rc: $out"
