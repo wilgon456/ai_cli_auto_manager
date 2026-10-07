@@ -384,7 +384,7 @@ function Get-AicmCodexThreads([string]$CodexHome) {
     $r = Invoke-AicmWithTimeout $python @($script, $db.FullName) 120
     if ($r.ExitCode -ne 0) { return $null }
     $threads = @{}
-    foreach ($line in ($r.Output -split "`r?`n")) {
+    foreach ($line in ($r.StdOut -split "`r?`n")) {
       $c = $line.Split("`t")
       if ($c.Count -lt 3 -or -not $c[0]) { continue }
       # Only unix seconds or milliseconds; anything else (a date text) leaves Updated at 0 = unknown.
