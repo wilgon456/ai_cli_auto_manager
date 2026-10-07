@@ -114,24 +114,29 @@ New CLIs are installed only with `--install-missing` (`-InstallMissing`) and the
 
 Official AI tools have shipped malicious releases. The Amazon Q extension 1.84.0 (July 2025) was published officially with a prompt telling the agent to wipe files, and Cline CLI 2.3.0 (February 2026) was published with a stolen token and quietly installed another program. Both were pulled within hours to two days. So npm-installed CLIs go through four steps:
 
-1. **Waiting period**: only the newest release that is at least 3 days old is installed.
+1. **Waiting period**: only the newest release that is at least 3 days old is installed, and its dependencies are resolved as of that date too (`npm install --before`), so a fresh malicious dependency cannot slip in through a version range. Unpublished and deprecated releases are never picked; a prerelease (`2.0.0-beta.3`) counts as older than its release.
 2. **Red flags**: compared with the installed release, a candidate that lost its provenance attestation, or adds or changes an install-time script (`preinstall`, `install`, `postinstall`), is not installed and you are notified. Cline 2.3.0 fails both checks.
 3. **Staged signature check**: the candidate is installed into a temporary folder without running any scripts (`--ignore-scripts`) and checked with `npm audit signatures` (that command does not work on global installs, hence the staging).
 4. Only then is that version installed globally. A CLI already at that version is not reinstalled.
+
+Registries that publish no signing keys (a private Verdaccio, for example) cannot be checked in step 3; that is reported once as "signatures not checkable" and does not block the update.
 
 | Environment variable | Meaning |
 | --- | --- |
 | `AICM_MIN_RELEASE_AGE_DAYS` | Waiting period in days (default 3, `0` = newest). Also `-MinReleaseAgeDays` on Windows and `--min-release-age-days` on macOS/Linux |
 | `AICM_VERIFY_SIGNATURES` | `0` skips the staged signature check |
 | `AICM_ALLOW` | Releases you reviewed and want to accept despite red flags, e.g. `AICM_ALLOW=cline@3.1.0` |
+| `AICM_INSTALL_TIMEOUT_SECONDS` | Time limit for one `npm install -g` or Homebrew step (default 1800) |
 
 Security fixes also arrive as updates, so a long waiting period has a cost. Three days avoids the incidents so far while still picking up fixes quickly.
 
 ### Unattended runs that keep working
 
 - **A CLI that is running is not overwritten.** On Windows a running program's files cannot be replaced (npm fails with `EBUSY`), and agent sessions often run all day. Such an update is recorded as *deferred*, not failed, and the scheduled job retries every 3 hours for 15 hours; a later run on a day that already succeeded exits immediately. If a CLI stays deferred for 5 days you get one reminder to close its sessions for a moment.
+- **Nothing hangs forever.** Installs have a time limit, and a timeout ends the whole process tree, not only the launcher. If a run still holds the lock after 3 hours, the next run tells you (once) instead of exiting quietly behind it.
 - **No registry, no failure.** When the npm registry cannot be reached the run is recorded as pending and retried; it is not reported as a failed update.
-- **Leftovers of interrupted installs are removed.** npm leaves staging folders (`node_modules/.<name>-XXXXXXXX`, hundreds of MB) behind when an install fails half way; those older than a day are removed after each update.
+- **Leftovers of interrupted installs are removed, carefully.** npm leaves staging folders (`node_modules/.<name>-XXXXXXXX`, hundreds of MB) behind when an install fails half way; those older than a day are removed after each update, but only while the package itself is installed, because such a folder can be npm's only backup. A managed CLI that disappears is reinstalled at the same version from that backup, or reported once.
+- **"Done today" means done.** A retry ends immediately only when a run on the same local calendar day succeeded for the same CLIs; a manual `--targets claude` run does not stop the full scheduled run. Retries with nothing to do write no log. The logs that cron and launchd append to are trimmed.
 - **Vendor install scripts run only when needed.** Grok Build's install script is fetched only when a newer release (past the waiting period) exists, not every day.
 - **One notification per problem.** A problem is notified when it first appears and then at most once a week while it lasts.
 
@@ -151,7 +156,7 @@ paseo reload
 
 ## Clean
 
-The built-in rules live in one file, [`rules/clean-rules.conf`](rules/clean-rules.conf), shared by Windows and macOS/Linux. Ages count from the last time a file was used, not when it was created, so a long conversation you are still continuing is never removed.
+The built-in rules live in one file, [`rules/clean-rules.conf`](rules/clean-rules.conf), shared by Windows and macOS/Linux. Ages count from the last time a file was used, not when it was created, so a long conversation you are still continuing is never removed. Most rules look at each entry of their folder as a whole (a session folder, say): it goes only when nothing inside it changed for the rule's days, so a session or a plugin checkout that is still in use is never thinned out file by file.
 
 | Rule | What | Age | Default |
 | --- | --- | --- | --- |
@@ -166,10 +171,10 @@ The built-in rules live in one file, [`rules/clean-rules.conf`](rules/clean-rule
 | `grok-downloads`, `kimi-logs` | Installer downloads, logs | 14, 30 days | on |
 | `npm-cache`, `pip-cache` | Package download caches (refetched on demand) | 60, 30 days | on |
 | `uv-cache` | `uv cache prune`, uv's own cleanup | - | on |
-| `os-temp` | Windows user temp folder | 7 days | on |
+| `os-temp` | Windows user temp folder (a folder goes only when nothing in it changed) | 7 days | on |
 | `playwright-browsers` | Old Playwright browser builds (keeps the newest 2 per browser) | - | off |
 
-**Never delete Codex session files directly.** Codex stores every conversation both in files and in its own database; deleting only the file leaves an entry that can no longer be opened (versions 1.x to 2.1 did this). This tool therefore only uses Codex's commands. Sessions whose file is already gone are removed from the database with `codex delete` on the same schedule. That step reads Codex's database read-only and needs Python (Windows) or sqlite3 (macOS); without them it is skipped.
+**Never delete Codex session files directly.** Codex stores every conversation both in files and in its own database; deleting only the file leaves an entry that can no longer be opened (versions 1.x to 2.1 did this). This tool therefore only uses Codex's commands. Sessions whose file is already gone are removed from the database with `codex delete` on the same schedule. That step reads Codex's database read-only and needs Python (Windows) or sqlite3 (macOS); without them, or when the database layout is not the expected one, it is skipped. A session counts as "file gone" only when no file with its id exists anywhere, so a moved home folder does not make live sessions look orphaned. Codex's folder follows `CODEX_HOME` (the `{codex}` path in the rules).
 
 ### Archive before deleting (optional)
 
@@ -179,10 +184,11 @@ Archiving only moves files, so it frees no space by itself; space comes back whe
 
 ### Never removed
 
-- Files newer than the rule's age, and files another program has open (skipped and logged as "in use").
+- Files newer than the rule's age, folders with anything newer inside, and files another program has locked (skipped and logged as "in use").
 - Anything behind a symlink or junction. Links are never followed, so their targets are safe.
-- Memory, credential and settings files such as `MEMORY.md`, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `auth.json`, `.credentials.json`, `settings.json`, `config.toml`, any `*.env`, and everything inside a folder named `memory`.
-- Anything outside the home folder and the temp folder. A rule pointing elsewhere, or at the home folder itself, is refused with a notification.
+- Memory, credential, key and settings files such as `MEMORY.md`, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `auth.json`, `.credentials.json`, `settings.json`, `config.toml`, `.npmrc`, `.netrc`, any `*.env`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, and everything inside a folder named `memory` (any letter case).
+- Anything outside the home folder and the temp folder. A rule pointing elsewhere, at the home folder itself or at a folder above it, is refused with a notification. The temp folder counts only when it really is one: if `TEMP`/`TMPDIR` points at a drive root, `/`, or a folder that contains your home folder, temp rules are refused.
+- Anything at all when the clock looks wrong. If the system clock is earlier than the last cleanup, or more than 400 days past it (a dead CMOS battery, a restored VM snapshot), every file would look old, so nothing is deleted and you are notified. If the date really is right, run once with `AICM_CLOCK_CHECK=0`.
 
 ### Changing rules
 
@@ -206,9 +212,11 @@ Tools that run several agent sessions at once leave three kinds of leftovers. Th
 **Worktrees and branches** (weekly with Clean, or `aicm worktrees`). Repositories are found under the folders listed in `~/.ai-cli-auto-manager/repos.conf` (one per line), or under common code folders in your home directory (`Desktop`, `dev`, `code`, `src`, `projects`, `repos`, `Documents/GitHub`, `Documents/Codex`, ...). A linked worktree is removed only when all of these hold:
 
 - no uncommitted or untracked changes, not locked, and untouched for 14 days;
-- its work is safely upstream: merged into the default branch, or its GitHub pull request was merged with exactly this commit (needs `gh`; this covers squash merges), or every commit is on a remote.
+- no ignored files except rebuildable build output (`node_modules`, `dist`, `.venv`, `target`, ...): `git worktree remove` deletes ignored files too, so a worktree holding a `.env` or a local database is kept and reported;
+- its work is safely upstream: merged into the default branch, or a pull request of origin's own GitHub repository was merged into the default branch with exactly this commit (needs `gh`; this covers squash merges), or every commit is on a remote right after a successful `git fetch --all --prune`;
+- no other program is working in it (the folder can be renamed).
 
-Links inside the worktree (for example a `node_modules` junction to a shared copy) are unlinked first, so `git worktree remove` can never delete what they point to. `--force` is never used. Worktrees whose folder is gone are pruned, and local branches with the same proof that are not checked out anywhere are deleted. The main worktree, its current branch and `main`/`master`/`develop` are never touched. A worktree with uncommitted changes untouched for 30 days is reported once as forgotten work.
+Links inside ignored folders (for example a `node_modules` junction to a shared copy) are unlinked first, so `git worktree remove` can never delete what they point to. `--force` is never used. Every removed worktree or branch keeps its commit under `refs/aicm-deleted/<date>/<branch>` for 90 days; bring one back with `git branch <name> refs/aicm-deleted/<date>/<name>`. Worktrees whose folder is gone are pruned, and local branches with the same proof that are not checked out anywhere are deleted. The main worktree, its current branch and `main`/`master`/`develop` are never touched. A worktree with uncommitted changes untouched for 30 days is reported once as forgotten work.
 
 **Configuration across CLIs** (weekly with Inventory, or `aicm config`). Lists the user-level MCP servers of each installed CLI (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Cursor, Copilot CLI) and the skill folders (`~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, ...): servers set up in some CLIs only, skills some CLIs cannot see, and skills with the same name but different content in two folders (which copy wins depends on folder order). Report only; the last case is notified once.
 
