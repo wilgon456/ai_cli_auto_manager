@@ -44,7 +44,9 @@ cat > "$WORK/registry.json" <<'EOF'
     "1.0.0": { "daysAgo": 30, "provenance": true },
     "1.1.0": { "daysAgo": 10, "scripts": { "postinstall": "npm install -g openclaw@latest" } } } },
   "@fake/badsig": { "latest": "1.1.0", "versions": {
-    "1.0.0": { "daysAgo": 30 }, "1.1.0": { "daysAgo": 10, "badsig": true } } }
+    "1.0.0": { "daysAgo": 30 }, "1.1.0": { "daysAgo": 10, "badsig": true } } },
+  "@opencode/cli": { "latest": "2.1.0", "versions": {
+    "2.0.0": { "daysAgo": 30, "provenance": true }, "2.1.0": { "daysAgo": 10, "provenance": true } } }
 }
 EOF
 
@@ -259,6 +261,42 @@ mkdir -p "$AICM_HOME/logs"
 awk 'BEGIN { for (i = 1; i <= 6000; i++) print "line " i }' > "$AICM_HOME/logs/cron.update.log"
 "$UPD" --targets fakeshadow >/dev/null 2>&1 || true
 [[ "$(wc -l < "$AICM_HOME/logs/cron.update.log" | tr -d ' ')" == 2000 ]] && tail -n 1 "$AICM_HOME/logs/cron.update.log" | grep -qx 'line 6000' && pass "cron.update.log is trimmed to its last 2000 lines" || fail "cron log not trimmed: $(wc -l < "$AICM_HOME/logs/cron.update.log")"
+
+echo "# Codex from the official installer updates itself, gated like the Grok installer"
+codex_registry() { # versions as version:daysAgo ...; the last one is latest
+  node -e 'const fs=require("fs"),f=process.argv[1],r=JSON.parse(fs.readFileSync(f,"utf8")),v={};let l;
+    for(const a of process.argv.slice(2)){const[n,d]=a.split(":");v[n]={daysAgo:+d,provenance:true};l=n;}
+    r["@openai/codex"]={latest:l,versions:v};fs.writeFileSync(f,JSON.stringify(r));' "$WORK/registry.json" "$@"
+}
+codex_updates() { grep -c . "$WORK/codex-updates.log" 2>/dev/null || echo 0; }
+mkdir -p "$CODEX_HOME/packages/standalone/current/bin" "$WORK/codexbin" "$WORK/appbin"
+echo 0.1.0 > "$WORK/codex-version"
+printf '#!/usr/bin/env bash\nif [[ "${1:-}" == update ]]; then echo updated >> "%s/codex-updates.log"; exit 0; fi\necho "codex-cli $(cat "%s/codex-version")"\n' "$WORK" "$WORK" > "$CODEX_HOME/packages/standalone/current/bin/codex"
+printf '#!/usr/bin/env bash\nif [[ "${1:-}" == update ]]; then echo updated >> "%s/app-updates.log"; exit 0; fi\necho "codex-cli 0.1.0"\n' "$WORK" > "$WORK/appbin/codex"
+chmod +x "$CODEX_HOME/packages/standalone/current/bin/codex" "$WORK/appbin/codex"
+ln -s "$CODEX_HOME/packages/standalone/current/bin/codex" "$WORK/codexbin/codex"
+codex_registry 0.1.0:30 0.2.0:10 0.3.0:1
+out="$(PATH="$WORK/codexbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && "$(codex_updates)" == 0 ]] && grep -q 'hold: codex 0.2.0 is old enough, but the installer would install 0.3.0' <<< "$out" && pass "codex update waits while the newest release is in its waiting period" || fail "codex hold: rc=$rc $out"
+codex_registry 0.1.0:30 0.2.0:10
+out="$(PATH="$WORK/codexbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && "$(codex_updates)" == 1 ]] && pass "standalone Codex is updated with codex update" || fail "codex standalone: rc=$rc $out"
+echo 0.2.0 > "$WORK/codex-version"
+out="$(PATH="$WORK/codexbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && "$(codex_updates)" == 1 ]] && grep -q 'already current: codex 0.2.0' <<< "$out" && pass "a current Codex does not rerun the installer" || fail "codex current: rc=$rc $out"
+echo 0.1.0 > "$WORK/codex-version"
+out="$(PATH="$WORK/codexbin:$PATH" "$ROOT/bin/inventory_ai_clis.sh" --offline 2>&1)" || true
+grep -Eq '^OpenAI Codex +standalone +0\.1\.0 .* yes$' <<< "$out" && pass "standalone Codex is covered" || fail "codex coverage: $out"
+out="$(PATH="$WORK/appbin:$PATH" "$UPD" --targets codex 2>&1)" || true
+[[ ! -e "$WORK/app-updates.log" ]] && pass "a Codex copy outside the installer (desktop app) is left to its app" || fail "desktop codex updated: $out"
+out="$(PATH="$WORK/appbin:$PATH" "$ROOT/bin/inventory_ai_clis.sh" --offline 2>&1)" || true
+grep -Eq '^OpenAI Codex +standalone +0\.1\.0 .* no: the Codex desktop app' <<< "$out" && pass "desktop Codex is reported as updated by its app" || fail "desktop codex coverage: $out"
+
+echo "# OpenCode 2.x is published as @opencode/cli"
+npm_cli opencode @opencode/cli 2.0.0
+# NPM unset: the npm first on PATH must be used, not one in a fallback folder such as /usr/local/bin.
+out="$(env -u NPM "$UPD" --targets opencode 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'install -g @opencode/cli@2.1.0' <<< "$(calls)" && pass "OpenCode 2.x is updated through the npm on PATH, not opencode upgrade" || fail "opencode 2.x: rc=$rc $out"
 
 echo "# bad catalog"
 printf 'Bad Id | x | x |  |  |  |  |\n' > "$WORK/bad.conf"

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.6.2 - 2026-10-07
+
+### Fixed: two CLIs the daily update did not reach
+- OpenCode 2.x is published as `@opencode/cli` (`opencode-ai` is the 1.x line). An npm install of
+  2.x fell through to `opencode upgrade`, which cannot tell how it was installed and failed every day.
+  The update now keeps `@opencode/cli` current through npm, and `--install-missing` installs it.
+- Codex installed with the official installer (`~/.codex/packages/standalone`) was taken for the
+  desktop app's copy and skipped. It is now updated with `codex update` (macOS and Linux) and the
+  inventory reports it as covered; a copy elsewhere is still left to the desktop app. `codex update`
+  reruns the official install script, so it is gated like the Grok installer: it runs only when a
+  newer release is past the waiting period and the installer would not fetch a newer, younger one.
+
 ## 2.6.1 - 2026-10-07
 
 ### Fixed

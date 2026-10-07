@@ -405,6 +405,9 @@ try {
       if ($inst -and $inst.Installed -and $inst.Method -eq 'standalone') {
         Invoke-ActiveSelfUpdate $inst @('upgrade')
         Write-ShadowWarning 'opencode'
+      } elseif (Test-NpmGlobalPackage '@opencode/cli') {
+        # OpenCode 2.x is published as @opencode/cli; opencode-ai is the 1.x line.
+        Update-NpmPackage '@opencode/cli'
       } elseif (Test-NpmGlobalPackage 'opencode-ai') {
         Update-NpmPackage 'opencode-ai'
       } elseif (Get-CommandPath 'opencode') {
@@ -412,7 +415,7 @@ try {
         if ($result.Output) { Write-Host $result.Output.TrimEnd() }
         if ($result.ExitCode -ne 0) { throw "opencode upgrade failed with exit code $($result.ExitCode)" }
       } elseif ($InstallMissing) {
-        Install-NpmPackage 'opencode-ai'
+        Install-NpmPackage '@opencode/cli'
       } else {
         Pass-Missing 'opencode' 'command not found and npm global package not installed'
       }
