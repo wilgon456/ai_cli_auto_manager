@@ -303,39 +303,103 @@ PY
 
 AICM_APP_DIR="$AICM_HOME/app"
 
-# Copies bin, lib, rules and VERSION from $1 into the app folder via a swap; prints the app folder.
+# Succeeds when copy $2 has every file of source $1 (bin, lib, rules, windows) with the same content,
+# plus the files every copy needs.
+aicm_app_copy_complete() { # source copy
+  local src="$1" copy="$2" f
+  for f in VERSION bin/aicm lib/aicm-common.sh; do [[ -s "$copy/$f" ]] || return 1; done
+  [[ -n "$(ls "$copy/rules" 2>/dev/null)" ]] || return 1
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    cmp -s "$src/$f" "$copy/$f" || return 1
+  done < <(cd "$src" && for d in bin lib rules windows; do [[ -d "$d" ]] && find "$d" -type f; done)
+  return 0
+}
+
+# Copies bin, lib, rules and VERSION from $1 into the app folder; prints the app folder. The new copy
+# is built next to the old one, every copy step is checked and the result compared with the source
+# before the swap; on any failure the old copy stays (or is put back) and this returns 1.
+# Every step checks its status itself: callers run this inside if/$( ), where errexit is off.
 aicm_sync_app_copy() {
   local src="$1" app="$AICM_APP_DIR" d f
   if [[ "$(cd "$src" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]]; then echo "$app"; return 0; fi
-  rm -rf -- "${app:?}.new" "${app:?}.old"
-  mkdir -p "$app.new"
-  for d in bin lib rules windows; do [[ -d "$src/$d" ]] && cp -R "$src/$d" "$app.new/$d"; done
-  for f in VERSION LICENSE README.md; do [[ -f "$src/$f" ]] && cp "$src/$f" "$app.new/$f"; done
-  printf '%s\n' "$src" > "$app.new/SOURCE"
-  [[ -d "$app" ]] && mv "$app" "$app.old"
-  mv "$app.new" "$app"
+  # A run that stopped between the two renames left only app.old behind: put it back first.
+  if [[ ! -d "$app" && -d "$app.old" ]]; then mv "$app.old" "$app" || return 1; fi
+  rm -rf -- "${app:?}.new" "${app:?}.old" || return 1
+  mkdir -p "$app.new" || return 1
+  for d in bin lib rules windows; do
+    if [[ -d "$src/$d" ]]; then cp -R "$src/$d" "$app.new/$d" || { rm -rf -- "${app:?}.new"; return 1; }; fi
+  done
+  for f in VERSION LICENSE README.md; do
+    if [[ -f "$src/$f" ]]; then cp "$src/$f" "$app.new/$f" || { rm -rf -- "${app:?}.new"; return 1; }; fi
+  done
+  printf '%s\n' "$src" > "$app.new/SOURCE" || { rm -rf -- "${app:?}.new"; return 1; }
+  if ! aicm_app_copy_complete "$src" "$app.new"; then
+    echo "installed copy: the new copy of $src is incomplete; keeping the old one" >&2
+    rm -rf -- "${app:?}.new"
+    return 1
+  fi
+  if [[ -d "$app" ]]; then mv "$app" "$app.old" || { rm -rf -- "${app:?}.new"; return 1; }; fi
+  if ! mv "$app.new" "$app"; then
+    if [[ -d "$app.old" && ! -d "$app" ]]; then mv "$app.old" "$app"; fi
+    rm -rf -- "${app:?}.new"
+    return 1
+  fi
   rm -rf -- "${app:?}.old"
   echo "$app"
 }
 
-# Called at the end of the daily update when it runs from the installed copy.
+# Called at the end of the daily update when it runs from the installed copy. Copies only a newer
+# version (checking out an old tag in the clone never downgrades the jobs), then re-registers the
+# jobs from the new copy so changed script names or arguments take effect.
 aicm_update_app_copy() {
-  local app="$AICM_APP_DIR" src new
+  local app="$AICM_APP_DIR" src new cur
   [[ "$(cd "$AICM_ROOT" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]] || return 0
   [[ -f "$app/SOURCE" ]] || return 0
   src="$(head -n 1 "$app/SOURCE")"
+  cur="$(aicm_version)"
   if [[ ! -f "$src/VERSION" || ! -x "$src/bin/aicm" ]]; then
-    echo "installed copy: source $src is gone; keeping version $(aicm_version)"
+    echo "installed copy: source $src is gone; keeping version $cur"
     return 0
   fi
   new="$(head -n 1 "$src/VERSION" | tr -d '[:space:]')"
-  [[ "$new" == "$(aicm_version)" ]] && return 0
-  if aicm_sync_app_copy "$src" >/dev/null 2>&1; then echo "installed copy: updated to $new from $src"
-  else echo "installed copy: could not refresh; trying again next run"; fi
+  [[ "$new" == "$cur" ]] && return 0
+  if ! aicm_version_older "$cur" "$new"; then
+    echo "installed copy: $src has version $new, not newer than $cur; keeping $cur"
+    return 0
+  fi
+  if ! aicm_sync_app_copy "$src" >/dev/null; then
+    echo "installed copy: could not refresh; keeping $cur, trying again next run"
+    return 0
+  fi
+  echo "installed copy: updated $cur -> $new from $src"
+  [[ -f "$AICM_HOME/state/schedule.json" ]] || return 0
+  # AICM_ROOT cleared so the new copy finds its own files.
+  local out rc=0
+  out="$(AICM_ROOT="" /bin/bash "$app/bin/aicm" schedule refresh 2>&1)" || rc=$?
+  if [[ -n "$out" ]]; then printf '%s\n' "$out" | sed 's/^/schedule refresh: /'; fi
+  if ((rc != 0)); then echo "schedule refresh: failed (exit code $rc); run: aicm schedule install"; fi
   return 0
 }
 
 AICM_LAUNCHD_PREFIX="io.github.wilgon456.ai-cli-auto-manager"
+
+# crontab, or the command in AICM_CRONTAB (tests use a fake that keeps its table in a file; the
+# updater puts system folders first on PATH, so a fake found through PATH would not be enough).
+aicm_crontab() { "${AICM_CRONTAB:-crontab}" "$@"; }
+
+# One "key":"value" string field of a one-line JSON state file.
+aicm_json_field() { # file key
+  [[ -f "$1" ]] || return 0
+  sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1
+}
+
+# The jobs recorded in schedule.json, one per line.
+aicm_scheduled_jobs() {
+  local file="$AICM_HOME/state/schedule.json"
+  [[ -f "$file" ]] || return 0
+  sed -n 's/.*"jobs":\[\([^]]*\)\].*/\1/p' "$file" | tr ',' '\n' | tr -d '" ' | grep -E '^(update|clean|inventory)$' || true
+}
 
 aicm_job_exists() {
   local job="$1"
@@ -343,7 +407,7 @@ aicm_job_exists() {
     [[ -f "$HOME/Library/LaunchAgents/$AICM_LAUNCHD_PREFIX.$job.plist" ]] || return 1
     launchctl list 2>/dev/null | grep -q "$AICM_LAUNCHD_PREFIX.$job" || return 1
   else
-    crontab -l 2>/dev/null | grep -q "# aicm:$job\$" || return 1
+    aicm_crontab -l 2>/dev/null | grep -q "# aicm:$job\$" || return 1
   fi
 }
 
@@ -353,7 +417,7 @@ aicm_job_exists() {
 aicm_schedule_problems() {
   local skip="${1:-}" nostale="${2:-}" file="$AICM_HOME/state/schedule.json" job state limit
   [[ -f "$file" ]] || return 0
-  for job in $(grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean|inventory)$'); do
+  for job in $(aicm_scheduled_jobs); do
     [[ "$job" == "$skip" ]] && continue
     if ! aicm_job_exists "$job"; then echo "scheduled job '$job' is missing; run: aicm schedule install"; continue; fi
     [[ "$nostale" == nostale ]] && continue

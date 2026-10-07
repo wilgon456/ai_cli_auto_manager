@@ -25,7 +25,7 @@ if [[ "\${1:-}" == -r ]]; then rm -f "\$table"; exit 0; fi
 exit 2
 EOF
 chmod +x "$WORK/fakebin/crontab"
-export PATH="$WORK/fakebin:$PATH"
+export PATH="$WORK/fakebin:$PATH" AICM_CRONTAB="$WORK/fakebin/crontab"
 printf '17 3 * * * /usr/bin/true # keep me\n' > "$WORK/crontab.txt"
 
 fails=0
@@ -50,6 +50,24 @@ grep -Eq '^15 6,9,12,15,18,21 \* \* \* /bin/bash \S*\.ai-cli-auto-manager/app/bi
 grep -q '^5 13 \* \* 0 .*clean_ai_leftovers.sh .*# aicm:clean$' "$WORK/crontab.txt" && pass "clean cron line (sunday = 0)" || fail "clean cron line"
 grep -q '^40 11 \* \* 3 .*inventory_ai_clis.sh .*# aicm:inventory$' "$WORK/crontab.txt" && pass "inventory cron line (wednesday = 3)" || fail "inventory cron line"
 grep -q '# keep me' "$WORK/crontab.txt" && pass "other cron lines kept" || fail "other cron line lost"
+SCHED="$AICM_HOME/state/schedule.json"
+grep -q '"options":{"updateAt":"06:15","inventoryDay":"3","inventoryAt":"11:40","cleanDay":"7","cleanAt":"13:05","targets":"codex,claude"}' "$SCHED" && pass "schedule.json keeps the install options" || fail "options: $(cat "$SCHED")"
+
+# Installing the same schedule again changes nothing; refresh re-registers stale jobs from the stored options.
+cp "$WORK/crontab.txt" "$WORK/crontab.want"
+out="$("$AICM" schedule install --update-at 06:15 --inventory-day wed --inventory-at 11:40 --clean-day sun --clean-at 13:05 --targets codex,claude 2>&1)"
+cmp -s "$WORK/crontab.want" "$WORK/crontab.txt" && grep -q '^unchanged: ' <<< "$out" && ! grep -q '^registered: ' <<< "$out" && pass "same install again leaves the jobs alone" || fail "reinstall: $out"
+sed 's/update_ai_clis\.sh/update_old_name.sh/' "$WORK/crontab.txt" > "$WORK/crontab.new" && mv "$WORK/crontab.new" "$WORK/crontab.txt"
+out="$("$AICM" schedule refresh 2>&1)" || true
+cmp -s "$WORK/crontab.want" "$WORK/crontab.txt" && pass "refresh puts a stale job back with the stored options" || fail "refresh: $out / $(cat "$WORK/crontab.txt")"
+out="$("$AICM" schedule refresh 2>&1)" || true
+grep -q 'already match' <<< "$out" && cmp -s "$WORK/crontab.want" "$WORK/crontab.txt" && pass "refresh with nothing to change changes nothing" || fail "second refresh: $out"
+# A schedule.json written by 2.5.1 has no options: refresh reads them back from the crontab lines.
+installed_before="$(sed -n 's/.*"installedAt":"\([^"]*\)".*/\1/p' "$SCHED")"
+sed 's/,"options":{[^}]*}//' "$SCHED" > "$SCHED.new" && mv "$SCHED.new" "$SCHED"
+out="$("$AICM" schedule refresh 2>&1)" || true
+cmp -s "$WORK/crontab.want" "$WORK/crontab.txt" && grep -q '"updateAt":"06:15".*"inventoryDay":"3".*"cleanDay":"7".*"targets":"codex,claude"' "$SCHED" && pass "refresh of an older schedule keeps its days and times" || fail "old refresh: $out / $(cat "$SCHED")"
+grep -q "\"installedAt\":\"$installed_before\"" "$SCHED" && pass "refresh keeps installedAt" || fail "installedAt changed"
 
 "$AICM" schedule install >/dev/null
 [[ "$(grep -c '# aicm:' "$WORK/crontab.txt")" == 3 ]] && pass "reinstall does not duplicate" || fail "duplicate cron lines"
@@ -81,6 +99,30 @@ grep -q "notify: .*'clean' is missing" <<< "$out" && pass "update run notifies a
 
 [[ -x "$AICM_HOME/app/bin/update_ai_clis.sh" && -f "$AICM_HOME/app/SOURCE" ]] && pass "jobs run an installed copy, not the clone" || fail "installed copy"
 grep -q "$AICM_HOME/app/bin/inventory_ai_clis.sh" "$WORK/crontab.txt" && pass "cron points at the installed copy" || fail "cron path"
+
+# The installed copy: never downgraded, swapped only when complete, the old copy kept on any failure.
+APP="$AICM_HOME/app"
+run_lib() { bash -c '. "$1/lib/aicm-common.sh"; shift; eval "$*"' _ "$@"; }
+printf '99.0.0\n' > "$APP/VERSION"
+out="$(run_lib "$APP" aicm_update_app_copy 2>&1)"
+[[ "$(cat "$APP/VERSION")" == 99.0.0 ]] && grep -q 'not newer' <<< "$out" && pass "an older version in the clone does not downgrade the copy" || fail "downgrade: $out"
+printf '0.0.1\n' > "$APP/VERSION"
+cp "$WORK/crontab.txt" "$WORK/crontab.before-update"
+sed 's/inventory_ai_clis\.sh/inventory_old_name.sh/' "$WORK/crontab.txt" > "$WORK/crontab.new" && mv "$WORK/crontab.new" "$WORK/crontab.txt"
+out="$(run_lib "$APP" aicm_update_app_copy 2>&1)"
+[[ "$(cat "$APP/VERSION")" == "$(cat "$ROOT/VERSION")" ]] && grep -q "updated 0.0.1 -> " <<< "$out" && pass "a newer version in the clone refreshes the copy" || fail "upgrade: $out"
+grep -q "$APP/bin/inventory_ai_clis.sh" "$WORK/crontab.txt" && ! grep -q inventory_old_name "$WORK/crontab.txt" && pass "after the copy is refreshed the jobs are re-registered" || fail "re-register after update: $out / $(cat "$WORK/crontab.txt")"
+echo old > "$APP/MARKER"
+out="$(run_lib "$ROOT" 'cp() { return 1; }; aicm_sync_app_copy "$AICM_ROOT"' 2>&1)" && rc=0 || rc=$?
+[[ "$rc" != 0 && -f "$APP/MARKER" && ! -e "$APP.new" ]] && pass "a failed copy keeps the old copy" || fail "failed copy rc=$rc: $out"
+out="$(run_lib "$ROOT" 'cp() { local rc=0; command cp "$@" || rc=$?; [[ "${*: -1}" == */lib ]] && rm -f "${*: -1}/aicm-common.sh"; return $rc; }; aicm_sync_app_copy "$AICM_ROOT"' 2>&1)" && rc=0 || rc=$?
+[[ "$rc" != 0 && -f "$APP/MARKER" && ! -e "$APP.new" ]] && grep -q incomplete <<< "$out" && pass "an incomplete copy is not swapped in" || fail "incomplete copy rc=$rc: $out"
+out="$(run_lib "$ROOT" 'mv() { [[ "$1" == *.new ]] && return 1; command mv "$@"; }; aicm_sync_app_copy "$AICM_ROOT"' 2>&1)" && rc=0 || rc=$?
+[[ "$rc" != 0 && -f "$APP/MARKER" && ! -e "$APP.old" && ! -e "$APP.new" ]] && pass "a failed swap puts the old copy back" || fail "failed swap rc=$rc: $out"
+mv "$APP" "$APP.old"
+out="$(run_lib "$ROOT" 'aicm_sync_app_copy "$AICM_ROOT"' 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && -x "$APP/bin/update_ai_clis.sh" && ! -e "$APP/MARKER" && ! -e "$APP.old" ]] && pass "a copy left half-swapped is completed by the next sync" || fail "recovery rc=$rc: $out"
+cp "$WORK/crontab.before-update" "$WORK/crontab.txt"
 # A registered job that has not completed for too long is caught by the others.
 touch -t "$(date -d '-20 days' +%Y%m%d%H%M 2>/dev/null || date -v-20d +%Y%m%d%H%M)" "$AICM_HOME/state/schedule.json"
 rm -f "$AICM_HOME/state/inventory.json"

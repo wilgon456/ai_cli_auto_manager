@@ -366,42 +366,106 @@ function Get-AicmCodexThreads([string]$CodexHome) {
 
 function Get-AicmAppDir { return (Join-Path (Get-AicmHome) 'app') }
 
-# Copies bin, lib, rules, windows and VERSION from $Source into the app folder via a swap.
+# Antivirus scanners briefly lock freshly written files, so a folder move is retried a few times.
+function Move-AicmDirectory([string]$From, [string]$To) {
+  for ($i = 1; ; $i++) {
+    try { Move-Item -LiteralPath $From -Destination $To -ErrorAction Stop; return }
+    catch { if ($i -ge 5) { throw }; Start-Sleep -Milliseconds (300 * $i) }
+  }
+}
+
+# Files of $Source (bin, lib, rules, windows) that are missing from $Copy or differ in size, plus the
+# files every copy needs. Empty when the copy is complete.
+function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
+  $gaps = New-Object System.Collections.Generic.List[string]
+  foreach ($f in 'VERSION', 'bin\aicm.ps1', 'lib\aicm-common.ps1', 'windows\run-hidden.vbs') {
+    if (-not (Test-Path -LiteralPath (Join-Path $Copy $f) -PathType Leaf)) { $gaps.Add($f) }
+  }
+  if (-not (Get-ChildItem -LiteralPath (Join-Path $Copy 'rules') -File -ErrorAction SilentlyContinue)) { $gaps.Add('rules') }
+  $base = [System.IO.Path]::GetFullPath($Source).TrimEnd('\')
+  foreach ($d in 'bin', 'lib', 'rules', 'windows') {
+    $dir = Join-Path $base $d
+    if (-not (Test-Path -LiteralPath $dir)) { continue }
+    foreach ($f in (Get-ChildItem -LiteralPath $dir -Recurse -File -Force)) {
+      $rel = $f.FullName.Substring($base.Length + 1)
+      $copied = Get-Item -LiteralPath (Join-Path $Copy $rel) -Force -ErrorAction SilentlyContinue
+      if (-not $copied -or $copied.Length -ne $f.Length) { $gaps.Add($rel) }
+    }
+  }
+  return $gaps.ToArray()
+}
+
+# Copies bin, lib, rules, windows and VERSION from $Source into the app folder. The new copy is built
+# next to the old one and checked file by file before the swap; when anything fails, the old copy
+# stays (or is put back), so the scheduled tasks never point at a missing or half-copied folder.
 function Sync-AicmAppCopy([string]$Source) {
   $app = Get-AicmAppDir
   if (Test-AicmSamePath $Source $app) { return $app }
   $new = "$app.new"
   $old = "$app.old"
+  # A run that stopped between the two moves left only app.old behind: put it back first.
+  if (-not (Test-Path -LiteralPath $app) -and (Test-Path -LiteralPath $old)) { Move-AicmDirectory $old $app }
   foreach ($d in $new, $old) { if (Test-Path -LiteralPath $d) { Remove-AicmTree ([System.IO.DirectoryInfo]::new($d)) } }
-  New-Item -ItemType Directory -Path $new -Force | Out-Null
-  foreach ($d in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $Source $d) -Destination (Join-Path $new $d) -Recurse -Force }
-  foreach ($f in 'VERSION', 'LICENSE', 'README.md') {
-    $p = Join-Path $Source $f
-    if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force }
+  try {
+    New-Item -ItemType Directory -Path $new -Force | Out-Null
+    foreach ($d in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $Source $d) -Destination (Join-Path $new $d) -Recurse -Force -ErrorAction Stop }
+    foreach ($f in 'VERSION', 'LICENSE', 'README.md') {
+      $p = Join-Path $Source $f
+      if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force -ErrorAction Stop }
+    }
+    [System.IO.File]::WriteAllText((Join-Path $new 'SOURCE'), $Source)
+    $gaps = @(Get-AicmAppCopyGaps $Source $new)
+    if ($gaps.Count -gt 0) { throw "the new copy is incomplete (missing or different: $($gaps[0]))" }
+  } catch {
+    if (Test-Path -LiteralPath $new) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($new)) } catch { } }
+    throw
   }
-  [System.IO.File]::WriteAllText((Join-Path $new 'SOURCE'), $Source)
-  if (Test-Path -LiteralPath $app) { Move-Item -LiteralPath $app -Destination $old }
-  Move-Item -LiteralPath $new -Destination $app
+  if (Test-Path -LiteralPath $app) { Move-AicmDirectory $app $old }
+  try {
+    Move-AicmDirectory $new $app
+  } catch {
+    if (-not (Test-Path -LiteralPath $app) -and (Test-Path -LiteralPath $old)) { Move-AicmDirectory $old $app }
+    if (Test-Path -LiteralPath $new) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($new)) } catch { } }
+    throw
+  }
   if (Test-Path -LiteralPath $old) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($old)) } catch { } }
   return $app
 }
 
-# Called at the end of the daily update when it runs from the installed copy.
+# Called at the end of the daily update when it runs from the installed copy. Copies only a newer
+# version (checking out an old tag in the clone never downgrades the jobs), then re-registers the
+# scheduled tasks from the new copy so changed script names or arguments take effect.
 function Update-AicmAppCopy {
+  $ErrorActionPreference = 'Continue'
   $app = Get-AicmAppDir
   if (-not (Test-AicmSamePath (Get-AicmRoot) $app)) { return }
   $sourceFile = Join-Path $app 'SOURCE'
   if (-not (Test-Path -LiteralPath $sourceFile)) { return }
   $source = (Get-Content -LiteralPath $sourceFile -TotalCount 1).Trim()
+  $current = Get-AicmVersion
   $srcVersion = Join-Path $source 'VERSION'
   if (-not $source -or -not (Test-Path -LiteralPath $srcVersion) -or -not (Test-Path -LiteralPath (Join-Path $source 'bin\aicm.ps1'))) {
-    Write-Host "installed copy: source $source is gone; keeping version $(Get-AicmVersion)"
+    Write-Host "installed copy: source $source is gone; keeping version $current"
     return
   }
   $newVersion = (Get-Content -LiteralPath $srcVersion -TotalCount 1).Trim()
-  if ($newVersion -eq (Get-AicmVersion)) { return }
-  try { [void](Sync-AicmAppCopy $source); Write-Host "installed copy: updated $(Get-AicmVersion) -> $newVersion from $source" }
-  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); trying again next run" }
+  if ($newVersion -eq $current) { return }
+  if ((Compare-AicmVersion $newVersion $current) -le 0) {
+    Write-Host "installed copy: $source has version $newVersion, not newer than $current; keeping $current"
+    return
+  }
+  try { [void](Sync-AicmAppCopy $source) }
+  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); keeping $current, trying again next run"; return }
+  Write-Host "installed copy: updated $current -> $newVersion from $source"
+  if (-not (Read-AicmState 'schedule')) { return }
+  try {
+    $exe = (Get-Process -Id $PID).Path
+    $out = & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $app 'bin\aicm.ps1') schedule refresh 2>&1
+    foreach ($line in @($out)) { if ("$line".Trim()) { Write-Host "schedule refresh: $line" } }
+    if ($LASTEXITCODE -ne 0) { Write-Host "schedule refresh: failed (exit code $LASTEXITCODE); run: aicm.ps1 schedule install" }
+  } catch {
+    Write-Host "schedule refresh: failed ($($_.Exception.Message)); run: aicm.ps1 schedule install"
+  }
 }
 
 # AICM_TASK_PATH lets tests register throwaway tasks in their own folder.

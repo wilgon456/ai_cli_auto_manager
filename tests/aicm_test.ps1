@@ -15,6 +15,16 @@ function Pass([string]$m) { Write-Host "ok   - $m" }
 function Fail([string]$m) { Write-Host "FAIL - $m"; $script:fails++ }
 
 function Invoke-Script([string]$Script, [string[]]$Arguments) {
+  return (Invoke-Child (@('-File', (Join-Path $root $Script)) + @($Arguments)))
+}
+
+# Runs $Code in a child PowerShell with the lib of $Dir dot-sourced (used to replace a cmdlet for one test).
+function Invoke-Lib([string]$Dir, [string]$Code) {
+  $text = "Set-StrictMode -Version Latest; `$ErrorActionPreference = 'Stop'; . '$(Join-Path $Dir 'lib\aicm-common.ps1')'; $Code"
+  return (Invoke-Child @('-EncodedCommand', [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($text))))
+}
+
+function Invoke-Child([string[]]$PsArguments) {
   $exe = (Get-Process -Id $PID).Path
   $saved = @{}
   $names = 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'AICM_TASK_PATH'
@@ -23,7 +33,7 @@ function Invoke-Script([string]$Script, [string[]]$Arguments) {
     $env:USERPROFILE = $fakeHome; $env:TEMP = "$work\tmp"; $env:TMP = "$work\tmp"; $env:LOCALAPPDATA = "$fakeHome\AppData\Local"
     $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'; $env:AICM_TASK_PATH = $taskPath
     $ErrorActionPreference = 'Continue'
-    $output = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root $Script) @Arguments 2>&1 | Out-String
+    $output = & $exe -NoProfile -ExecutionPolicy Bypass @PsArguments 2>&1 | Out-String
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
   } finally {
     foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
@@ -73,6 +83,50 @@ try {
   if ((Test-Path -LiteralPath "$appDir\bin\update_ai_clis.ps1") -and (Test-Path -LiteralPath "$appDir\SOURCE")) { Pass 'jobs run an installed copy, not the clone' } else { Fail 'installed copy' }
   if ($update -and $update.Actions[0].Execute -eq 'wscript.exe' -and $update.Actions[0].Arguments -like "*$appDir\windows\run-hidden.vbs*" -and $update.Actions[0].Arguments -like "*$appDir\bin\update_ai_clis.ps1*") { Pass 'tasks start hidden from the installed copy' } else { Fail "task action: $($update.Actions[0].Execute) $($update.Actions[0].Arguments)" }
   if ($update -and $update.Actions[0].Arguments -match '-Scheduled' -and $update.Triggers[0].Repetition.Interval -eq 'PT3H') { Pass 'update task retries every 3 hours' } else { Fail 'update retry' }
+  $schedFile = "$aicmHome\state\schedule.json"
+  $o = (Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json).options
+  if ($o.updateAt -eq '06:15' -and $o.inventoryDay -eq 'Wednesday' -and $o.inventoryAt -eq '11:40' -and $o.cleanDay -eq 'Sunday' -and $o.cleanAt -eq '13:05' -and $o.targets -eq 'codex,claude') { Pass 'schedule.json keeps the install options' } else { Fail "options: $($o | ConvertTo-Json -Compress)" }
+
+  # Installing the same schedule again changes nothing; refresh re-registers stale tasks from the stored options.
+  $installArgs = @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')
+  $r = Invoke-Aicm $installArgs
+  if ($r.Output -match 'unchanged:' -and $r.Output -notmatch 'registered:') { Pass 'same install again leaves the tasks alone' } else { Fail "reinstall: $($r.Output)" }
+  $wantArgs = $update.Actions[0].Arguments
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument 'stale arguments') | Out-Null
+  $r = Invoke-Aicm @('schedule', 'refresh')
+  if ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Arguments -eq $wantArgs) { Pass 'refresh puts a stale task back with the stored options' } else { Fail "refresh: $($r.Output)" }
+  $r = Invoke-Aicm @('schedule', 'refresh')
+  if ($r.Output -match 'already match' -and $r.Output -notmatch 'registered:') { Pass 'refresh with nothing to change changes nothing' } else { Fail "second refresh: $($r.Output)" }
+  # A schedule.json written by 2.5.1 has no options: refresh reads them back from the tasks.
+  $s = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
+  $installedBefore = $s.installedAt
+  $s.PSObject.Properties.Remove('options')
+  $s | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $schedFile -Encoding UTF8
+  $r = Invoke-Aicm @('schedule', 'refresh')
+  $s = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
+  if ($r.Output -match 'already match' -and $s.options.updateAt -eq '06:15' -and $s.options.inventoryDay -eq 'Wednesday' -and $s.options.cleanDay -eq 'Sunday' -and $s.options.targets -eq 'codex,claude') { Pass 'refresh of an older schedule keeps its days and times' } else { Fail "old refresh: $($r.Output) $($s | ConvertTo-Json -Compress)" }
+  if ($s.installedAt -eq $installedBefore) { Pass 'refresh keeps installedAt' } else { Fail 'installedAt changed' }
+
+  # The installed copy: never downgraded, swapped only when complete, the old copy kept on any failure.
+  $appDir = Join-Path $aicmHome 'app'
+  Set-Content -LiteralPath "$appDir\VERSION" -Value '99.0.0'
+  $r = Invoke-Lib $appDir 'Update-AicmAppCopy'
+  if ((Get-Content -LiteralPath "$appDir\VERSION" -TotalCount 1) -eq '99.0.0' -and $r.Output -match 'not newer') { Pass 'an older version in the clone does not downgrade the copy' } else { Fail "downgrade: $($r.Output)" }
+  Set-Content -LiteralPath "$appDir\VERSION" -Value '0.0.1'
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument 'stale arguments') | Out-Null
+  $r = Invoke-Lib $appDir 'Update-AicmAppCopy'
+  if ((Get-Content -LiteralPath "$appDir\VERSION" -TotalCount 1) -eq $version -and $r.Output -match 'updated 0\.0\.1 -> ') { Pass 'a newer version in the clone refreshes the copy' } else { Fail "upgrade: $($r.Output)" }
+  if ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0].Arguments -match 'inventory_ai_clis\.ps1') { Pass 'after the copy is refreshed the tasks are re-registered' } else { Fail "re-register after update: $($r.Output)" }
+  Set-Content -LiteralPath "$appDir\MARKER" -Value 'old'
+  $r = Invoke-Lib $root 'function Copy-Item { throw "disk full" }; Sync-AicmAppCopy (Get-AicmRoot)'
+  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'a failed copy keeps the old copy' } else { Fail "failed copy: $($r.ExitCode) $($r.Output)" }
+  $r = Invoke-Lib $root 'function Copy-Item { param([string]$LiteralPath, [string]$Destination, [switch]$Recurse, [switch]$Force, $ErrorAction) Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Recurse:$Recurse -Force; if ($Destination -like "*\lib") { Remove-Item -LiteralPath (Join-Path $Destination "aicm-common.ps1") } }; Sync-AicmAppCopy (Get-AicmRoot)'
+  if ($r.ExitCode -ne 0 -and $r.Output -match 'incomplete' -and (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'an incomplete copy is not swapped in' } else { Fail "incomplete copy: $($r.ExitCode) $($r.Output)" }
+  $r = Invoke-Lib $root 'function Move-Item { param([string]$LiteralPath, [string]$Destination, $ErrorAction) if ($LiteralPath -like "*.new") { throw "locked by a scanner" }; Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination }; function Start-Sleep { }; Sync-AicmAppCopy (Get-AicmRoot)'
+  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.old") -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'a failed swap puts the old copy back' } else { Fail "failed swap: $($r.ExitCode) $($r.Output)" }
+  Rename-Item -LiteralPath $appDir -NewName 'app.old'
+  $r = Invoke-Lib $root 'Sync-AicmAppCopy (Get-AicmRoot)'
+  if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath "$appDir\bin\update_ai_clis.ps1") -and -not (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.old")) { Pass 'a copy left half-swapped is completed by the next sync' } else { Fail "recovery: $($r.ExitCode) $($r.Output)" }
 
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 1 -and $r.Output -match 'no update run') { Pass 'doctor flags missing update run' } else { Fail "doctor before runs: $($r.Output)" }
@@ -134,6 +188,16 @@ try {
     $legacy = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -ErrorAction SilentlyContinue
     $others = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -ne 'Update' })
     if ($legacy -and $others.Count -eq 0) { Pass 'legacy installer registers update only' } else { Fail "legacy installer: $($r.Output)" }
+    # With all three jobs installed, the legacy installer only changes Update.
+    $null = Invoke-Aicm @('schedule', 'install', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-KeepLegacyTask')
+    $r = Invoke-Script 'windows\install_scheduled_task.ps1' @('-At', '04:45')
+    $u = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -ErrorAction SilentlyContinue
+    $i = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue
+    $c = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -ErrorAction SilentlyContinue
+    $s = Get-Content -LiteralPath "$aicmHome\state\schedule.json" -Raw | ConvertFrom-Json
+    if ($u -and $i -and $c -and ([datetime]$u.Triggers[0].StartBoundary).ToString('HH:mm') -eq '04:45' -and $i.Triggers[0].DaysOfWeek -eq 8 -and ([datetime]$i.Triggers[0].StartBoundary).ToString('HH:mm') -eq '11:40' -and @($s.jobs).Count -eq 3 -and $s.options.inventoryDay -eq 'Wednesday' -and $s.options.updateAt -eq '04:45') {
+      Pass 'legacy installer keeps Inventory and Clean as they were'
+    } else { Fail "legacy installer with all jobs: $($r.Output)" }
   }
 } finally {
   Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
