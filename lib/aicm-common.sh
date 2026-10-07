@@ -70,6 +70,8 @@ aicm_expand_path() {
     "~") p="$HOME" ;;
     "~/"*) p="$HOME/${p#\~/}" ;;
   esac
+  # Codex reads CODEX_HOME, so its sessions and database live there when it is set.
+  p="${p//\{codex\}/${CODEX_HOME:-$HOME/.codex}}"
   p="${p//\{temp\}/$(aicm_temp_dir)}"
   p="${p//\{cache\}/$(aicm_cache_dir)}"
   p="${p//\{localappdata\}/$(aicm_cache_dir)}"
@@ -78,16 +80,38 @@ aicm_expand_path() {
   printf '%s' "$p"
 }
 
+# The folder itself with symlinks resolved, or the text as given when it does not exist.
+aicm_real_dir() { (cd -P -- "$1" 2>/dev/null && pwd -P) || printf '%s' "$1"; }
+
+# The temp folder counts as a cleanup area only when it really is a temp folder: never /, the home
+# folder or a folder above it, and named tmp/temp/T (macOS: /var/folders/../T) or under /tmp or /var/folders.
+# A TMPDIR pointing at / or /home would otherwise let a {temp} rule sweep the home folder.
+aicm_temp_usable() {
+  local temp home
+  temp="$(aicm_real_dir "$(aicm_temp_dir)")"; home="$(aicm_real_dir "${HOME%/}")"
+  [[ -n "$temp" && "$temp" != / && -n "$home" && "$home" != / ]] || return 1
+  [[ "$home/" == "$temp/"* ]] && return 1
+  case "$(aicm_lower "$(basename "$temp")")" in tmp|temp|t) return 0 ;; esac
+  case "$temp" in /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) return 0 ;; esac
+  return 1
+}
+
 # A rule may only touch the home folder (never the home folder itself) or the temp folder.
+# $2 = 1: the rule's path is written with {temp}; it is allowed only while TMPDIR looks right.
 aicm_path_allowed() {
-  local p="$1" home temp
+  local p="$1" from_temp="${2:-0}" home temp in_temp=1
   home="${HOME%/}"
   temp="$(aicm_temp_dir)"
   case "/$p/" in
     */../*|*/./*) return 1 ;;
   esac
-  [[ "$p" == "$home" ]] && return 1
-  [[ "$p" == "$temp" || "$p" == "$temp/"* ]] && return 0
+  # No home folder (HOME unset or /) means no safe area at all.
+  [[ -n "$home" ]] || return 1
+  # The home folder itself, or anything above it, never.
+  [[ "$home/" == "$p/"* ]] && return 1
+  if [[ "$p" == "$temp" || "$p" == "$temp/"* ]] && aicm_temp_usable; then in_temp=0; fi
+  [[ "$from_temp" == 1 ]] && return "$in_temp"
+  ((in_temp == 0)) && return 0
   [[ "$p" == "$home/"* ]] && return 0
   return 1
 }
@@ -144,11 +168,11 @@ aicm_load_rule_file() {
     id="$(aicm_trim "$id")"; os="$(aicm_lower "$(aicm_trim "$os")")"; kind="$(aicm_lower "$(aicm_trim "$kind")")"
     path="$(aicm_trim "$path")"; pattern="$(aicm_trim "$pattern")"; days="$(aicm_trim "$days")"
     limit="$(aicm_trim "$limit")"; default="$(aicm_lower "$(aicm_trim "$default")")"; note="$(aicm_trim "$note")"
-    case "$kind" in age|cap|keep-latest|command|archive|codex) ;; *) echo "invalid rule kind '$kind' in $source: $line" >&2; return 1 ;; esac
+    case "$kind" in age|age-files|cap|keep-latest|command|archive|codex) ;; *) echo "invalid rule kind '$kind' in $source: $line" >&2; return 1 ;; esac
     case "$default" in on|off) ;; *) echo "invalid default '$default' in $source: $line" >&2; return 1 ;; esac
     [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || { echo "invalid days in $source: $line" >&2; return 1; }
     [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || { echo "invalid limit in $source: $line" >&2; return 1; }
-    if [[ "$kind" == age ]] && (( ${days:-0} < 1 )); then echo "age rule needs days >= 1 in $source: $line" >&2; return 1; fi
+    if [[ "$kind" == age || "$kind" == age-files ]] && (( ${days:-0} < 1 )); then echo "$kind rule needs days >= 1 in $source: $line" >&2; return 1; fi
     if [[ "$kind" == keep-latest ]] && (( ${limit:-0} < 1 )); then echo "keep-latest rule needs limit >= 1 in $source: $line" >&2; return 1; fi
     if [[ "$kind" == archive ]] && (( ${days:-0} < 1 || ${limit:-0} < 1 )); then echo "archive rule needs days >= 1 (archive after) and limit >= 1 (delete after) in $source: $line" >&2; return 1; fi
     if [[ "$kind" == codex ]] && (( ${days:-0} < 1 )); then echo "codex rule needs days >= 1 in $source: $line" >&2; return 1; fi
@@ -173,7 +197,9 @@ AICM_PROTECT_ARGS=(
   ! -iname MEMORY.md ! -iname CLAUDE.md ! -iname AGENTS.md ! -iname GEMINI.md
   ! -iname auth.json ! -iname .credentials.json ! -iname credentials.json ! -iname credentials
   ! -iname settings.json ! -iname settings.local.json ! -iname config.toml ! -iname config.json ! -iname config.yaml
-  ! -iname '*.env' ! -iname .env ! -path '*/memory/*'
+  ! -iname '*.env' ! -iname .env ! -iname .npmrc ! -iname .netrc
+  ! -iname '*.pem' ! -iname '*.key' ! -iname 'id_rsa*' ! -iname 'id_ed25519*' ! -iname 'id_ecdsa*' ! -iname 'id_dsa*'
+  ! -ipath '*/memory/*'
 )
 
 # Writes to a temp file and renames it into place, so a crash mid-write never leaves a half-written state file.
@@ -271,15 +297,22 @@ aicm_archive_days() { # rule_id rule_days
   echo "$days"
 }
 
-# Codex threads from its state DB (read-only), one "id<TAB>rollout_path<TAB>updated_at<TAB>archived" line each.
-# Uses sqlite3 (always on macOS) or python3 on Linux; fails when neither can read it.
+# Codex threads from its state DB (read-only), one "id<TAB>updated_at<TAB>archived" line each.
+# Uses sqlite3 (always on macOS) or python3 on Linux; fails when neither can read it, or when the
+# threads table lacks the expected columns (an unknown layout is never guessed at).
 aicm_codex_threads() {
-  local root="$1" db
+  local root="$1" db cols arch=0
   [[ "${AICM_CODEX_DB_READER:-1}" == 0 ]] && return 1
-  db="$(find "$root" -maxdepth 1 -name 'state_*.sqlite' -type f 2>/dev/null | sort -t_ -k2 -n | tail -n 1)"
+  # The newest layout: the highest number after the last "_" of the file name (state_12 over state_5).
+  db="$(find "$root" -maxdepth 1 -name 'state_*.sqlite' -type f 2>/dev/null \
+    | awk '{ n = $0; sub(/.*_/, "", n); sub(/\.sqlite$/, "", n); if (n ~ /^[0-9]+$/) print n "\t" $0 }' \
+    | sort -n | tail -n 1 | cut -f 2-)"
   [[ -n "$db" ]] || return 1
   if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 -readonly -separator "$(printf '\t')" "$db" 'select id, rollout_path, updated_at, archived from threads' 2>/dev/null
+    cols="$(sqlite3 -readonly "$db" "select group_concat(name, ',') from pragma_table_info('threads')" 2>/dev/null)" || return 1
+    [[ ",$cols," == *,id,* && ",$cols," == *,updated_at,* ]] || return 1
+    [[ ",$cols," == *,archived,* ]] && arch=archived
+    sqlite3 -readonly -separator "$(printf '\t')" "$db" "select id, updated_at, $arch from threads" 2>/dev/null
     return
   fi
   # On macOS python3 may be an installer stub, so only Linux falls back to it.
@@ -287,7 +320,11 @@ aicm_codex_threads() {
     python3 - "$db" <<'PY' 2>/dev/null
 import sqlite3, sys
 con = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
-for r in con.execute('select id, rollout_path, updated_at, archived from threads'):
+cols = {r[1] for r in con.execute('pragma table_info(threads)')}
+if not {'id', 'updated_at'} <= cols:
+    sys.exit(3)
+arch = 'archived' if 'archived' in cols else '0'
+for r in con.execute('select id, updated_at, ' + arch + ' from threads'):
     print('\t'.join('' if v is None else str(v) for v in r))
 PY
     return

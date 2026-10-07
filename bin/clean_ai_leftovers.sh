@@ -82,12 +82,29 @@ if [[ "$REPORT" != true ]]; then
 fi
 
 # Per-rule results, set by the rule functions.
+# R_ERROR: a rule that could not do its job sets it (and returns 0); it becomes a problem.
 R_FILES=0; R_BYTES=0; R_REMOVED=0; R_REMOVED_BYTES=0; R_IN_USE=0; R_STATUS=""
-R_PURGE=0; R_PURGE_BYTES=0; R_PURGED=0; R_PURGED_BYTES=0; R_DETAIL=""
+R_PURGE=0; R_PURGE_BYTES=0; R_PURGED=0; R_PURGED_BYTES=0; R_DETAIL=""; R_ERROR=""
+R_VARS="R_FILES R_BYTES R_REMOVED R_REMOVED_BYTES R_IN_USE R_PURGE R_PURGE_BYTES R_PURGED R_PURGED_BYTES R_DETAIL R_ERROR"
 
 reset_result() {
   R_FILES=0; R_BYTES=0; R_REMOVED=0; R_REMOVED_BYTES=0; R_IN_USE=0; R_STATUS=""
-  R_PURGE=0; R_PURGE_BYTES=0; R_PURGED=0; R_PURGED_BYTES=0; R_DETAIL=""
+  R_PURGE=0; R_PURGE_BYTES=0; R_PURGED=0; R_PURGED_BYTES=0; R_DETAIL=""; R_ERROR=""
+}
+
+# Every age comes from the clock, so a clock far off (a dead CMOS battery, a restored VM snapshot, a
+# wrong NTP answer) would make everything look old. Compared with when the last run wrote its state.
+clock_problem() {
+  local f="$AICM_HOME/state/last-clean.json" when now
+  [[ "${AICM_CLOCK_CHECK:-1}" != 0 && -f "$f" ]] || return 0
+  when="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)" || return 0
+  [[ "$when" =~ ^[0-9]+$ ]] || return 0
+  now="$(date +%s)"
+  if ((now < when - 86400)); then
+    echo "the system clock is earlier than the last cleanup run: nothing deleted until the clock is right"
+  elif ((now > when + 400 * 86400)); then
+    echo "the system clock is more than 400 days past the last cleanup run: nothing deleted (if the date is right, run once with AICM_CLOCK_CHECK=0)"
+  fi
 }
 
 tree_bytes() {
@@ -98,28 +115,61 @@ file_bytes() {
   printf '%s\0' "$1" | aicm_sizes_stdin | aicm_sum_lines
 }
 
-# Deletes the NUL-separated file list in $1, updating R_REMOVED / R_REMOVED_BYTES / R_IN_USE.
+count_list() { tr -cd '\0' < "$1" | wc -c | tr -d ' '; }
+
+# Deletes the NUL-separated file list in $1 in one pass (no process per file, so a 100k-file cache takes
+# seconds), updating R_REMOVED / R_REMOVED_BYTES / R_IN_USE from what is still there afterwards.
 remove_listed_files() {
-  local list="$1" f size
-  while IFS= read -r -d '' f; do
-    size="$(file_bytes "$f")"
-    if rm -f -- "$f" 2>/dev/null && [[ ! -e "$f" ]]; then
-      R_REMOVED=$((R_REMOVED + 1)); R_REMOVED_BYTES=$((R_REMOVED_BYTES + size))
-    else
-      R_IN_USE=$((R_IN_USE + 1))
-    fi
-  done < "$list"
+  local list="$1" left f count bytes n_left b_left
+  [[ -s "$list" ]] || return 0
+  count="$(count_list "$list")"; bytes="$(aicm_sizes_stdin < "$list" | aicm_sum_lines)"
+  xargs -0 rm -f -- < "$list" 2>/dev/null || true
+  left="$(mktemp)"
+  while IFS= read -r -d '' f; do if [[ -e "$f" || -L "$f" ]]; then printf '%s\0' "$f"; fi; done < "$list" > "$left"
+  n_left="$(count_list "$left")"; b_left="$(aicm_sizes_stdin < "$left" | aicm_sum_lines)"
+  rm -f "$left"
+  R_REMOVED=$((R_REMOVED + count - n_left)); R_REMOVED_BYTES=$((R_REMOVED_BYTES + bytes - b_left)); R_IN_USE=$((R_IN_USE + n_left))
 }
 
+# Empty folders below $1, deepest first; "memory" folders and their insides stay.
+prune_empty_dirs() {
+  find "$1" -mindepth 1 -type d -empty ! -iname memory ! -ipath '*/memory/*' -delete 2>/dev/null || true
+}
+
+# Each entry directly in <root> that matches <pattern> (a session folder, a temp folder, a file) is one
+# unit: it goes only when nothing inside it changed for <days>. Deleting old files one by one would break
+# folders still in use (an open session whose first file is old, a plugin checkout). Units are checked
+# and deleted one at a time, so a session resumed while the cleanup runs is seen before anything goes.
 run_age_rule() {
+  local root="$1" pattern="$2" days="$3" dry="$4" mins unit list
+  mins=$((days * 1440))
+  list="$(mktemp)"
+  for unit in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+    [[ -e "$unit" && ! -L "$unit" ]] || continue
+    # shellcheck disable=SC2053
+    [[ "$(basename "$unit")" == $pattern ]] || continue
+    # Anything changed within <days> (a file, a folder, the unit itself) keeps the whole unit.
+    [[ -z "$(find "$unit" -mmin -"$mins" -print -quit 2>/dev/null)" ]] || continue
+    find "$unit" -type f "${AICM_PROTECT_ARGS[@]}" -print0 2>/dev/null > "$list" || true
+    R_FILES=$((R_FILES + $(count_list "$list"))); R_BYTES=$((R_BYTES + $(aicm_sizes_stdin < "$list" | aicm_sum_lines)))
+    [[ "$dry" == true ]] && continue
+    remove_listed_files "$list"
+    if [[ -d "$unit" ]]; then prune_empty_dirs "$unit"; rmdir "$unit" 2>/dev/null || true; fi
+  done
+  rm -f "$list"
+}
+
+# Single old files anywhere below <root>: for caches whose entries stand alone (content-addressed npm and
+# pip caches), where a folder is never "in use" as a whole.
+run_age_files_rule() {
   local root="$1" pattern="$2" days="$3" dry="$4" list
   list="$(mktemp)"
   find "$root" -type f -name "$pattern" -mmin +"$((days * 1440))" "${AICM_PROTECT_ARGS[@]}" -print0 2>/dev/null > "$list" || true
-  R_FILES="$(tr -cd '\0' < "$list" | wc -c | tr -d ' ')"
+  R_FILES="$(count_list "$list")"
   R_BYTES="$(aicm_sizes_stdin < "$list" | aicm_sum_lines)"
   if [[ "$dry" != true ]]; then
     remove_listed_files "$list"
-    find "$root" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    prune_empty_dirs "$root"
   fi
   rm -f "$list"
 }
@@ -225,7 +275,7 @@ run_archive_rule() { # root id pattern days limit dry purge_dry
         R_IN_USE=$((R_IN_USE + 1))
       fi
     done < "$list"
-    find "$root" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    prune_empty_dirs "$root"
   fi
   rm -f "$list"
   purge_archive "$AICM_HOME/archive/$id" "$limit" "$purge_dry"
@@ -238,22 +288,34 @@ codex_id() { [[ "$1" =~ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 # unused for <days> + <limit>. Threads whose file is already gone count as archived and are deleted
 # on the same schedule (needs sqlite3 or python3 to read the database; skipped otherwise).
 run_codex_rule() { # root days limit dry
-  local root="$1" days="$2" limit="$3" dry="$4" codex arch del threads f cid now cut id rollout updated _archived size orphans=()
-  if ! codex="$(command -v codex 2>/dev/null)"; then R_DETAIL="codex command not found: nothing touched"; return 0; fi
-  arch="$(mktemp)"; del="$(mktemp)"; threads="$(mktemp)"
+  local root="$1" days="$2" limit="$3" dry="$4" codex arch del threads present d f cid now cut id updated _archived size orphans=()
+  if ! codex="$(command -v codex 2>/dev/null)"; then
+    # Sessions without the codex command: Codex was used here, but this run cannot find it.
+    if [[ -d "$root/sessions" ]]; then R_ERROR="codex command not found, Codex sessions were not cleaned"; return 0; fi
+    R_DETAIL="codex command not found: nothing touched"; return 0
+  fi
+  arch="$(mktemp)"; del="$(mktemp)"; threads="$(mktemp)"; present="$(mktemp)"
   [[ -d "$root/sessions" ]] && find "$root/sessions" -type f -name 'rollout-*' -mmin +"$((days * 1440))" -print0 2>/dev/null > "$arch"
   [[ -d "$root/archived_sessions" ]] && find "$root/archived_sessions" -type f -name 'rollout-*' -mmin +"$(((days + limit) * 1440))" -print0 2>/dev/null > "$del"
   # limit 0: no archive stage, sessions unused for <days> are deleted right away.
   if ((limit == 0)); then cat "$arch" >> "$del"; : > "$arch"; fi
   if aicm_codex_threads "$root" > "$threads"; then
+    # A thread is orphaned only when no rollout file with its id exists under sessions or archived_sessions;
+    # the stored path is not trusted (a moved home folder, WSL, encodings).
+    for d in "$root/sessions" "$root/archived_sessions"; do
+      if [[ -d "$d" ]]; then find "$d" -type f -name 'rollout-*' 2>/dev/null; fi
+    done | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' > "$present" || true
     now="$(date +%s)"; cut=$((now - (days + limit) * 86400))
-    while IFS=$'\t' read -r id rollout updated _archived; do
-      [[ -n "$id" && -n "$rollout" && -n "$updated" ]] || continue
+    while IFS=$'\t' read -r id updated _archived; do
+      [[ -n "$id" ]] || continue
+      # Only unix seconds or milliseconds; anything else (a date text) is unknown and left alone.
+      [[ "$updated" =~ ^[0-9]+(\.[0-9]+)?$ ]] || continue
       updated="${updated%%.*}"; ((updated > 100000000000)) && updated=$((updated / 1000))
-      [[ ! -e "$rollout" ]] && ((updated < cut)) && orphans+=("$id")
+      ((updated > 0 && updated < cut)) || continue
+      grep -qxF "$id" "$present" || orphans+=("$id")
     done < "$threads"
   else
-    R_DETAIL="Codex database not read (sqlite3/python3 not found): sessions whose file is already gone are left alone"
+    R_DETAIL="Codex database not read (sqlite3/python3 not found, or an unknown layout): sessions whose file is already gone are left alone"
   fi
   R_FILES="$(tr -cd '\0' < "$arch" | wc -c | tr -d ' ')"
   R_BYTES="$(aicm_sizes_stdin < "$arch" | aicm_sum_lines)"
@@ -297,7 +359,7 @@ run_codex_rule() { # root days limit dry
       fi
     fi
   fi
-  rm -f "$arch" "$del" "$threads"
+  rm -f "$arch" "$del" "$threads" "$present"
 }
 
 run_command_rule() {
@@ -309,6 +371,13 @@ run_command_rule() {
   if ((rc != 0)); then R_STATUS="error: $cmd $args exited with $rc"; return 1; fi
   R_STATUS="ran: $(printf '%s\n' "$out" | awk 'NF { l = $0 } END { print l }')"
 }
+
+clock="$(clock_problem)"
+if [[ -n "$clock" ]]; then
+  echo "problem: $clock"
+  # No state is written, so the guard keeps comparing with the last good run.
+  if [[ "$DRY_RUN" != true ]]; then aicm_attention clean "cleanup: $clock"; exit 1; fi
+fi
 
 errors=()
 planned_bytes=0; freed_bytes=0; off_bytes=0; archive_bytes=0; archived_bytes=0
@@ -330,7 +399,8 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
   else
     root="$(aicm_expand_path "$raw_path")"
     shown="$(aicm_display_path "$root")"
-    if ! aicm_path_allowed "$root"; then
+    from_temp=0; [[ "$raw_path" == *"{temp}"* ]] && from_temp=1
+    if ! aicm_path_allowed "$root" "$from_temp"; then
       R_STATUS="refused: outside home and temp"; errors+=("$id: path outside home and temp")
     elif [[ -L "$root" ]]; then
       R_STATUS="skipped: path is a link"
@@ -338,14 +408,27 @@ for ((i = 0; i < ${#AICM_RULE_ID[@]}; i++)); do
       R_STATUS="not present"
     else
       [[ "$REPORT" == true ]] && total="$(tree_bytes "$root")"
-      case "$kind" in
-        age) run_age_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
-        cap) run_cap_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
-        keep-latest) run_keep_latest_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
-        archive) run_archive_rule "$root" "$id" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" "$DRY_RUN" ;;
-        codex) run_codex_rule "$root" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
-      esac
-      if [[ "$enabled" != 1 ]]; then R_STATUS=off
+      # Each rule runs in a subshell, so an unexpected failure in one rule (a full disk, a value it could
+      # not read) is reported and the other rules still run. The results come back as variable lines.
+      set +e
+      rule_out="$(
+        set -e
+        exec 4>&1 1>&2
+        case "$kind" in
+          age) run_age_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
+          age-files) run_age_files_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "$dry" ;;
+          cap) run_cap_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
+          keep-latest) run_keep_latest_rule "$root" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
+          archive) run_archive_rule "$root" "$id" "${AICM_RULE_PATTERN[$i]}" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" "$DRY_RUN" ;;
+          codex) run_codex_rule "$root" "${AICM_RULE_DAYS[$i]}" "${AICM_RULE_LIMIT[$i]}" "$dry" ;;
+        esac
+        for v in $R_VARS; do printf '%s=%q\n' "$v" "${!v}"; done >&4
+      )"
+      rc=$?
+      set -e
+      if ((rc == 0)); then eval "$rule_out"; else R_ERROR="stopped unexpectedly (exit $rc), see the log"; fi
+      if [[ -n "$R_ERROR" ]]; then R_STATUS="error: $R_ERROR"; errors+=("$id: $R_ERROR")
+      elif [[ "$enabled" != 1 ]]; then R_STATUS=off
       elif [[ "$kind" == codex && "${AICM_RULE_LIMIT[$i]}" == 0 ]]; then
         # limit 0 deletes directly; show it as a deletion, not an archive.
         if [[ "$DRY_RUN" == true ]]; then R_STATUS="would remove"; else R_STATUS=removed; fi

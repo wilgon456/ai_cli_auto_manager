@@ -37,6 +37,9 @@ make_file() { # path days_old [bytes]
   head -c "${3:-16}" /dev/zero > "$1"
   touch -t "$(stamp_days_ago "$2")" "$1"
 }
+age_dirs() { # folder days_old: the folder and every folder below it look untouched since then
+  find "$1" -type d -exec touch -t "$(stamp_days_ago "$2")" {} +
+}
 TODAY="$(date +%Y%m%d)"
 
 # Fake codex: records calls; archive moves the rollout to archived_sessions, delete removes it.
@@ -60,11 +63,21 @@ U1=11111111-1111-4111-8111-111111111111; U2=22222222-2222-4222-8222-222222222222
 U3=33333333-3333-4333-8333-333333333333; U4=44444444-4444-4444-8444-444444444444
 UX=ffffffff-ffff-4fff-8fff-ffffffffffff; UO=55555555-5555-4555-8555-555555555555; UY=66666666-6666-4666-8666-666666666666
 UE=eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee
+# UT: a thread whose date is text; UM: a thread whose stored path is from an old home folder, file present
+UT=99999999-9999-4999-8999-999999999999; UM=88888888-8888-4888-8888-888888888888
+make_file "$HOME/.codex/archived_sessions/rollout-2026-09-27T10-00-00-$UM.jsonl" 10
 
-# age rule: old scratch file goes, new one stays, protected names stay, links are not followed.
-make_file "$HOME/.codex/.tmp/2026/08/old.bin" 40
-make_file "$HOME/.codex/.tmp/2026/10/new.bin" 1
+# age rule: a folder untouched for the rule's days goes as a whole; a folder with one fresh file stays
+# whole (its old files too); protected names stay, links are not followed.
+make_file "$HOME/.codex/.tmp/old-run/08/old.bin" 40
+make_file "$HOME/.codex/.tmp/old-run/id_ed25519" 40
+make_file "$HOME/.codex/.tmp/old-run/Memory/notes.md" 40
+make_file "$HOME/.codex/.tmp/live/first.bin" 40
+make_file "$HOME/.codex/.tmp/live/new.bin" 1
+make_file "$HOME/.codex/.tmp/old-single.bin" 40
 make_file "$HOME/.codex/.tmp/MEMORY.md" 90
+age_dirs "$HOME/.codex/.tmp/old-run" 40
+age_dirs "$HOME/.codex/.tmp/live" 40
 make_file "$WORK/outside/precious.txt" 90
 link_dir "$WORK/outside" "$HOME/.codex/.tmp/linked"
 # archive rule: Claude transcripts, only *.jsonl, memory folder untouched; Claude's own setting is 20 days.
@@ -98,7 +111,9 @@ db_sql="create table threads (id text, rollout_path text, updated_at integer, ar
 insert into threads values ('$U1', '$HOME/.codex/sessions/x-$U1.jsonl', $(( $(date +%s) - 40 * 86400 )), 0);
 insert into threads values ('$UO', '$HOME/.codex/sessions/gone-$UO.jsonl', $(( $(date +%s) - 100 * 86400 )), 0);
 insert into threads values ('$UY', '$HOME/.codex/sessions/gone-$UY.jsonl', $(( $(date +%s) - 50 * 86400 )), 0);
-insert into threads values ('$UE', '$HOME/.codex/sessions/gone-$UE.jsonl', $(( $(date +%s) - 100 * 86400 )), 0);"
+insert into threads values ('$UE', '$HOME/.codex/sessions/gone-$UE.jsonl', $(( $(date +%s) - 100 * 86400 )), 0);
+insert into threads values ('$UT', '$HOME/.codex/sessions/gone-$UT.jsonl', '2026-09-01', 0);
+insert into threads values ('$UM', '/old/home/.codex/archived_sessions/rollout-$UM.jsonl', $(( $(date +%s) - 100 * 86400 )), 1);"
 DB="$HOME/.codex/state_5.sqlite"
 if command -v sqlite3 >/dev/null 2>&1; then
   sqlite3 "$DB" "$db_sql" && DB_OK=true
@@ -129,7 +144,7 @@ echo "# dry run"
 out="$("$ROOT/bin/clean_ai_leftovers.sh" --dry-run 2>&1)" && rc=0 || rc=$?
 echo "$out"
 [[ "$rc" == 1 ]] && pass "dry run reports refused rules with exit 1" || fail "dry run exit was $rc"
-expect_exists "$HOME/.codex/.tmp/2026/08/old.bin" "dry run removes nothing"
+expect_exists "$HOME/.codex/.tmp/old-run/08/old.bin" "dry run removes nothing"
 expect_exists "$HOME/.claude/projects/p/old.jsonl" "dry run archives nothing"
 expect_exists "$HOME/.cache/ms-playwright/chromium-1000" "dry run keeps old builds"
 [[ ! -s "$WORK/codex-calls.log" ]] && pass "dry run does not call codex" || fail "dry run called codex"
@@ -140,10 +155,14 @@ grep -q 'archive after 12d (the CLI deletes after 20d)' <<< "$out" && pass "arch
 echo "# real run"
 out="$("$ROOT/bin/clean_ai_leftovers.sh" 2>&1)" && rc=0 || rc=$?
 echo "$out"
-expect_gone "$HOME/.codex/.tmp/2026/08/old.bin" "old scratch file removed"
-expect_gone "$HOME/.codex/.tmp/2026/08" "emptied folder pruned"
+expect_gone "$HOME/.codex/.tmp/old-run/08/old.bin" "old scratch file removed"
+expect_gone "$HOME/.codex/.tmp/old-run/08" "emptied folder pruned"
+expect_gone "$HOME/.codex/.tmp/old-single.bin" "old single file removed"
+expect_exists "$HOME/.codex/.tmp/old-run/id_ed25519" "key file kept"
+expect_exists "$HOME/.codex/.tmp/old-run/Memory/notes.md" "Memory folder kept (any letter case)"
 expect_exists "$HOME/.codex/.tmp" "rule root kept"
-expect_exists "$HOME/.codex/.tmp/2026/10/new.bin" "fresh scratch file kept"
+expect_exists "$HOME/.codex/.tmp/live/new.bin" "fresh scratch file kept"
+expect_exists "$HOME/.codex/.tmp/live/first.bin" "old file of a folder still in use kept"
 expect_exists "$HOME/.codex/.tmp/MEMORY.md" "protected name kept"
 expect_exists "$WORK/outside/precious.txt" "link target outside never touched"
 expect_link_target "$HOME/.codex/.tmp/linked" "link itself kept by age rule"
@@ -165,6 +184,8 @@ expect_exists "$HOME/.codex/archived_sessions/rollout-2026-08-01T10-00-00-$U4.js
 if [[ "$DB_OK" == true ]]; then
   grep -qx "delete --force $UO" "$WORK/codex-calls.log" && pass "session whose file is gone and unused 90+ days deleted" || fail "orphan delete"
   ! grep -q "$UY" "$WORK/codex-calls.log" && pass "session whose file is gone but used within 90 days kept" || fail "young orphan touched"
+  ! grep -q "$UT" "$WORK/codex-calls.log" && pass "thread with a date text left alone (no crash)" || fail "text-date thread touched"
+  ! grep -q "$UM" "$WORK/codex-calls.log" && pass "thread with a stale stored path but a present file is not an orphan" || fail "moved-home thread deleted"
   grep -E '^codex-sessions ' <<< "$out" | grep -qv 'in use or failed' && pass "sub-agent session removed with its parent is not reported as failed" || fail "sub-agent recount: $(grep -E '^codex-sessions ' <<< "$out")"
   expect_gone "$HOME/.codex/archived_sessions/rollout-2026-05-01T10-00-00-$UX.jsonl" "file Codex does not know is removed directly"
 else
@@ -191,7 +212,7 @@ if PATH="${PATH#"$WORK/fakebin:"}" command -v codex >/dev/null 2>&1; then
   echo "skip - a real codex is installed on this machine"
 else
   PATH="${PATH#"$WORK/fakebin:"}" "$ROOT/bin/clean_ai_leftovers.sh" --rules codex-sessions > "$WORK/nocodex.txt" 2>&1 || true
-  grep -q 'codex command not found: nothing touched' "$WORK/nocodex.txt" && pass "missing codex command reported" || fail "missing codex"
+  grep -q 'codex command not found, Codex sessions were not cleaned' "$WORK/nocodex.txt" && pass "missing codex command reported as a problem" || fail "missing codex"
   expect_exists "$HOME/.codex/sessions/2026/07/01/rollout-2026-07-01T10-00-00-$U2.jsonl" "codex files kept without the codex command"
 fi
 
@@ -212,6 +233,30 @@ echo "# explicit rule runs even when off"
 "$ROOT/bin/clean_ai_leftovers.sh" --rules codex-images >/dev/null 2>&1 || true
 expect_gone "$HOME/.codex/generated_images/pic.png" "--rules runs an off rule"
 expect_exists "$AICM_HOME/archive/codex-images/$TODAY/pic.png" "... and archives it"
+
+echo "# a temp folder above the home folder is never a cleanup area"
+make_file "$HOME/Documents/thesis.docx" 40
+age_dirs "$HOME/Documents" 40
+printf 'temp-sweep | all | age | {temp} | * | 7 | | on |\n' > "$WORK/temp.conf"
+out="$(TMPDIR="$WORK" "$ROOT/bin/clean_ai_leftovers.sh" --rules temp-sweep --local-rules-file "$WORK/temp.conf" 2>&1)" || true
+expect_exists "$HOME/Documents/thesis.docx" "TMPDIR above home: home files kept"
+grep -q 'refused' <<< "$out" && pass "TMPDIR above home: rule refused" || fail "TMPDIR above home not refused: $out"
+TMPDIR=/ "$ROOT/bin/clean_ai_leftovers.sh" --rules temp-sweep --local-rules-file "$WORK/temp.conf" > /dev/null 2>&1 || true
+expect_exists "$HOME/Documents/thesis.docx" "TMPDIR=/: home files kept"
+
+echo "# a clock far off deletes nothing"
+make_file "$HOME/.codex/.tmp/clock-run/old.bin" 40
+age_dirs "$HOME/.codex/.tmp/clock-run" 40
+touch -t "$(stamp_days_ago -3)" "$AICM_HOME/state/last-clean.json"
+out="$("$ROOT/bin/clean_ai_leftovers.sh" --rules codex-tmp 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 1 ]] && grep -q 'system clock is earlier' <<< "$out" && pass "clock behind the last run: refused" || fail "clock check: rc=$rc $out"
+expect_exists "$HOME/.codex/.tmp/clock-run/old.bin" "clock behind the last run: nothing deleted"
+touch -t "$(stamp_days_ago 500)" "$AICM_HOME/state/last-clean.json"
+out="$("$ROOT/bin/clean_ai_leftovers.sh" --rules codex-tmp 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 1 ]] && grep -q '400 days past' <<< "$out" && pass "clock far ahead of the last run: refused" || fail "clock jump: rc=$rc $out"
+expect_exists "$HOME/.codex/.tmp/clock-run/old.bin" "clock far ahead: nothing deleted"
+AICM_CLOCK_CHECK=0 "$ROOT/bin/clean_ai_leftovers.sh" --rules codex-tmp > /dev/null 2>&1 || true
+expect_gone "$HOME/.codex/.tmp/clock-run/old.bin" "AICM_CLOCK_CHECK=0 runs anyway"
 
 echo "# unknown rule id"
 if "$ROOT/bin/clean_ai_leftovers.sh" --rules nope >/dev/null 2>&1; then fail "unknown id accepted"; else pass "unknown id rejected"; fi

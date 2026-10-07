@@ -65,6 +65,9 @@ function Expand-AicmPath([string]$Path) {
   $p = $Path
   if ($p -eq '~') { $p = Get-AicmUserHome }
   elseif ($p.StartsWith('~/') -or $p.StartsWith('~\')) { $p = (Get-AicmUserHome) + $p.Substring(1) }
+  # Codex reads CODEX_HOME, so its sessions and database live there when it is set.
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path (Get-AicmUserHome) '.codex' }
+  $p = $p.Replace('{codex}', $codexHome)
   $p = $p.Replace('{temp}', (Get-AicmTempDir))
   $p = $p.Replace('{localappdata}', (Get-AicmLocalAppData))
   $p = $p.Replace('{cache}', (Get-AicmLocalAppData))
@@ -83,27 +86,63 @@ function Test-AicmSamePath([string]$A, [string]$B) {
   return [string]::Equals($x, $y, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+# Expands 8.3 short names (C:\Users\JOHNDO~1\...) so paths compare by their real long names.
+function Get-AicmLongPath([string]$Path) {
+  $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+  if ($full -notmatch '~') { return $full }
+  $root = [System.IO.Path]::GetPathRoot($full)
+  $out = $root.TrimEnd('\')
+  foreach ($part in $full.Substring($root.Length).Split('\')) {
+    if (-not $part) { continue }
+    $next = Join-Path $out $part
+    if ($part -match '~') {
+      # The search pattern matches short names too and returns the long one.
+      try { $hit = @([System.IO.Directory]::GetFileSystemEntries(($out + '\'), $part)) } catch { $hit = @() }
+      if ($hit.Count -eq 1) { $next = $hit[0] }
+    }
+    $out = $next.TrimEnd('\')
+  }
+  return $out
+}
+
+# The temp folder counts as a cleanup area only when it really is a temp folder: never a drive root,
+# the home folder or a folder above it, and it must sit under %LOCALAPPDATA% or be named Temp/tmp.
+# A TEMP variable pointing at C:\ or C:\Users would otherwise let the os-temp rule sweep the home folder.
+function Test-AicmTempUsable {
+  $temp = Get-AicmLongPath (Get-AicmTempDir)
+  $userHome = Get-AicmLongPath (Get-AicmUserHome)
+  if ([System.IO.Path]::GetPathRoot($temp).TrimEnd('\') -eq $temp) { return $false }
+  if (Test-AicmUnder $userHome $temp) { return $false }
+  if (@('temp', 'tmp') -contains (Split-Path -Leaf $temp).ToLowerInvariant()) { return $true }
+  return (Test-AicmUnder $temp (Get-AicmLongPath (Get-AicmLocalAppData)))
+}
+
 # A rule may only touch the home folder (never the home folder itself) or the temp folder.
-function Test-AicmAllowedPath([string]$Path) {
-  $userHome = Get-AicmUserHome
-  $temp = Get-AicmTempDir
-  if (Test-AicmSamePath $Path $userHome) { return $false }
-  if (Test-AicmUnder $Path $temp) { return $true }
-  return (Test-AicmUnder $Path $userHome)
+# $FromTemp: the rule's path is written with {temp}; it is allowed only while TEMP looks right.
+function Test-AicmAllowedPath([string]$Path, [bool]$FromTemp = $false) {
+  $p = Get-AicmLongPath $Path
+  $userHome = Get-AicmLongPath (Get-AicmUserHome)
+  # The home folder itself, or anything above it, never.
+  if (Test-AicmUnder $userHome $p) { return $false }
+  $inTemp = (Test-AicmUnder $p (Get-AicmLongPath (Get-AicmTempDir))) -and (Test-AicmTempUsable)
+  if ($FromTemp) { return $inTemp }
+  return ($inTemp -or (Test-AicmUnder $p $userHome))
 }
 
 $script:AicmProtectedNames = @(
   'MEMORY.md', 'CLAUDE.md', 'AGENTS.md', 'GEMINI.md',
   'auth.json', '.credentials.json', 'credentials.json', 'credentials',
   'settings.json', 'settings.local.json', 'config.toml', 'config.json', 'config.yaml',
-  '.env'
+  '.env', '.npmrc', '.netrc'
 )
+# Keys and certificates, wherever a tool happened to put them.
+$script:AicmProtectedPatterns = @('*.env', '*.pem', '*.key', 'id_rsa*', 'id_ed25519*', 'id_ecdsa*', 'id_dsa*')
 
 function Test-AicmProtected([System.IO.FileSystemInfo]$Item) {
   foreach ($name in $script:AicmProtectedNames) {
     if ([string]::Equals($Item.Name, $name, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
   }
-  if ($Item.Name -like '*.env') { return $true }
+  foreach ($pattern in $script:AicmProtectedPatterns) { if ($Item.Name -like $pattern) { return $true } }
   if ($Item.FullName -match '[\\/]memory[\\/]') { return $true }
   return $false
 }
@@ -150,7 +189,7 @@ function Remove-AicmTree([System.IO.DirectoryInfo]$Dir) {
   $Dir.Delete($false)
 }
 
-# Removes empty folders below $Root, deepest first. $Root itself and links are kept.
+# Removes empty folders below $Root, deepest first. $Root itself, links and "memory" folders are kept.
 function Remove-AicmEmptyDirs([string]$Root) {
   $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
   $stack = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
@@ -160,7 +199,7 @@ function Remove-AicmEmptyDirs([string]$Root) {
     $subs = $null
     try { $subs = $dir.GetDirectories() } catch { continue }
     foreach ($sub in $subs) {
-      if (Test-AicmLink $sub) { continue }
+      if ((Test-AicmLink $sub) -or $sub.Name -ieq 'memory') { continue }
       $dirs.Add($sub)
       $stack.Push($sub)
     }
@@ -189,14 +228,14 @@ function ConvertFrom-AicmRuleLine([string]$Line, [string]$Source) {
   if ($cols.Count -lt 8) { throw "invalid rule in ${Source}: expected 9 columns: $t" }
   while ($cols.Count -lt 9) { $cols += '' }
   $kind = $cols[2].ToLowerInvariant()
-  if (@('age', 'cap', 'keep-latest', 'command', 'archive', 'codex') -notcontains $kind) { throw "invalid rule kind '$kind' in ${Source}: $t" }
+  if (@('age', 'age-files', 'cap', 'keep-latest', 'command', 'archive', 'codex') -notcontains $kind) { throw "invalid rule kind '$kind' in ${Source}: $t" }
   $default = $cols[7].ToLowerInvariant()
   if (@('on', 'off') -notcontains $default) { throw "invalid default '$default' in ${Source}: $t" }
   $days = 0
   if ($cols[5]) { $days = [int]$cols[5] }
   $limit = 0
   if ($cols[6]) { $limit = [int]$cols[6] }
-  if ($kind -eq 'age' -and $days -lt 1) { throw "age rule needs days >= 1 in ${Source}: $t" }
+  if (@('age', 'age-files') -contains $kind -and $days -lt 1) { throw "$kind rule needs days >= 1 in ${Source}: $t" }
   if ($kind -eq 'keep-latest' -and $limit -lt 1) { throw "keep-latest rule needs limit >= 1 in ${Source}: $t" }
   if ($kind -eq 'archive' -and ($days -lt 1 -or $limit -lt 1)) { throw "archive rule needs days >= 1 (archive after) and limit >= 1 (delete after) in ${Source}: $t" }
   if ($kind -eq 'codex' -and $days -lt 1) { throw "codex rule needs days >= 1 in ${Source}: $t" }
@@ -328,7 +367,7 @@ function Get-AicmCodexId([string]$Name) {
   return ''
 }
 
-# Codex threads from its state DB (read-only): id -> rollout path, last update (unix seconds), archived.
+# Codex threads from its state DB (read-only): id -> last update (unix seconds, 0 = unknown), archived.
 # Needs Python with sqlite3; returns $null when that is not available or the layout is unknown.
 function Get-AicmCodexThreads([string]$CodexHome) {
   if ($env:AICM_CODEX_DB_READER -eq '0') { return $null }
@@ -337,7 +376,8 @@ function Get-AicmCodexThreads([string]$CodexHome) {
   if (-not $db) { return $null }
   $python = @('python', 'python3', 'py') | Where-Object { Resolve-AicmExecutable $_ } | Select-Object -First 1
   if (-not $python) { return $null }
-  $code = "import sqlite3,sys`ncon=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)`nfor r in con.execute('select id, rollout_path, updated_at, archived from threads'):`n    print('\t'.join('' if v is None else str(v) for v in r))"
+  # Stops (exit 3) when the table lacks the expected columns, so an unknown layout is never guessed at.
+  $code = "import sqlite3,sys`ncon=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)`ncols={r[1] for r in con.execute('pragma table_info(threads)')}`nif not {'id','updated_at'} <= cols: sys.exit(3)`narch='archived' if 'archived' in cols else '0'`nfor r in con.execute('select id, updated_at, '+arch+' from threads'):`n    print('\t'.join('' if v is None else str(v) for v in r))"
   $script = [System.IO.Path]::GetTempFileName() + '.py'
   [System.IO.File]::WriteAllText($script, $code)
   try {
@@ -346,11 +386,12 @@ function Get-AicmCodexThreads([string]$CodexHome) {
     $threads = @{}
     foreach ($line in ($r.Output -split "`r?`n")) {
       $c = $line.Split("`t")
-      if ($c.Count -lt 4 -or -not $c[0]) { continue }
+      if ($c.Count -lt 3 -or -not $c[0]) { continue }
+      # Only unix seconds or milliseconds; anything else (a date text) leaves Updated at 0 = unknown.
       $u = 0.0
-      [void][double]::TryParse($c[2], [ref]$u)
+      if ($c[1] -match '^\d+(\.\d+)?$') { [void][double]::TryParse($c[1], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$u) }
       if ($u -gt 1e11) { $u = $u / 1000 }
-      $threads[$c[0]] = [pscustomobject]@{ Rollout = $c[1]; Updated = $u; Archived = ($c[3] -eq '1') }
+      $threads[$c[0]] = [pscustomobject]@{ Updated = $u; Archived = ($c[2] -eq '1') }
     }
     return $threads
   } finally {
