@@ -89,11 +89,32 @@ function Get-StateAgeDays($State) {
   try { return ((Get-Date) - [datetime]::Parse($State.finishedAt).ToLocalTime()).TotalDays } catch { return [double]::PositiveInfinity }
 }
 
-# Tasks run the installed copy through windows\run-hidden.vbs, so no PowerShell window flashes on screen.
-function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra) {
+# Tasks run the installed copy through windows\run-hidden.vbs, so no PowerShell window flashes on screen
+# (//B: a script error never opens a dialog that would keep the task waiting). Where Windows Script Host
+# cannot run (turned off by policy, VBScript removed), they start PowerShell directly with a hidden window.
+function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra, [string]$Launcher = 'wscript') {
+  $ps = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $App "bin\$Script")`"") + $Extra
+  if ($Launcher -eq 'powershell') {
+    return (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ((@('-WindowStyle', 'Hidden') + $ps) -join ' '))
+  }
   $vbs = Join-Path $App 'windows\run-hidden.vbs'
-  $argList = @("`"$vbs`"", 'powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $App "bin\$Script")`"") + $Extra
-  return (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ($argList -join ' '))
+  return (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ((@('//B', '//Nologo', "`"$vbs`"", 'powershell.exe') + $ps) -join ' '))
+}
+
+# 'wscript' when wscript.exe runs windows\run-hidden.vbs and passes the exit code back, else 'powershell'.
+# The test runs a trivial command in batch mode (no dialog) and gives up after 20 seconds.
+# AICM_WSCRIPT_EXE replaces wscript.exe for the test (used by the tests to simulate a broken launcher).
+function Get-TaskLauncher([string]$App) {
+  if (@(Get-AicmWshDisabled).Count -gt 0) { return 'powershell' }
+  $exe = if ($env:AICM_WSCRIPT_EXE) { $env:AICM_WSCRIPT_EXE } else { 'wscript.exe' }
+  $vbs = Join-Path $App 'windows\run-hidden.vbs'
+  try {
+    $p = Start-Process -FilePath $exe -ArgumentList @('//B', '//Nologo', "`"$vbs`"", 'cmd.exe', '/c', 'exit', '7') -WindowStyle Hidden -PassThru -ErrorAction Stop
+    $null = $p.Handle
+    if (-not $p.WaitForExit(20000)) { try { $p.Kill() } catch { }; return 'powershell' }
+    if ($p.ExitCode -eq 7) { return 'wscript' }
+  } catch { }
+  return 'powershell'
 }
 
 # HH:MM or H:MM with hour 0-23 and minute 0-59.
@@ -150,7 +171,7 @@ function Get-InstalledScheduleOptions($Sched) {
 }
 
 # Action and trigger of one job, built from the options.
-function Get-JobSpec([string]$Name, $Opt, [string]$App) {
+function Get-JobSpec([string]$Name, $Opt, [string]$App, [string]$Launcher) {
   $retention = @('-LogRetentionDays', "$($Opt.logRetentionDays)")
   switch ($Name) {
     'Update' {
@@ -162,15 +183,15 @@ function Get-JobSpec([string]$Name, $Opt, [string]$App) {
       # Retry every 3 hours for 15 hours: a CLI that was running at 05:00 is updated once it is closed.
       # A run after a complete success the same day exits right away.
       $trigger.Repetition = (New-ScheduledTaskTrigger -Once -At $Opt.updateAt -RepetitionInterval (New-TimeSpan -Hours 3) -RepetitionDuration (New-TimeSpan -Hours 15)).Repetition
-      return @{ Action = (New-TaskAction $App 'update_ai_clis.ps1' $extra); Trigger = $trigger
+      return @{ Action = (New-TaskAction $App 'update_ai_clis.ps1' $extra $Launcher); Trigger = $trigger
         Description = 'AI CLI Auto Manager: update installed AI coding CLIs'; Text = "daily at $($Opt.updateAt) (retried every 3 hours until it succeeds)" }
     }
     'Inventory' {
-      return @{ Action = (New-TaskAction $App 'inventory_ai_clis.ps1' $retention); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.inventoryDay -At $Opt.inventoryAt)
+      return @{ Action = (New-TaskAction $App 'inventory_ai_clis.ps1' $retention $Launcher); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.inventoryDay -At $Opt.inventoryAt)
         Description = 'AI CLI Auto Manager: list installed AI coding CLIs'; Text = "every $($Opt.inventoryDay) at $($Opt.inventoryAt)" }
     }
     'Clean' {
-      return @{ Action = (New-TaskAction $App 'clean_ai_leftovers.ps1' $retention); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.cleanDay -At $Opt.cleanAt)
+      return @{ Action = (New-TaskAction $App 'clean_ai_leftovers.ps1' $retention $Launcher); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.cleanDay -At $Opt.cleanAt)
         Description = 'AI CLI Auto Manager: remove stale AI CLI leftovers'; Text = "every $($Opt.cleanDay) at $($Opt.cleanAt)" }
     }
   }
@@ -206,12 +227,14 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
   $jobs = New-Object System.Collections.Generic.List[string]
   $app = Sync-AicmAppCopy (Get-AicmRoot)
   if (-not $Refresh) { Write-Host "installed copy: $app (version $(Get-AicmVersion))" }
+  $launcher = Get-TaskLauncher $app
+  if ($launcher -ne 'wscript') { Write-Host 'note: wscript.exe cannot run windows\run-hidden.vbs here (Windows Script Host turned off?); the tasks start PowerShell directly with a hidden window, which may flash briefly' }
   $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
   $changed = $false
   foreach ($name in $script:JobNames) {
     $existing = Get-AicmTask $name
     if ($Want -contains $name) {
-      $spec = Get-JobSpec $name $Opt $app
+      $spec = Get-JobSpec $name $Opt $app $launcher
       $same = $existing -and (Get-TaskSignature $existing.Actions[0] $existing.Triggers[0]) -eq (Get-TaskSignature $spec.Action $spec.Trigger)
       # A plain install also turns a disabled task back on; a refresh leaves that choice alone.
       if ($same -and ($Refresh -or $existing.State -ne 'Disabled')) {
@@ -238,7 +261,7 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
   if ($Refresh -and $prev -and $prev.PSObject.Properties['installedAt']) { $installedAt = [string]$prev.installedAt }
   Write-AicmState 'schedule' ([ordered]@{
     installedAt = $installedAt; version = Get-AicmVersion; app = $app; source = (Get-ScheduleSource $app)
-    jobs = $jobs.ToArray(); options = $Opt
+    jobs = $jobs.ToArray(); launcher = $launcher; options = $Opt
   })
   if ($Refresh) {
     if (-not $changed) { Write-Host 'scheduled tasks already match the installed copy' }

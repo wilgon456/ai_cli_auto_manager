@@ -475,6 +475,48 @@ function Get-AicmTask([string]$Name) {
   return (Get-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $Name -ErrorAction SilentlyContinue)
 }
 
+# Registry keys that turn Windows Script Host off (value Enabled = 0); the tasks normally start
+# through wscript.exe, so they cannot run then. AICM_WSH_KEYS (paths separated by ';') replaces the
+# two real keys in tests.
+function Get-AicmWshDisabled {
+  $keys = if ($env:AICM_WSH_KEYS) { $env:AICM_WSH_KEYS -split ';' } else {
+    @('HKCU:\Software\Microsoft\Windows Script Host\Settings', 'HKLM:\Software\Microsoft\Windows Script Host\Settings')
+  }
+  foreach ($k in $keys) {
+    if (-not $k) { continue }
+    $v = $null
+    try { $v = (Get-ItemProperty -LiteralPath $k -Name 'Enabled' -ErrorAction Stop).Enabled } catch { continue }
+    if ("$v".Trim() -eq '0') { $k }
+  }
+}
+
+# A registered task that cannot do its work: turned off, pointing at a file that is gone, or failed
+# on its last run. Result codes 0x41301 (running), 0x41303 (has not run yet) and 0x41325 (queued) are
+# not failures. Exit code 1 is the job reporting its own failure, which it already notified, so it is
+# only reported when the job did not get as far as writing its state file.
+function Get-AicmTaskProblems($Task, [string]$Job) {
+  if ($Task.State -eq 'Disabled') {
+    "scheduled task '$Job' is disabled; enable it in Task Scheduler or run: aicm.ps1 schedule install"
+  }
+  foreach ($a in @($Task.Actions)) {
+    $files = @([regex]::Matches([string]$a.Arguments, '"([^"]+\.(?:ps1|vbs))"') | ForEach-Object { $_.Groups[1].Value })
+    if ($a.Execute -and [System.IO.Path]::IsPathRooted([string]$a.Execute)) { $files += [string]$a.Execute }
+    foreach ($f in $files) {
+      if (-not (Test-Path -LiteralPath $f)) { "scheduled task '$Job' starts $f, which does not exist; run: aicm.ps1 schedule install"; break }
+    }
+  }
+  $info = $null
+  try { $info = $Task | Get-ScheduledTaskInfo -ErrorAction Stop } catch { return }
+  $code = [int64]$info.LastTaskResult
+  if ($code -in @(0, 0x41301, 0x41303, 0x41325)) { return }
+  if ($code -eq 1) {
+    $stateName = @{ Update = 'last-update'; Inventory = 'inventory'; Clean = 'last-clean' }[$Job]
+    $state = if ($stateName) { Read-AicmState $stateName } else { $null }
+    try { if ($state -and [datetime]::Parse($state.finishedAt) -ge $info.LastRunTime.AddMinutes(-1)) { return } } catch { }
+  }
+  "scheduled task '$Job' failed on its last run (result 0x{0:X}); see {1}" -f $code, (Join-Path (Get-AicmHome) 'logs')
+}
+
 # Checks that every scheduled job recorded at install time still exists.
 # Returns a list of human-readable problems (empty when healthy).
 # Also flags a job that is registered but has not completed for too long (its script is gone, it keeps
@@ -486,12 +528,20 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
   $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9) }
   $installedDays = 0
   try { $installedDays = ((Get-Date).ToUniversalTime() - [datetime]::Parse($sched.installedAt).ToUniversalTime()).TotalDays } catch { }
+  $launcher = if ($sched.PSObject.Properties['launcher']) { [string]$sched.launcher } else { 'wscript' }
+  if ($launcher -eq 'wscript') {
+    foreach ($k in @(Get-AicmWshDisabled)) {
+      $problems.Add("Windows Script Host is turned off ($k = 0), so the scheduled tasks cannot start; run: aicm.ps1 schedule install (it then starts them through PowerShell)")
+    }
+  }
   foreach ($job in @($sched.jobs)) {
     if ($job -eq $Skip) { continue }
-    if (-not (Get-AicmTask $job)) {
+    $task = Get-AicmTask $job
+    if (-not $task) {
       $problems.Add("scheduled task '$job' is missing; run: aicm.ps1 schedule install")
       continue
     }
+    foreach ($p in @(Get-AicmTaskProblems $task $job)) { $problems.Add($p) }
     if ($NoStale -or -not $limits.ContainsKey($job)) { continue }
     $state = Read-AicmState $limits[$job][0]
     $days = [double]::PositiveInfinity

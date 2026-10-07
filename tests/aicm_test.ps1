@@ -9,6 +9,7 @@ $fakeHome = Join-Path $work 'home'
 $aicmHome = Join-Path $fakeHome '.ai-cli-auto-manager'
 $folderName = 'AICM Test ' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $taskPath = "\$folderName\"
+$wshKey = 'HKCU:\Software\AICM Test WSH ' + [guid]::NewGuid().ToString('N')
 $script:fails = 0
 
 function Pass([string]$m) { Write-Host "ok   - $m" }
@@ -147,6 +148,41 @@ try {
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 0) { Pass 'doctor healthy after runs' } else { Fail "doctor after runs: $($r.Output)" }
 
+  # A registered task that cannot work: turned off, its script gone, or its last run failed.
+  Disable-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' | Out-Null
+  $r = Invoke-Aicm @('doctor')
+  if ($r.ExitCode -eq 1 -and $r.Output -match "'Inventory' is disabled") { Pass 'doctor notices a disabled task' } else { Fail "disabled task: $($r.Output)" }
+  Enable-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' | Out-Null
+  $vbsFile = "$aicmHome\app\windows\run-hidden.vbs"
+  Rename-Item -LiteralPath $vbsFile -NewName 'run-hidden.vbs.away'
+  $r = Invoke-Aicm @('doctor')
+  if ($r.ExitCode -eq 1 -and $r.Output -match "'Update' starts .*run-hidden\.vbs, which does not exist") { Pass 'doctor notices a task whose file is gone' } else { Fail "missing file: $($r.Output)" }
+  Rename-Item -LiteralPath "$vbsFile.away" -NewName 'run-hidden.vbs'
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 5') | Out-Null
+  Start-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory'
+  $deadline = (Get-Date).AddSeconds(60)
+  while ((Get-Date) -lt $deadline -and (Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName 'Inventory').LastTaskResult -ne 5) { Start-Sleep -Milliseconds 250 }
+  $r = Invoke-Aicm @('doctor')
+  if ($r.ExitCode -eq 1 -and $r.Output -match "'Inventory' failed on its last run \(result 0x5\)") { Pass 'doctor notices a task whose last run failed' } else { Fail "failed run: $($r.Output)" }
+  $null = Invoke-Aicm @('schedule', 'refresh')
+
+  # Windows Script Host turned off: the doctor says so, and install falls back to PowerShell.
+  New-Item -Path $wshKey -Force | Out-Null
+  New-ItemProperty -Path $wshKey -Name 'Enabled' -Value '0' -PropertyType String -Force | Out-Null
+  $env:AICM_WSH_KEYS = $wshKey
+  try {
+    $r = Invoke-Aicm @('doctor')
+    if ($r.ExitCode -eq 1 -and $r.Output -match 'Windows Script Host is turned off') { Pass 'doctor notices Windows Script Host turned off' } else { Fail "wsh off: $($r.Output)" }
+  } finally { Remove-Item Env:\AICM_WSH_KEYS }
+  $env:AICM_WSCRIPT_EXE = Join-Path $work 'no-such-wscript.exe'
+  try { $r = Invoke-Aicm $installArgs } finally { Remove-Item Env:\AICM_WSCRIPT_EXE }
+  $u = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
+  $s = Get-Content -LiteralPath "$aicmHome\state\schedule.json" -Raw | ConvertFrom-Json
+  if ($u.Actions[0].Execute -eq 'powershell.exe' -and $u.Actions[0].Arguments -match '^-WindowStyle Hidden .*-File ".*\\bin\\update_ai_clis\.ps1"' -and $s.launcher -eq 'powershell') { Pass 'install falls back to PowerShell when wscript cannot run' } else { Fail "fallback: $($u.Actions[0].Execute) $($u.Actions[0].Arguments) / $($r.Output)" }
+  $r = Invoke-Aicm $installArgs
+  $u = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
+  if ($u.Actions[0].Execute -eq 'wscript.exe' -and $u.Actions[0].Arguments -like '//B //Nologo *') { Pass 'install goes back to wscript (batch mode) when it works' } else { Fail "wscript again: $($u.Actions[0].Arguments)" }
+
   # Someone deletes the cleanup task: doctor and the next update run must notice.
   Unregister-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -Confirm:$false
   $r = Invoke-Aicm @('doctor')
@@ -206,6 +242,7 @@ try {
     $svc.Connect()
     $svc.GetFolder('\').DeleteFolder($folderName, 0)
   } catch { }
+  Remove-Item -LiteralPath $wshKey -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
