@@ -23,11 +23,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCK_DIR="${LOCK_DIR:-$(aicm_temp_dir)/ai-cli-auto-manager-update-$(id -u).lockdir}"
 LOG_DIR="${LOG_DIR:-$AICM_HOME/logs}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
-BREW="${BREW:-$(command -v brew 2>/dev/null || echo /usr/local/bin/brew)}"
-NPM="${NPM:-$(command -v npm 2>/dev/null || echo /usr/local/bin/npm)}"
 AI_CLI_TARGETS="${AI_CLI_TARGETS:-all}"
 INSTALL_MISSING="${INSTALL_MISSING:-false}"
 PATH="/usr/local/bin:/opt/homebrew/bin:${HOME:-}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+# Resolved after PATH is widened: cron and launchd start with a minimal PATH.
+BREW="${BREW:-$(command -v brew 2>/dev/null || echo /usr/local/bin/brew)}"
+NPM="${NPM:-$(command -v npm 2>/dev/null || echo /usr/local/bin/npm)}"
+AICM_NPM_CMD="$NPM"
+# Upper limit for one install, upgrade or brew update (seconds). A postinstall that hangs on the
+# network would otherwise hold the lock, and every later run would exit as "already active".
+INSTALL_TIMEOUT_SECONDS="${AICM_INSTALL_TIMEOUT_SECONDS:-1800}"
+[[ "$INSTALL_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && ((INSTALL_TIMEOUT_SECONDS > 0)) || INSTALL_TIMEOUT_SECONDS=1800
+STUCK_HOURS=3
 DRY_RUN=false
 VERSION_TEXT=""
 SCHEDULED=false
@@ -124,35 +131,91 @@ PY
   fi
 }
 
+# The selected targets, normalized (no spaces, sorted, no duplicates): "all" or e.g. "claude,codex".
+run_targets() {
+  local t list
+  list="$(printf '%s' "${AI_CLI_TARGETS//[[:space:]]/}" | tr ',' '\n' | awk 'NF' | sort -u | paste -sd ',' -)"
+  t=",$list,"
+  if [[ -z "$list" || "$t" == *,all,* ]]; then echo all; else echo "$list"; fi
+}
+
+# A scheduled retry has nothing to do when the last run finished today (local calendar day) without
+# failures or pending work and covered every target of this run. A partial manual run
+# (aicm update --targets claude) therefore does not stop the full scheduled run.
+done_today() {
+  local file="$AICM_HOME/state/last-update.json" state day done want t
+  [[ -f "$file" ]] || return 1
+  state="$(cat "$file")"
+  [[ "$state" == *'"ok":true'* && "$state" != *'"pending":true'* ]] || return 1
+  day="$(printf '%s' "$state" | sed -n 's/.*"localDate":"\([0-9-]*\)".*/\1/p')"
+  [[ -n "$day" && "$day" == "$(date +%Y-%m-%d)" ]] || return 1
+  done="$(printf '%s' "$state" | sed -n 's/.*"targets":"\([^"]*\)".*/\1/p')"
+  [[ -n "$done" ]] || return 1
+  [[ ",$done," == *,all,* ]] && return 0
+  want="$(run_targets)"
+  [[ "$want" == all ]] && return 1
+  for t in ${want//,/ }; do [[ ",$done," == *",$t,"* ]] || return 1; done
+  return 0
+}
+
+# Another run holds the lock. When it started more than STUCK_HOURS ago it is probably stuck (a
+# postinstall waiting on the network, say), and it blocks every later run; say so instead of exiting quietly.
+check_stuck_run() {
+  local started now
+  started="$(cat "$LOCK_DIR/started" 2>/dev/null || true)"
+  [[ "$started" =~ ^[0-9]+$ ]] || return 0
+  now="$(date +%s)"
+  ((now - started >= STUCK_HOURS * 3600)) || return 0
+  echo "the run holding the lock (pid $(cat "$LOCK_DIR/pid" 2>/dev/null || echo '?')) started $(((now - started) / 3600)) hours ago"
+  aicm_attention update-stuck "the daily update has been running for more than $STUCK_HOURS hours and blocks the next runs; if it is stuck, end it (its pid is in $LOCK_DIR/pid) and run 'aicm update'"
+}
+
+# cron and launchd append this script's output to these files; nothing else trims them. They are
+# trimmed in place (not replaced): the scheduler keeps the file open for appending.
+trim_schedule_logs() {
+  local f lines bytes
+  for f in "$AICM_HOME/logs/cron.update.log" "$AICM_HOME/logs/launchd.update.out.log" "$AICM_HOME/logs/launchd.update.err.log"; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    lines="$(wc -l < "$f" | tr -d ' ')"; bytes="$(wc -c < "$f" | tr -d ' ')"
+    if ((lines > 4000 || bytes > 5242880)); then
+      tail -n 2000 "$f" > "$f.$$.tmp" && cat "$f.$$.tmp" > "$f"
+      rm -f "$f.$$.tmp"
+      echo "trimmed $f to its last 2000 lines"
+    fi
+  done
+}
+
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/update-$(date +%Y%m%d-%H%M%S).log"
 LATEST_LOG="$LOG_DIR/latest.log"
 
+# Runs that do nothing (lock held, already done today) write no log file: a retry must not replace
+# latest.log with one line.
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   if [[ -f "$LOCK_DIR/pid" ]] && kill -0 "$(cat "$LOCK_DIR/pid" 2>/dev/null)" 2>/dev/null; then
-    echo "[$(ts)] another update run is already active" | tee -a "$LOG_FILE"
+    echo "[$(ts)] another update run is already active"
+    check_stuck_run
     exit 0
   fi
-  echo "[$(ts)] removing stale lock: $LOCK_DIR" | tee -a "$LOG_FILE"
-  rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+  echo "[$(ts)] removing stale lock: $LOCK_DIR"
+  rm -f "$LOCK_DIR/pid" "$LOCK_DIR/started" 2>/dev/null || true
   rmdir "$LOCK_DIR" 2>/dev/null || true
   if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo "[$(ts)] another update run is already active" | tee -a "$LOG_FILE"
+    echo "[$(ts)] another update run is already active"
     exit 0
   fi
 fi
 printf '%s\n' "$$" > "$LOCK_DIR/pid"
-trap 'rm -f "$LOCK_DIR/pid" 2>/dev/null || true; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+date +%s > "$LOCK_DIR/started"
+trap 'rm -f "$LOCK_DIR/pid" "$LOCK_DIR/started" 2>/dev/null || true; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+[[ -s "$AICM_HOME/state/attention-update-stuck.tsv" ]] && aicm_attention update-stuck
 
 # The scheduled job retries during the day; after a complete success today there is nothing to do.
-if [[ "$SCHEDULED" == true && "$DRY_RUN" != true && -f "$AICM_HOME/state/last-update.json" ]]; then
-  last_state="$(cat "$AICM_HOME/state/last-update.json")"
-  last_day="$(printf '%s' "$last_state" | sed -n 's/.*"finishedAt":"\([0-9-]*\)T.*/\1/p')"
-  if [[ "$last_state" == *'"ok":true'* && "$last_state" != *'"pending":true'* && "$last_day" == "$(date -u +%Y-%m-%d)" ]]; then
-    echo "[$(ts)] already updated today; nothing to retry" | tee -a "$LOG_FILE"
-    exit 0
-  fi
+if [[ "$SCHEDULED" == true && "$DRY_RUN" != true ]] && done_today; then
+  echo "[$(ts)] already updated today; nothing to retry"
+  exit 0
 fi
+[[ "$DRY_RUN" != true ]] && trim_schedule_logs
 
 # Mirror all output to a timestamped log and latest.log.
 : > "$LATEST_LOG"
@@ -312,26 +375,26 @@ update_brew_package() {
   local name="$1"
   local outdated rc
   if is_brew_cask_installed "$name"; then
-    outdated="$("$BREW" outdated --cask "$name" 2>&1)"
+    outdated="$(aicm_timeout 300 "$BREW" outdated --cask "$name" 2>&1)"
     rc=$?
     if ((rc != 0)) && [[ "$outdated" != *"$name"* ]]; then
       echo "$outdated"
       return "$rc"
     fi
     if [[ -n "$outdated" ]]; then
-      "$BREW" upgrade --cask "$name"
+      aicm_timeout "$INSTALL_TIMEOUT_SECONDS" "$BREW" upgrade --cask "$name"
     else
       echo "brew cask already up-to-date: $name"
     fi
   elif is_brew_formula_installed "$name"; then
-    outdated="$("$BREW" outdated --formula "$name" 2>&1)"
+    outdated="$(aicm_timeout 300 "$BREW" outdated --formula "$name" 2>&1)"
     rc=$?
     if ((rc != 0)) && [[ "$outdated" != *"$name"* ]]; then
       echo "$outdated"
       return "$rc"
     fi
     if [[ -n "$outdated" ]]; then
-      "$BREW" upgrade --formula "$name"
+      aicm_timeout "$INSTALL_TIMEOUT_SECONDS" "$BREW" upgrade --formula "$name"
     else
       echo "brew formula already up-to-date: $name"
     fi
@@ -359,12 +422,29 @@ registry_ok() {
   [[ "$REGISTRY_OK" == yes ]]
 }
 
+# npm packages this run looked after ("pkg" lines) and those known from earlier runs that are still
+# installed ("pkg<TAB>version" lines); written to state/update-npm.tsv at the end.
+MANAGED_NPM=""
+KNOWN_NPM=""
+NPM_STATE="$AICM_HOME/state/update-npm.tsv"
+remember_npm() { [[ $'\n'"$MANAGED_NPM" == *$'\n'"$1"$'\n'* ]] || MANAGED_NPM+="$1"$'\n'; }
+
+# The real install. --before applies the waiting period to the dependencies too; the time limit keeps a
+# postinstall that hangs on the network from holding the lock forever.
+npm_global_install() { # spec [extra args]
+  local rc=0
+  aicm_timeout "$INSTALL_TIMEOUT_SECONDS" "$NPM" install -g "$@" || rc=$?
+  ((rc == 124)) && echo "npm install $1 did not finish within ${INSTALL_TIMEOUT_SECONDS}s and was stopped"
+  return "$rc"
+}
+
 update_npm_package() {
-  local pkg="$1" installed target
+  local pkg="$1" installed target before
   if ! registry_ok; then PENDING=true; return 0; fi
   if is_npm_global_installed "$pkg"; then
+    remember_npm "$pkg"
     installed="$(npm_installed_version "$pkg")"
-    target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS")" || { echo "could not read the release list of $pkg"; return 1; }
+    target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS" "$installed" skip-deprecated)" || { echo "could not read the release list of $pkg"; return 1; }
     if [[ -z "$target" ]]; then
       echo "hold: no release of $pkg is $MIN_RELEASE_AGE_DAYS days old yet"
       return 0
@@ -374,20 +454,64 @@ update_npm_package() {
       return 0
     fi
     echo "candidate: $pkg $installed -> $target"
-    aicm_npm_check "$pkg" "$installed" "$target" || return 1
-    "$NPM" install -g "$pkg@$target"
+    aicm_npm_check "$pkg" "$installed" "$target" "$MIN_RELEASE_AGE_DAYS" || return 1
+    before="$(aicm_npm_before "$MIN_RELEASE_AGE_DAYS")"
+    npm_global_install "$pkg@$target" ${before:+"$before"}
   else
     echo "npm global package not installed: $pkg"
   fi
 }
 
 install_npm_package() {
-  local pkg="$1" target
+  local pkg="$1" target before
   command -v "$NPM" >/dev/null 2>&1 || { echo "npm is not installed"; return 1; }
-  target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS")" || { echo "could not read the release list of $pkg"; return 1; }
+  remember_npm "$pkg"
+  target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS" "" skip-deprecated)" || { echo "could not read the release list of $pkg"; return 1; }
   [[ -n "$target" ]] || { echo "hold: no release of $pkg is $MIN_RELEASE_AGE_DAYS days old yet"; return 0; }
-  aicm_npm_check "$pkg" "" "$target" || return 1
-  "$NPM" install -g "$pkg@$target"
+  aicm_npm_check "$pkg" "" "$target" "$MIN_RELEASE_AGE_DAYS" || return 1
+  before="$(aicm_npm_before "$MIN_RELEASE_AGE_DAYS")"
+  npm_global_install "$pkg@$target" ${before:+"$before"}
+}
+
+# npm CLIs this updater managed before. One that is gone now was either removed on purpose or lost to
+# an interrupted install (npm moved it to a backup folder .<name>-XXXXXXXX and never finished). With
+# such a backup it is reinstalled at the same version; otherwise it is reported once and forgotten,
+# so an intentional uninstall is not fought every day.
+restore_missing_npm() {
+  local pkg version backup
+  [[ -f "$NPM_STATE" ]] && command -v "$NPM" >/dev/null 2>&1 || return 0
+  while IFS=$'\t' read -r pkg version; do
+    [[ -n "$pkg" ]] || continue
+    if [[ -n "$(aicm_npm_pkg_version "$pkg")" ]]; then KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'; continue; fi
+    echo
+    echo "== missing npm CLI: $pkg =="
+    if ! backup="$(aicm_npm_backup "$pkg")"; then
+      echo "fail: $pkg ($version) was installed at the last update and is gone now"
+      failures+=("$pkg disappeared since the last update; reinstall it with 'npm install -g $pkg@$version', or ignore this if you removed it rc=1")
+      continue
+    fi
+    echo "found npm's backup of an interrupted install: $backup"
+    KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+    if ! registry_ok; then PENDING=true; continue; fi
+    if npm_global_install "$pkg@$version"; then
+      echo "restored: $pkg $version"
+    else
+      failures+=("$pkg was lost by an interrupted install and could not be reinstalled; run 'npm install -g $pkg@$version' rc=1")
+    fi
+  done < "$NPM_STATE"
+  return 0
+}
+
+save_npm_state() {
+  local out="$KNOWN_NPM" pkg version
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    version="$(aicm_npm_pkg_version "$pkg")"
+    [[ -n "$version" ]] || continue
+    out="$(printf '%s' "$out" | awk -F '\t' -v p="$pkg" '$1 != p')"$'\n'"$pkg"$'\t'"$version"$'\n'
+  done <<< "$MANAGED_NPM"
+  mkdir -p "$AICM_HOME/state"
+  printf '%s' "$out" | awk 'NF' > "$NPM_STATE.$$.tmp" && mv -f "$NPM_STATE.$$.tmp" "$NPM_STATE"
 }
 
 update_agy_cli() {
@@ -450,6 +574,9 @@ update_opencode_cli() {
   fi
 }
 
+# Limitation: the vendor updaters (claude update, opencode upgrade, agy update, brew, catalog
+# self-updates) and the Grok installer install whatever their vendor serves; the npm waiting period
+# and release checks cannot be applied to them. Only the Grok installer is gated (see update_grok_cli).
 install_or_update_grok_cli() {
   command -v curl >/dev/null 2>&1 || { echo "curl is not installed"; return 1; }
   command_with_timeout 300 bash -c 'curl -fsSL https://x.ai/cli/install.sh | bash'
@@ -459,14 +586,29 @@ update_grok_cli() {
   if command -v grok >/dev/null 2>&1 && active_path_contains grok "/node_modules/" && is_npm_global_installed "@xai-official/grok"; then
     update_npm_package "@xai-official/grok"
   elif command -v grok >/dev/null 2>&1; then
-    # The vendor installer is a remote script; run it only when a newer release (past the waiting
-    # period) exists. The npm package carries the same version numbers.
-    if command -v "$NPM" >/dev/null 2>&1 && registry_ok; then
-      local have want
-      have="$(aicm_timeout 15 grok --version 2>&1 | aicm_semver || true)"
-      want="$(aicm_npm_target "@xai-official/grok" "$MIN_RELEASE_AGE_DAYS" || true)"
-      if [[ -n "$have" ]] && { [[ -z "$want" ]] || ! aicm_version_older "$have" "$want"; }; then
-        echo "already current: grok $have (newest release at least $MIN_RELEASE_AGE_DAYS days old: $want)"
+    # The vendor installer is a remote script that always installs the newest release. Run it only when
+    # the installed version is known, a newer release exists, and that newest release is itself past
+    # the waiting period. The npm package carries the same version numbers and publish dates.
+    local have want newest
+    have="$(aicm_timeout 15 grok --version 2>&1 | aicm_semver || true)"
+    if [[ -z "$have" ]]; then
+      echo "skip: cannot read the installed grok version, so the installer is not run unattended; update it by hand"
+      return 0
+    fi
+    if ! command -v "$NPM" >/dev/null 2>&1; then
+      echo "skip: npm is needed to look up Grok release dates; the installer is not run unattended. Update grok by hand"
+      return 0
+    fi
+    if ! registry_ok; then PENDING=true; return 0; fi
+    want="$(aicm_npm_target "@xai-official/grok" "$MIN_RELEASE_AGE_DAYS" || true)"
+    if [[ -z "$want" ]] || ! aicm_version_older "$have" "$want"; then
+      echo "already current: grok $have (newest release at least $MIN_RELEASE_AGE_DAYS days old: $want)"
+      return 0
+    fi
+    if ((MIN_RELEASE_AGE_DAYS > 0)); then
+      newest="$(AICM_NPM_TIMEOUT=60 aicm_npm view "@xai-official/grok" version 2>/dev/null | aicm_semver || true)"
+      if [[ -n "$newest" && "$newest" != "$want" ]]; then
+        echo "hold: grok $want is old enough, but the installer would install $newest, which is still in its $MIN_RELEASE_AGE_DAYS-day waiting period"
         return 0
       fi
     fi
@@ -541,6 +683,7 @@ update_kimi_cli() {
 echo "[$(ts)] AI CLI update started"
 echo "host=$(hostname) user=$(id -un) dry_run=$DRY_RUN targets=$AI_CLI_TARGETS install_missing=$INSTALL_MISSING min_release_age_days=$MIN_RELEASE_AGE_DAYS"
 cleanup_old_logs
+[[ "$DRY_RUN" != true ]] && restore_missing_npm
 collect_catalog_extras
 
 echo
@@ -555,7 +698,7 @@ for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx
 
 if command -v "$BREW" >/dev/null 2>&1; then
   if { gpt_target_enabled && { is_brew_cask_installed codex || is_brew_formula_installed codex; }; } || { target_enabled opencode && { is_brew_cask_installed opencode || is_brew_formula_installed opencode; }; } || { target_enabled claude && { is_brew_cask_installed claude-code || is_brew_formula_installed claude-code; }; }; then
-    run_step "brew update" "$BREW" update
+    run_step "brew update" aicm_timeout "$INSTALL_TIMEOUT_SECONDS" "$BREW" update
   else
     echo "pass: no target Homebrew-managed CLIs installed; skipping brew update"
   fi
@@ -664,14 +807,17 @@ fi
 
 if [[ "$DRY_RUN" != "true" ]]; then
   update_ok=true; [[ -z "$failure_summary" ]] || update_ok=false
+  # npm CLIs looked after: the next run reports one that disappears (see restore_missing_npm).
+  save_npm_state
   aicm_npm_leftovers
   aicm_update_app_copy
-  aicm_state_write last-update "{\"finishedAt\":\"$(ts)\",\"version\":\"$(aicm_version)\",\"ok\":$update_ok,\"pending\":$PENDING,\"failures\":\"$(aicm_json_escape "$failure_summary")\",\"logFile\":\"$(aicm_json_escape "$LOG_FILE")\"}"
+  aicm_state_write last-update "{\"finishedAt\":\"$(ts)\",\"localDate\":\"$(date +%Y-%m-%d)\",\"targets\":\"$(aicm_json_escape "$(run_targets)")\",\"version\":\"$(aicm_version)\",\"ok\":$update_ok,\"pending\":$PENDING,\"failures\":\"$(aicm_json_escape "$failure_summary")\",\"logFile\":\"$(aicm_json_escape "$LOG_FILE")\"}"
   notes=()
   # The step name without its exit code, so the same failure keeps the same key from day to day.
   if ((${#failures[@]})); then for f in "${failures[@]}"; do notes+=("update failed: ${f% rc=*}"); done; fi
   if ((${#version_failures[@]})); then for f in "${version_failures[@]}"; do notes+=("update failed: $f"); done; fi
   if ((${#problems[@]})); then notes+=("${problems[@]}"); fi
+  if ((${#AICM_NPM_NOTES[@]})); then notes+=("${AICM_NPM_NOTES[@]}"); fi
   aicm_attention update ${notes[@]+"${notes[@]}"}
 fi
 

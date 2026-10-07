@@ -18,6 +18,8 @@ $script:fails = 0
 
 function Pass([string]$m) { Write-Host "ok   - $m" }
 function Fail([string]$m) { Write-Host "FAIL - $m"; $script:fails++ }
+# PowerShell 7 reads "2026-10-07" from JSON as a DateTime; Windows PowerShell keeps the string.
+function ConvertTo-TestDay($v) { if ($v -is [datetime]) { return $v.ToString('yyyy-MM-dd') } return [string]$v }
 function Get-Calls { if (Test-Path -LiteralPath "$work\npm-calls.log") { return @(Get-Content -LiteralPath "$work\npm-calls.log") } return @() }
 
 $fakeEnv = @{ FAKE_NPM_DIR = $work; FAKE_NPM_PREFIX = $prefix; FAKE_NPM_ROOT = $npmRoot }
@@ -136,6 +138,8 @@ try {
   if ($r.ExitCode -eq 0) { Pass 'update exits 0' } else { Fail "update exit $($r.ExitCode)" }
   if ((Get-Calls) -contains 'install -g @fake/npmcli@1.1.0') { Pass 'installs the newest release at least 3 days old (1.1.0, not 1.2.0)' } else { Fail "waiting period: $(Get-Calls)" }
   if ((Get-Calls) -contains 'stage @fake/npmcli@1.1.0 --ignore-scripts') { Pass 'staged without running install scripts' } else { Fail 'staged install' }
+  $before = @(Get-Content -LiteralPath "$work\npm-before.log" -ErrorAction SilentlyContinue)
+  if (@($before | Where-Object { $_ -match '^install -g @fake/npmcli@1\.1\.0 before=\d{4}-' }).Count -eq 1 -and @($before | Where-Object { $_ -match '^stage @fake/npmcli@1\.1\.0 before=\d{4}-' }).Count -eq 1) { Pass 'staged and real install pass --before (waiting period for dependencies)' } else { Fail "--before: $before" }
   if ($r.Output -match 'signatures ok') { Pass 'signature check ran' } else { Fail 'signature check' }
   if (Test-Path -LiteralPath "$work\solo-upgrades.log") { Pass 'standalone CLI self-updated' } else { Fail 'self-update not run' }
   if ($r.Output -match 'pass: Fake Shadow is installed standalone') { Pass 'no updater: reported, not failed' } else { Fail 'shadow handling' }
@@ -145,6 +149,9 @@ try {
   if ($r.Output -match 'already current: @fake/npmcli 1\.1\.0') { Pass 'nothing newer than the waiting period: not reinstalled' } else { Fail "reinstalled: $($r.Output)" }
   if (@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count -eq 1) { Pass 'post-update hook ran once: only the run that changed a version' } else { Fail "hook runs: $(@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count)" }
   if ($r.Output -match 'post-update hook skipped: no CLI version changed') { Pass 'hook skipped when nothing changed' } else { Fail 'hook skip message' }
+  # npm with an old .npmrc setting prints a warning on stderr; the JSON it prints must still parse.
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm') @{ FAKE_NPM_WARN = '1' }
+  if ($r.ExitCode -eq 0 -and $r.Output -match 'already current: @fake/npmcli 1\.1\.0') { Pass 'npm warnings on stderr do not break the JSON' } else { Fail "npm warning: exit $($r.ExitCode) $($r.Output)" }
   $r = Invoke-Script 'bin\inventory_ai_clis.ps1' $inv
   if ($r.Output -match '(?m)^Fake NPM +npm +1\.1\.0 +1\.2\.0 +held +yes') { Pass 'inventory shows a release in its waiting period as held' } else { Fail "held state: $($r.Output)" }
 
@@ -164,6 +171,8 @@ try {
   $r = Invoke-Script $upd @('-Targets', 'fakebadsig')
   if ($r.ExitCode -ne 0 -and $r.Output -match 'signature check failed for @fake/badsig@1\.1\.0') { Pass 'bad registry signature blocks the update' } else { Fail "bad signature: $($r.Output)" }
   if ((Get-Calls) -notcontains 'install -g @fake/badsig@1.1.0') { Pass 'release with a bad signature not installed' } else { Fail 'bad signature installed' }
+  $r = Invoke-Script $upd @('-Targets', 'fakebadsig')
+  if ($r.ExitCode -ne 0 -and $r.Output -match 'checked earlier today' -and @(Get-Calls | Where-Object { $_ -eq 'stage @fake/badsig@1.1.0 --ignore-scripts' }).Count -eq 1) { Pass 'a bad signature verdict is kept for the day: no second download' } else { Fail "verdict cache: $($r.Output)" }
 
   Write-Host '# install-missing only when named'
   $null = Invoke-Script $upd @('-Targets', 'fakenpm', '-InstallMissing')
@@ -206,7 +215,7 @@ try {
   $old = (Get-Date).ToUniversalTime().AddDays(-6).ToString('o')
   "{`"@fake/npmcli`":`"$old`"}" | Set-Content -LiteralPath "$aicmHome\state\update-deferred.json" -Encoding ASCII
   $r = Invoke-Script $upd @('-Targets', 'fakenpm')
-  if ($r.Output -match 'notify: .*@fake/npmcli has not been updated for 6 days') { Pass 'reminder after 5+ days of deferral' } else { Fail "reminder: $($r.Output)" }
+  if ($r.Output -match 'notify: .*@fake/npmcli has not been updated for more than 5 days') { Pass 'reminder after 5+ days of deferral' } else { Fail "reminder: $($r.Output)" }
   $r = Invoke-Script $upd @('-Targets', 'fakenpm')
   if ($r.Output -notmatch 'notify:') { Pass 'the same reminder is not repeated the next day' } else { Fail 'reminder repeated' }
 
@@ -215,13 +224,26 @@ try {
   New-Item -ItemType Directory -Path (Join-Path $npmRoot '@fake\.npmcli-AbCd1234') -Force | Out-Null
   'x' | Set-Content -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-AbCd1234\stale.txt')
   (Get-Item -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-AbCd1234')).LastWriteTime = (Get-Date).AddDays(-3)
+  # A leftover whose package is not installed may be the only copy of an interrupted install: kept.
+  New-Item -ItemType Directory -Path (Join-Path $npmRoot '@fake\.gonecli-AbCd1234') -Force | Out-Null
+  '{"name":"@fake/gonecli","version":"1.0.0"}' | Set-Content -LiteralPath (Join-Path $npmRoot '@fake\.gonecli-AbCd1234\package.json')
+  (Get-Item -LiteralPath (Join-Path $npmRoot '@fake\.gonecli-AbCd1234')).LastWriteTime = (Get-Date).AddDays(-3)
   $r = Invoke-Script $upd @('-Targets', 'fakenpm', '-Scheduled')
   if ((Get-Calls) -contains 'install -g @fake/npmcli@1.3.0') { Pass 'scheduled retry installs once the CLI is free' } else { Fail "retry: $($r.Output)" }
   if (-not (Test-Path -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-AbCd1234'))) { Pass 'npm staging leftover removed' } else { Fail 'npm leftover kept' }
+  if ((Test-Path -LiteralPath (Join-Path $npmRoot '@fake\.gonecli-AbCd1234')) -and $r.Output -match 'kept npm leftover .*gonecli is not installed') { Pass 'leftover of a package that is not installed is kept' } else { Fail 'only copy removed' }
+  Remove-Item -LiteralPath (Join-Path $npmRoot '@fake\.gonecli-AbCd1234') -Recurse -Force
   $deferredNow = Get-Content -LiteralPath "$aicmHome\state\update-deferred.json" -Raw | ConvertFrom-Json
   if (@($deferredNow.PSObject.Properties).Count -eq 0) { Pass 'deferral cleared after the update' } else { Fail 'deferral not cleared' }
+  $last = Get-Content -LiteralPath "$aicmHome\state\last-update.json" -Raw | ConvertFrom-Json
+  if ((ConvertTo-TestDay $last.localDate) -eq (Get-Date).ToString('yyyy-MM-dd') -and $last.targets -eq 'fakenpm') { Pass 'state records the local date and the targets' } else { Fail "state: $($last | ConvertTo-Json -Compress)" }
+  $logsBefore = @(Get-ChildItem -LiteralPath "$aicmHome\logs" -Filter 'update-*.log').Count
+  $latestBefore = Get-Content -LiteralPath "$aicmHome\logs\latest.log" -Raw
   $r = Invoke-Script $upd @('-Targets', 'fakenpm', '-Scheduled')
   if ($r.Output -match 'already updated today') { Pass 'later scheduled run the same day exits at once' } else { Fail "early exit: $($r.Output)" }
+  if (@(Get-ChildItem -LiteralPath "$aicmHome\logs" -Filter 'update-*.log').Count -eq $logsBefore -and (Get-Content -LiteralPath "$aicmHome\logs\latest.log" -Raw) -eq $latestBefore) { Pass 'a retry with nothing to do writes no log and keeps latest.log' } else { Fail 'no-op retry touched the logs' }
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm,fakeshadow', '-Scheduled')
+  if ($r.Output -notmatch 'already updated today') { Pass 'a partial run does not count for a run with more targets' } else { Fail 'partial run counted as done' }
 
   Write-Host '# registry unreachable: skipped, not failed'
   $r = Invoke-Script $upd @('-Targets', 'fakenpm') @{ FAKE_NPM_OFFLINE = '1' }
@@ -229,6 +251,74 @@ try {
   if ($r.ExitCode -eq 0 -and $r.Output -match 'registry unreachable' -and $last.pending) { Pass 'offline run succeeds and stays pending' } else { Fail "offline: exit $($r.ExitCode) $($r.Output)" }
   $r = Invoke-Script $upd @('-Targets', 'fakenpm', '-Scheduled')
   if ($r.Output -notmatch 'already updated today') { Pass 'a pending day is retried by the scheduled run' } else { Fail 'pending day not retried' }
+
+  Write-Host '# a timeout ends the whole process tree'
+  # npm.cmd starts cmd.exe, which starts node; on timeout node must not keep running.
+  $marker = 'aicmtreekill' + [guid]::NewGuid().ToString('N')
+  "@node -e `"setTimeout(function(){}, 120000)`" $marker" | Set-Content -LiteralPath "$work\hang.cmd" -Encoding ASCII
+  $savedHome = $env:AICM_HOME
+  try {
+    $env:AICM_HOME = $aicmHome
+    . (Join-Path $root 'lib\aicm-common.ps1')
+    $t = Invoke-AicmWithTimeout "$work\hang.cmd" @() 3
+    $split = Invoke-AicmWithTimeout 'node' @('-e', 'console.log(1); console.error(2)') 30
+  } finally { $env:AICM_HOME = $savedHome }
+  Start-Sleep -Seconds 1
+  $left = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($marker) })
+  if ($t.ExitCode -eq 124 -and $left.Count -eq 0) { Pass 'timeout returns 124 and no grandchild survives' } else { Fail "tree kill: rc=$($t.ExitCode) left=$($left.Count)" }
+  foreach ($p in $left) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+  if ($split.StdOut.Trim() -eq '1' -and $split.StdErr.Trim() -eq '2' -and $split.Output -match '1' -and $split.Output -match '2') { Pass 'stdout and stderr are returned separately (and together in .Output)' } else { Fail "stream split: [$($split.StdOut)] [$($split.StdErr)]" }
+
+  Write-Host '# semver order'
+  $order = @(@('2.0.0-beta.3', '2.0.0', -1), @('2.0.0-beta.2', '2.0.0-beta.11', -1), @('2.0.0-alpha', '2.0.0-alpha.1', -1), @('1.2.0', '1.10.0', -1), @('1.0.0+build', '1.0.0', 0), @('2.0.0', '2.0.0-rc.1', 1))
+  $wrong = @($order | Where-Object { (Compare-AicmVersion $_[0] $_[1]) -ne $_[2] })
+  if ($wrong.Count -eq 0) { Pass 'a prerelease is older than its release' } else { Fail "compare: $($wrong | ForEach-Object { $_ -join ' ' })" }
+
+  Write-Host '# a run that holds the lock for hours is reported'
+  $env:AICM_HOME = $aicmHome
+  try { $held = [System.Threading.Mutex]::new($false, (Get-AicmLockName 'update')) } finally { $env:AICM_HOME = $savedHome }
+  [void]$held.WaitOne(0)
+  try {
+    "{`"startedAt`":`"$((Get-Date).ToUniversalTime().AddHours(-4).ToString('yyyy-MM-ddTHH:mm:ssZ'))`",`"pid`":1}" | Set-Content -LiteralPath "$aicmHome\state\update-running.json" -Encoding ASCII
+    $logsBefore = @(Get-ChildItem -LiteralPath "$aicmHome\logs" -Filter 'update-*.log').Count
+    $r = Invoke-Script $upd @('-Targets', 'fakeshadow', '-Scheduled')
+    if ($r.ExitCode -eq 0 -and $r.Output -match 'already active' -and $r.Output -match 'notify: .*running for more than 3 hours') { Pass 'lock held for 3+ hours raises a notification' } else { Fail "stuck run: $($r.Output)" }
+    if (@(Get-ChildItem -LiteralPath "$aicmHome\logs" -Filter 'update-*.log').Count -eq $logsBefore) { Pass 'a blocked run writes no log' } else { Fail 'blocked run wrote a log' }
+    $r = Invoke-Script $upd @('-Targets', 'fakeshadow', '-Scheduled')
+    if ($r.Output -notmatch 'notify:') { Pass 'the stuck-run notice is not repeated every retry' } else { Fail 'stuck notice repeated' }
+  } finally { $held.ReleaseMutex(); $held.Dispose() }
+  $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
+  if (-not (Test-Path -LiteralPath "$aicmHome\state\update-running.json") -and $r.Output -notmatch 'already active') { Pass 'lock and start time are released after a run' } else { Fail "running state left: $($r.Output)" }
+
+  Write-Host '# unpublished and deprecated releases are passed over; registries without signing keys'
+  $reg = Get-Content -LiteralPath "$work\registry.json" -Raw | ConvertFrom-Json
+  $reg | Add-Member -NotePropertyName '@fake/depcli' -NotePropertyValue ([pscustomobject]@{ latest = '1.2.0'; versions = [pscustomobject]@{
+    '1.0.0' = [pscustomobject]@{ daysAgo = 30 }; '1.1.0' = [pscustomobject]@{ daysAgo = 20 }
+    '1.2.0' = [pscustomobject]@{ daysAgo = 10; deprecated = 'broken, use 1.1.0' }; '1.3.0' = [pscustomobject]@{ daysAgo = 5; unpublished = $true } } })
+  $reg | Add-Member -NotePropertyName '@fake/nokeys' -NotePropertyValue ([pscustomobject]@{ latest = '1.1.0'; versions = [pscustomobject]@{
+    '1.0.0' = [pscustomobject]@{ daysAgo = 30 }; '1.1.0' = [pscustomobject]@{ daysAgo = 10; nokeys = $true } } })
+  $reg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$work\registry.json" -Encoding ASCII
+  New-NpmCli 'fakedep' '@fake/depcli' '1.0.0'
+  New-NpmCli 'fakenokeys' '@fake/nokeys' '1.0.0'
+  @('fakedep | fakedep | Fake Dep | @fake/depcli | | | |', 'fakenokeys | fakenokeys | Fake NoKeys | @fake/nokeys | | | |') | Add-Content -LiteralPath "$aicmHome\ai-clis.local.conf" -Encoding UTF8
+  $r = Invoke-Script $upd @('-Targets', 'fakedep')
+  if ((Get-Calls) -contains 'install -g @fake/depcli@1.1.0' -and $r.Output -match 'skip: @fake/depcli@1\.2\.0 is deprecated') { Pass 'deprecated and unpublished releases are skipped' } else { Fail "deprecated: $($r.Output)" }
+  $r = Invoke-Script $upd @('-Targets', 'fakenokeys')
+  if ($r.ExitCode -eq 0 -and (Get-Calls) -contains 'install -g @fake/nokeys@1.1.0' -and $r.Output -match 'notify: .*publishes no signing keys') { Pass 'registry without signing keys: warned, not failed' } else { Fail "no keys: exit $($r.ExitCode) $($r.Output)" }
+
+  Write-Host '# a CLI lost by an interrupted install'
+  $pkgDir = Join-Path $npmRoot '@fake\npmcli'
+  $wasVersion = (Get-Content -LiteralPath "$pkgDir\package.json" -Raw | ConvertFrom-Json).version
+  Rename-Item -LiteralPath $pkgDir -NewName '.npmcli-XyZw9876'
+  $installsBefore = @(Get-Calls | Where-Object { $_ -eq "install -g @fake/npmcli@$wasVersion" }).Count
+  $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
+  if ($r.ExitCode -eq 0 -and $r.Output -match "restored: @fake/npmcli $([regex]::Escape($wasVersion))" -and @(Get-Calls | Where-Object { $_ -eq "install -g @fake/npmcli@$wasVersion" }).Count -eq $installsBefore + 1) { Pass 'a CLI whose install was cut off is reinstalled at the same version' } else { Fail "restore: $($r.Output)" }
+  Remove-Item -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-XyZw9876') -Recurse -Force
+  Remove-Item -LiteralPath (Join-Path $npmRoot '@fake\newcli') -Recurse -Force
+  $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
+  if ($r.ExitCode -ne 0 -and $r.Output -match 'notify: .*@fake/newcli disappeared since the last update') { Pass 'a managed CLI that is gone is reported as a failure' } else { Fail "missing CLI: exit $($r.ExitCode) $($r.Output)" }
+  $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
+  if ($r.ExitCode -eq 0 -and $r.Output -notmatch 'disappeared') { Pass 'it is reported once, then forgotten (it may have been removed on purpose)' } else { Fail "missing CLI repeated: $($r.Output)" }
 
   Write-Host '# bad catalog'
   'Bad Id | x | x |  |  |  |  |' | Set-Content -LiteralPath "$work\bad.conf" -Encoding UTF8

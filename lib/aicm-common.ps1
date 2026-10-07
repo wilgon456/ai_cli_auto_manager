@@ -511,6 +511,20 @@ function Resolve-AicmExecutable([string]$Name) {
   return $path
 }
 
+# Ends a process and everything it started. npm.cmd runs cmd.exe, which runs node; killing only
+# cmd.exe would leave node (and a hanging postinstall) running.
+function Stop-AicmProcessTree([System.Diagnostics.Process]$Process) {
+  $ErrorActionPreference = 'Continue'
+  $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+  if ($env:SystemRoot -and (Test-Path -LiteralPath $taskkill)) {
+    try { & $taskkill /T /F /PID $Process.Id 2>&1 | Out-Null } catch { }
+  }
+  try { if (-not $Process.HasExited) { $Process.Kill() } } catch { }
+  try { [void]$Process.WaitForExit(5000) } catch { }
+}
+
+# Runs a command with a time limit. Returns .ExitCode (124 on timeout), .StdOut, .StdErr and .Output
+# (both streams together, for display). Parse .StdOut only: npm prints warnings on stderr.
 function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds) {
   $exe = Resolve-AicmExecutable $Name
   if (-not $exe) { throw "command not found: $Name" }
@@ -526,21 +540,18 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
     $process = Start-Process @startArgs
     # Touch the handle now; otherwise ExitCode stays empty after a timed WaitForExit.
     $null = $process.Handle
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-      try { $process.Kill() } catch { }
-      $partial = @(
-        Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
-        Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
-        "TIMEOUT after ${TimeoutSeconds}s"
-      ) -join ''
-      return [pscustomobject]@{ ExitCode = 124; Output = $partial }
+    $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+    if ($timedOut) { Stop-AicmProcessTree $process } else { $process.WaitForExit() }
+    # An empty file gives no value at all, which stays $null even through [string]; callers get ''.
+    $stdout = Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $stdout) { $stdout = '' }
+    $stderr = Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $stderr) { $stderr = '' }
+    if ($timedOut) {
+      $stderr += "TIMEOUT after ${TimeoutSeconds}s"
+      return [pscustomobject]@{ ExitCode = 124; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
     }
-    $process.WaitForExit()
-    $output = @(
-      Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
-      Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
-    ) -join ''
-    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $output }
+    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
   } finally {
     Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
   }
@@ -551,12 +562,39 @@ function Get-AicmSemver([string]$Text) {
   return ''
 }
 
-# 1 when $A is newer, -1 when older, 0 when equal or not comparable.
+# 1 when $A is newer, -1 when older, 0 when equal or not comparable. Semver order: the dotted numbers
+# first (missing parts count as 0), then a prerelease (2.0.0-beta.3) is older than its release (2.0.0);
+# two prereleases compare part by part, numbers numerically and below words. Build metadata (+x) is ignored.
 function Compare-AicmVersion([string]$A, [string]$B) {
   if (-not $A -or -not $B -or $A -eq $B) { return 0 }
-  $va = $null; $vb = $null
-  if ([version]::TryParse(($A -replace '[-+].*$', ''), [ref]$va) -and [version]::TryParse(($B -replace '[-+].*$', ''), [ref]$vb)) {
-    return $va.CompareTo($vb)
+  $pa = $A.Trim() -replace '\+.*$', ''
+  $pb = $B.Trim() -replace '\+.*$', ''
+  if ($pa -notmatch '^v?(\d+(\.\d+)*)(-(.+))?$') { return 0 }
+  $na = $Matches[1]; $ra = if ($Matches[4]) { $Matches[4] } else { '' }
+  if ($pb -notmatch '^v?(\d+(\.\d+)*)(-(.+))?$') { return 0 }
+  $nb = $Matches[1]; $rb = if ($Matches[4]) { $Matches[4] } else { '' }
+  $xa = @($na.Split('.')); $xb = @($nb.Split('.'))
+  $count = [Math]::Max($xa.Count, $xb.Count)
+  for ($i = 0; $i -lt $count; $i++) {
+    $ea = if ($i -lt $xa.Count) { [decimal]$xa[$i] } else { [decimal]0 }
+    $eb = if ($i -lt $xb.Count) { [decimal]$xb[$i] } else { [decimal]0 }
+    if ($ea -ne $eb) { if ($ea -gt $eb) { return 1 } else { return -1 } }
+  }
+  if ($ra -eq $rb) { return 0 }
+  if (-not $ra) { return 1 }
+  if (-not $rb) { return -1 }
+  $ia = @($ra.Split('.')); $ib = @($rb.Split('.'))
+  $count = [Math]::Max($ia.Count, $ib.Count)
+  for ($i = 0; $i -lt $count; $i++) {
+    if ($i -ge $ia.Count) { return -1 }
+    if ($i -ge $ib.Count) { return 1 }
+    $sa = $ia[$i]; $sb = $ib[$i]
+    $da = $sa -match '^\d+$'; $db = $sb -match '^\d+$'
+    if ($da -and $db) { $c = ([decimal]$sa).CompareTo([decimal]$sb) }
+    elseif ($da) { $c = -1 }
+    elseif ($db) { $c = 1 }
+    else { $c = [string]::CompareOrdinal($sa, $sb) }
+    if ($c -ne 0) { if ($c -gt 0) { return 1 } else { return -1 } }
   }
   return 0
 }
@@ -599,12 +637,12 @@ function Get-AicmNpmInfo {
     $info.Available = $true
     $prefix = Invoke-AicmWithTimeout 'npm' @('prefix', '-g') 30
     if ($prefix.ExitCode -eq 0) {
-      $first = @($prefix.Output -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+      $first = @($prefix.StdOut -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
       if ($first) { $info.Prefix = $first.Trim() }
     }
     $list = Invoke-AicmWithTimeout 'npm' @('ls', '-g', '--depth=0', '--json') 60
     try {
-      $deps = ($list.Output | ConvertFrom-Json).dependencies
+      $deps = ($list.StdOut | ConvertFrom-Json).dependencies
       if ($deps) { foreach ($p in $deps.PSObject.Properties) { $info.Packages[$p.Name] = [string]$p.Value.version } }
     } catch { }
   }
@@ -695,25 +733,73 @@ function Invoke-AicmNpmGuard([string[]]$Arguments) {
   $guard = Join-Path (Get-AicmRoot) 'lib\npm-guard.js'
   $r = Invoke-AicmWithTimeout 'node' (@($guard) + $Arguments) 60
   if ($r.ExitCode -ne 0) { throw "npm-guard failed: $($r.Output.Trim())" }
-  return @($r.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  return @($r.StdOut -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
+# Writes `npm view <args> --json` to a temp file. Only stdout goes into the file: npm prints warnings
+# (for example about an old setting in .npmrc) on stderr, and they would break the JSON.
 function Save-AicmNpmView([string[]]$Arguments) {
   $r = Invoke-AicmWithTimeout 'npm' (@('view') + $Arguments + @('--json')) 90
   if ($r.ExitCode -ne 0) { throw "npm view $($Arguments -join ' ') failed: $($r.Output.Trim())" }
   $file = [System.IO.Path]::GetTempFileName()
-  [System.IO.File]::WriteAllText($file, $r.Output)
+  [System.IO.File]::WriteAllText($file, $r.StdOut)
   return $file
 }
 
-# npm leaves its staging folders (node_modules\.<name>-XXXXXXXX) behind when an install fails half way;
-# on this tool's first test machine one of them was 238 MB. Removes those older than a day.
-function Remove-AicmNpmLeftovers {
+# A value read back from a state file as a date. PowerShell 7's ConvertFrom-Json already turns ISO
+# strings into DateTime; Windows PowerShell leaves strings. $null when it is not a date.
+function ConvertTo-AicmDate($Value) {
+  if ($null -eq $Value) { return $null }
+  if ($Value -is [datetime]) { return $Value }
+  $d = [datetime]::MinValue
+  $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+  if ([datetime]::TryParse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$d)) { return $d }
+  return $null
+}
+
+# A local calendar day (yyyy-MM-dd) read back from a state file ('' when there is none).
+function ConvertTo-AicmDay($Value) {
+  if ($null -eq $Value) { return '' }
+  if ($Value -is [datetime]) { return $Value.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }
+  return [string]$Value
+}
+
+function Get-AicmToday { return (Get-Date).ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }
+
+# The global node_modules folder ('' when npm is missing).
+function Get-AicmNpmRoot {
   $prefix = (Get-AicmNpmInfo).Prefix
-  if (-not $prefix) { return }
-  $root = Join-Path $prefix 'node_modules'
-  if (-not (Test-Path -LiteralPath $root)) { $root = Join-Path $prefix 'lib\node_modules' }
-  if (-not (Test-Path -LiteralPath $root)) { return }
+  if (-not $prefix) { return '' }
+  foreach ($root in @((Join-Path $prefix 'node_modules'), (Join-Path $prefix 'lib\node_modules'))) {
+    if (Test-Path -LiteralPath $root) { return $root }
+  }
+  return ''
+}
+
+# npm's backup of a package it was replacing (node_modules\[@scope\].<name>-XXXXXXXX with a package.json),
+# left behind when the install was interrupted. '' when there is none.
+function Get-AicmNpmBackup([string]$Package) {
+  $root = Get-AicmNpmRoot
+  if (-not $root) { return '' }
+  $parts = $Package.Split('/')
+  $parent = if ($parts.Count -gt 1) { Join-Path $root $parts[0] } else { $root }
+  $name = $parts[$parts.Count - 1]
+  if (-not (Test-Path -LiteralPath $parent)) { return '' }
+  foreach ($d in ([System.IO.DirectoryInfo]::new($parent)).GetDirectories(".$name-*")) {
+    if ($d.Name -match ('^\.' + [regex]::Escape($name) + '-[A-Za-z0-9]{8}$') -and -not (Test-AicmLink $d) -and (Test-Path -LiteralPath (Join-Path $d.FullName 'package.json'))) {
+      return $d.FullName
+    }
+  }
+  return ''
+}
+
+# npm leaves folders named node_modules\.<name>-XXXXXXXX behind when an install stops half way: its
+# staging folder, or its backup of the copy it was replacing. On this tool's first test machine one of
+# them was 238 MB. Removes those older than a day, but only while <name> itself is installed (has a
+# package.json): otherwise the leftover may be the only good copy of a CLI whose install was cut off.
+function Remove-AicmNpmLeftovers {
+  $root = Get-AicmNpmRoot
+  if (-not $root) { return }
   $cutoff = (Get-Date).AddDays(-1)
   $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
   foreach ($d in ([System.IO.DirectoryInfo]::new($root)).GetDirectories()) {
@@ -721,7 +807,13 @@ function Remove-AicmNpmLeftovers {
     if ($d.Name.StartsWith('@')) { foreach ($s in $d.GetDirectories()) { $dirs.Add($s) } } else { $dirs.Add($d) }
   }
   foreach ($d in $dirs) {
-    if ($d.Name -notmatch '^\.[^.].*-[A-Za-z0-9]{8}$' -or (Test-AicmLink $d) -or $d.LastWriteTime -gt $cutoff) { continue }
+    if ($d.Name -notmatch '^\.([^.].*)-[A-Za-z0-9]{8}$') { continue }
+    $owner = $Matches[1]
+    if ((Test-AicmLink $d) -or $d.LastWriteTime -gt $cutoff) { continue }
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $d.Parent.FullName $owner) 'package.json'))) {
+      Write-Host "kept npm leftover $($d.FullName) ($owner is not installed; this may be its only copy)"
+      continue
+    }
     $bytes = 0L
     foreach ($f in (Get-AicmFiles $d.FullName)) { $bytes += $f.Length }
     try { Remove-AicmTree $d; Write-Host "removed npm leftover $($d.FullName) ($(Format-AicmSize $bytes))" }
@@ -730,18 +822,71 @@ function Remove-AicmNpmLeftovers {
 }
 
 # The version to install: the newest stable release that is at least N days old ('' when none is).
-function Get-AicmNpmTarget([string]$Package, [int]$MinAgeDays) {
-  if ($MinAgeDays -le 0) {
+# Unpublished versions never count. -SkipDeprecated (the updater) also passes over deprecated releases
+# newer than -Installed; when every newer one is deprecated, -Installed is returned (nothing to do).
+function Get-AicmNpmTarget([string]$Package, [int]$MinAgeDays, [string]$Installed = '', [switch]$SkipDeprecated) {
+  if ($MinAgeDays -le 0 -and -not $SkipDeprecated) {
     $r = Invoke-AicmWithTimeout 'npm' @('view', $Package, 'version') 60
-    return (Get-AicmSemver $r.Output)
+    return (Get-AicmSemver $r.StdOut)
   }
-  $view = Save-AicmNpmView @($Package, 'time', 'dist-tags')
-  try { return (@(Invoke-AicmNpmGuard @('pick', "$MinAgeDays", $view)) | Select-Object -First 1) }
+  $view = Save-AicmNpmView @($Package, 'time', 'dist-tags', 'versions')
+  try { $list = @(Invoke-AicmNpmGuard @('candidates', "$([Math]::Max(0, $MinAgeDays))", $view)) }
   finally { Remove-Item -LiteralPath $view -Force -ErrorAction SilentlyContinue }
+  if (-not $SkipDeprecated) { if ($list.Count -gt 0) { return $list[0] } else { return '' } }
+  $checked = 0
+  foreach ($v in $list) {
+    if ($Installed -and (Compare-AicmVersion $v $Installed) -le 0) { return $v }
+    if ($checked -ge 5) { break }
+    $checked++
+    $r = Invoke-AicmWithTimeout 'npm' @('view', "$Package@$v", 'deprecated') 60
+    if ($r.ExitCode -ne 0) { throw "npm view $Package@$v deprecated failed: $($r.Output.Trim())" }
+    $why = $r.StdOut.Trim()
+    if (-not $why) { return $v }
+    Write-Host "skip: $Package@$v is deprecated ($why)"
+  }
+  return $Installed
 }
 
+# --before=<now minus the waiting period>: npm then resolves the dependencies, too, to versions published
+# before that moment, so the waiting period covers them (their install scripts run in the real install).
+# Nothing when there is no waiting period.
+function Get-AicmNpmBeforeArgs([int]$MinAgeDays) {
+  if ($MinAgeDays -le 0) { return }
+  return ('--before=' + (Get-Date).ToUniversalTime().AddDays(-$MinAgeDays).ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture))
+}
+
+# Signature verdicts per package@version, kept for the day, so the scheduled retries do not download
+# and stage the same release again. Values: ok | unverifiable | bad: <summary>.
+function Get-AicmNpmVerdict([string]$Spec) {
+  $s = Read-AicmState 'npm-verdicts'
+  if (-not $s -or -not $s.PSObject.Properties[$Spec]) { return '' }
+  $e = $s.PSObject.Properties[$Spec].Value
+  if (-not $e -or -not $e.PSObject.Properties['day'] -or -not $e.PSObject.Properties['verdict']) { return '' }
+  if ((ConvertTo-AicmDay $e.day) -ne (Get-AicmToday)) { return '' }
+  return [string]$e.verdict
+}
+
+function Set-AicmNpmVerdict([string]$Spec, [string]$Verdict) {
+  $today = Get-AicmToday
+  $keep = [ordered]@{}
+  $s = Read-AicmState 'npm-verdicts'
+  if ($s) {
+    foreach ($p in $s.PSObject.Properties) {
+      if ($p.Name -ne $Spec -and $p.Value -and $p.Value.PSObject.Properties['day'] -and (ConvertTo-AicmDay $p.Value.day) -eq $today) { $keep[$p.Name] = $p.Value }
+    }
+  }
+  $keep[$Spec] = [ordered]@{ day = $today; verdict = $Verdict }
+  Write-AicmState 'npm-verdicts' $keep
+}
+
+# Notes for the caller's attention list (stable texts, so they are announced once a week at most).
+$script:AicmNpmNotes = New-Object System.Collections.Generic.List[string]
+$script:AicmNoKeysNote = 'the npm registry publishes no signing keys (a private registry?), so release signatures cannot be checked; updates go on without that check. Set AICM_VERIFY_SIGNATURES=0 to skip it'
+function Add-AicmNpmNote([string]$Text) { if (-not $script:AicmNpmNotes.Contains($Text)) { $script:AicmNpmNotes.Add($Text) } }
+
 # Throws when the candidate looks unlike the installed release or fails the registry signature check.
-function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Target) {
+function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Target, [int]$MinAgeDays = -1) {
+  if ($MinAgeDays -lt 0) { $MinAgeDays = Get-AicmMinReleaseAgeDays }
   $allowed = @(($env:AICM_ALLOW -split ',') | ForEach-Object { $_.Trim() }) -contains "$Package@$Target"
   if ($Installed) {
     $old = Save-AicmNpmView @("$Package@$Installed")
@@ -754,16 +899,34 @@ function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Targ
     }
   }
   if ($env:AICM_VERIFY_SIGNATURES -eq '0') { return }
+  $spec = "$Package@$Target"
+  $verdict = Get-AicmNpmVerdict $spec
+  if ($verdict -eq 'ok') { Write-Host "signatures ok (checked earlier today): $spec"; return }
+  if ($verdict -eq 'unverifiable') { Write-Host "signatures not checkable (checked earlier today): $spec"; Add-AicmNpmNote $script:AicmNoKeysNote; return }
+  if ($verdict -like 'bad:*') { throw "signature check failed for ${spec} (checked earlier today): $($verdict.Substring(4).Trim())" }
   $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('aicm-stage-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $stage -Force | Out-Null
   try {
     # --ignore-scripts: nothing from the candidate runs before it has passed the checks.
-    $r = Invoke-AicmWithTimeout 'npm' @('install', "$Package@$Target", '--prefix', $stage, '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error') 900
-    if ($r.ExitCode -ne 0) { throw "staged install of $Package@$Target failed: $($r.Output.Trim())" }
+    $r = Invoke-AicmWithTimeout 'npm' (@('install', $spec, '--prefix', $stage, '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error') + @(Get-AicmNpmBeforeArgs $MinAgeDays)) 900
+    if ($r.ExitCode -ne 0) { throw "staged install of $spec failed: $($r.Output.Trim())" }
     $r = Invoke-AicmWithTimeout 'npm' @('audit', 'signatures', '--prefix', $stage) 300
     $summary = @($r.Output -split "`r?`n" | Where-Object { $_.Trim() }) -join ' / '
-    if ($r.ExitCode -ne 0) { throw "signature check failed for $Package@${Target}: $summary" }
-    Write-Host "signatures ok: $summary"
+    if ($r.ExitCode -eq 0) {
+      Set-AicmNpmVerdict $spec 'ok'
+      Write-Host "signatures ok: $summary"
+      return
+    }
+    # A registry without signing keys (Verdaccio and other private registries): nothing can be checked.
+    if ($r.Output -match 'installed from a supported registry') {
+      Set-AicmNpmVerdict $spec 'unverifiable'
+      Write-Host "warn: signatures not checkable for ${spec}: $summary"
+      Add-AicmNpmNote $script:AicmNoKeysNote
+      return
+    }
+    # Remember a real signature problem for the day; other errors (network) are tried again next run.
+    if ($r.Output -match '(?i)(invalid|missing)[^\r\n]*signature') { Set-AicmNpmVerdict $spec "bad: $summary" }
+    throw "signature check failed for ${spec}: $summary"
   } finally {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
   }
