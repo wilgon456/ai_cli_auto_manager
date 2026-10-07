@@ -25,7 +25,9 @@ LOG_DIR="${LOG_DIR:-$AICM_HOME/logs}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 AI_CLI_TARGETS="${AI_CLI_TARGETS:-all}"
 INSTALL_MISSING="${INSTALL_MISSING:-false}"
-PATH="/usr/local/bin:/opt/homebrew/bin:${HOME:-}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+# The PATH captured at install comes first, so the job updates the copies the user runs (nvm before a
+# stale Homebrew npm prefix, ~/.grok/bin before an old brew formula). The fallbacks only widen it.
+PATH="${PATH:+$PATH:}/usr/local/bin:/opt/homebrew/bin:${HOME:-}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # Resolved after PATH is widened: cron and launchd start with a minimal PATH.
 BREW="${BREW:-$(command -v brew 2>/dev/null || echo /usr/local/bin/brew)}"
 NPM="${NPM:-$(command -v npm 2>/dev/null || echo /usr/local/bin/npm)}"

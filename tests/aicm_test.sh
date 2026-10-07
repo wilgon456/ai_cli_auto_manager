@@ -140,6 +140,10 @@ out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 1 ]] && grep -q "'clean' is missing" <<< "$out" && pass "doctor notices a deleted job" || fail "deleted job: $out"
 out="$("$ROOT/bin/update_ai_clis.sh" --targets none 2>&1)" || true
 grep -q "notify: .*'clean' is missing" <<< "$out" && pass "update run notifies about the deleted job" || fail "update did not notify: $out"
+printf '#!/usr/bin/env bash\necho "9.9.9 (Claude Code)"\n' > "$WORK/fakebin/claude"; chmod +x "$WORK/fakebin/claude"
+out="$("$ROOT/bin/update_ai_clis.sh" --dry-run --targets claude 2>&1)" || true
+grep -q "path: $WORK/fakebin/claude" <<< "$out" && pass "update uses the CLI first on the job PATH, not /usr/local or Homebrew" || fail "update PATH order: $out"
+rm -f "$WORK/fakebin/claude"
 NLOG="$AICM_HOME/logs/notifications.log"
 grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} AI CLI Auto Manager - .*'clean' is missing" "$NLOG" && pass "notifications are kept in notifications.log" || fail "notification log: $(cat "$NLOG" 2>&1)"
 out="$("$AICM" doctor 2>&1)" || true
