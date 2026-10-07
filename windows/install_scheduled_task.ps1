@@ -1,9 +1,10 @@
 <#
 .SYNOPSIS
-  Kept for compatibility. Registers only the daily update task, as before.
+  Kept for compatibility. Registers (or updates) only the daily update task, as before.
 .DESCRIPTION
   New installs should run:  .\bin\aicm.ps1 schedule install
-  which registers both the daily update and the weekly cleanup.
+  which registers the daily update, the weekly inventory and the weekly cleanup.
+  Inventory and Clean tasks that are already registered are left as they are.
 #>
 [CmdletBinding()]
 param(
@@ -16,7 +17,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $aicm = Join-Path (Split-Path -Parent $PSScriptRoot) 'bin\aicm.ps1'
 Write-Host "note: windows\install_scheduled_task.ps1 is deprecated; use: .\bin\aicm.ps1 schedule install"
-$splat = @{ Command = 'schedule'; Action = 'install'; UpdateAt = $At; LogRetentionDays = $LogRetentionDays; NoClean = $true; NoInventory = $true }
+$splat = @{ Command = 'schedule'; Action = 'install'; UpdateAt = $At; LogRetentionDays = $LogRetentionDays; NoClean = $true; NoInventory = $true; KeepOtherJobs = $true }
 if ($Targets) { $splat.Targets = @($Targets) }
 if ($InstallMissing) { $splat.InstallMissing = $true }
 & $aicm @splat

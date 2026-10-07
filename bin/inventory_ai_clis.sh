@@ -64,8 +64,10 @@ for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
     state=behind
     # A newer release that is still inside the waiting period is expected, not a problem.
     if [[ "$CLI_METHOD" == npm ]]; then
-      target="$(aicm_npm_target "$npm_pkg" "$(aicm_min_release_age_days)" 2>/dev/null || true)"
-      if [[ -z "$target" ]] || ! aicm_version_older "$version" "$target"; then state=held; fi
+      # When the release lookup itself fails (offline, timeout), it stays "behind", like on Windows.
+      if target="$(aicm_npm_target "$npm_pkg" "$(aicm_min_release_age_days)" 2>/dev/null)"; then
+        if [[ -z "$target" ]] || ! aicm_version_older "$version" "$target"; then state=held; fi
+      fi
     fi
   else state=current; fi
   coverage="$(aicm_cli_coverage "$i")"

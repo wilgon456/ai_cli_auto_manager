@@ -32,6 +32,20 @@ function Get-AicmLocalAppData {
   return (Join-Path (Get-AicmUserHome) 'AppData\Local')
 }
 
+# Per-user lock name. A separate AICM_HOME (tests, a second setup) gets its own lock, so it never
+# waits for or blocks the real scheduled runs.
+function Get-AicmLockName([string]$Kind) {
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $userPart = if ($identity -and $identity.User) { $identity.User.Value } else { $env:USERNAME }
+  $name = "Local\ai-cli-auto-manager-$Kind-$($userPart -replace '[^A-Za-z0-9._-]', '-')"
+  if ($env:AICM_HOME) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($env:AICM_HOME.ToLowerInvariant())) | Select-Object -First 6 | ForEach-Object { $_.ToString('x2') })
+    $name += "-$hash"
+  }
+  return $name
+}
+
 function Initialize-AicmDirectory([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) {
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -51,6 +65,9 @@ function Expand-AicmPath([string]$Path) {
   $p = $Path
   if ($p -eq '~') { $p = Get-AicmUserHome }
   elseif ($p.StartsWith('~/') -or $p.StartsWith('~\')) { $p = (Get-AicmUserHome) + $p.Substring(1) }
+  # Codex reads CODEX_HOME, so its sessions and database live there when it is set.
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path (Get-AicmUserHome) '.codex' }
+  $p = $p.Replace('{codex}', $codexHome)
   $p = $p.Replace('{temp}', (Get-AicmTempDir))
   $p = $p.Replace('{localappdata}', (Get-AicmLocalAppData))
   $p = $p.Replace('{cache}', (Get-AicmLocalAppData))
@@ -69,27 +86,63 @@ function Test-AicmSamePath([string]$A, [string]$B) {
   return [string]::Equals($x, $y, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+# Expands 8.3 short names (C:\Users\JOHNDO~1\...) so paths compare by their real long names.
+function Get-AicmLongPath([string]$Path) {
+  $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+  if ($full -notmatch '~') { return $full }
+  $root = [System.IO.Path]::GetPathRoot($full)
+  $out = $root.TrimEnd('\')
+  foreach ($part in $full.Substring($root.Length).Split('\')) {
+    if (-not $part) { continue }
+    $next = Join-Path $out $part
+    if ($part -match '~') {
+      # The search pattern matches short names too and returns the long one.
+      try { $hit = @([System.IO.Directory]::GetFileSystemEntries(($out + '\'), $part)) } catch { $hit = @() }
+      if ($hit.Count -eq 1) { $next = $hit[0] }
+    }
+    $out = $next.TrimEnd('\')
+  }
+  return $out
+}
+
+# The temp folder counts as a cleanup area only when it really is a temp folder: never a drive root,
+# the home folder or a folder above it, and it must sit under %LOCALAPPDATA% or be named Temp/tmp.
+# A TEMP variable pointing at C:\ or C:\Users would otherwise let the os-temp rule sweep the home folder.
+function Test-AicmTempUsable {
+  $temp = Get-AicmLongPath (Get-AicmTempDir)
+  $userHome = Get-AicmLongPath (Get-AicmUserHome)
+  if ([System.IO.Path]::GetPathRoot($temp).TrimEnd('\') -eq $temp) { return $false }
+  if (Test-AicmUnder $userHome $temp) { return $false }
+  if (@('temp', 'tmp') -contains (Split-Path -Leaf $temp).ToLowerInvariant()) { return $true }
+  return (Test-AicmUnder $temp (Get-AicmLongPath (Get-AicmLocalAppData)))
+}
+
 # A rule may only touch the home folder (never the home folder itself) or the temp folder.
-function Test-AicmAllowedPath([string]$Path) {
-  $userHome = Get-AicmUserHome
-  $temp = Get-AicmTempDir
-  if (Test-AicmSamePath $Path $userHome) { return $false }
-  if (Test-AicmUnder $Path $temp) { return $true }
-  return (Test-AicmUnder $Path $userHome)
+# $FromTemp: the rule's path is written with {temp}; it is allowed only while TEMP looks right.
+function Test-AicmAllowedPath([string]$Path, [bool]$FromTemp = $false) {
+  $p = Get-AicmLongPath $Path
+  $userHome = Get-AicmLongPath (Get-AicmUserHome)
+  # The home folder itself, or anything above it, never.
+  if (Test-AicmUnder $userHome $p) { return $false }
+  $inTemp = (Test-AicmUnder $p (Get-AicmLongPath (Get-AicmTempDir))) -and (Test-AicmTempUsable)
+  if ($FromTemp) { return $inTemp }
+  return ($inTemp -or (Test-AicmUnder $p $userHome))
 }
 
 $script:AicmProtectedNames = @(
   'MEMORY.md', 'CLAUDE.md', 'AGENTS.md', 'GEMINI.md',
   'auth.json', '.credentials.json', 'credentials.json', 'credentials',
   'settings.json', 'settings.local.json', 'config.toml', 'config.json', 'config.yaml',
-  '.env'
+  '.env', '.npmrc', '.netrc'
 )
+# Keys and certificates, wherever a tool happened to put them.
+$script:AicmProtectedPatterns = @('*.env', '*.pem', '*.key', 'id_rsa*', 'id_ed25519*', 'id_ecdsa*', 'id_dsa*')
 
 function Test-AicmProtected([System.IO.FileSystemInfo]$Item) {
   foreach ($name in $script:AicmProtectedNames) {
     if ([string]::Equals($Item.Name, $name, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
   }
-  if ($Item.Name -like '*.env') { return $true }
+  foreach ($pattern in $script:AicmProtectedPatterns) { if ($Item.Name -like $pattern) { return $true } }
   if ($Item.FullName -match '[\\/]memory[\\/]') { return $true }
   return $false
 }
@@ -136,7 +189,7 @@ function Remove-AicmTree([System.IO.DirectoryInfo]$Dir) {
   $Dir.Delete($false)
 }
 
-# Removes empty folders below $Root, deepest first. $Root itself and links are kept.
+# Removes empty folders below $Root, deepest first. $Root itself, links and "memory" folders are kept.
 function Remove-AicmEmptyDirs([string]$Root) {
   $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
   $stack = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
@@ -146,7 +199,7 @@ function Remove-AicmEmptyDirs([string]$Root) {
     $subs = $null
     try { $subs = $dir.GetDirectories() } catch { continue }
     foreach ($sub in $subs) {
-      if (Test-AicmLink $sub) { continue }
+      if ((Test-AicmLink $sub) -or $sub.Name -ieq 'memory') { continue }
       $dirs.Add($sub)
       $stack.Push($sub)
     }
@@ -175,14 +228,14 @@ function ConvertFrom-AicmRuleLine([string]$Line, [string]$Source) {
   if ($cols.Count -lt 8) { throw "invalid rule in ${Source}: expected 9 columns: $t" }
   while ($cols.Count -lt 9) { $cols += '' }
   $kind = $cols[2].ToLowerInvariant()
-  if (@('age', 'cap', 'keep-latest', 'command', 'archive', 'codex') -notcontains $kind) { throw "invalid rule kind '$kind' in ${Source}: $t" }
+  if (@('age', 'age-files', 'cap', 'keep-latest', 'command', 'archive', 'codex') -notcontains $kind) { throw "invalid rule kind '$kind' in ${Source}: $t" }
   $default = $cols[7].ToLowerInvariant()
   if (@('on', 'off') -notcontains $default) { throw "invalid default '$default' in ${Source}: $t" }
   $days = 0
   if ($cols[5]) { $days = [int]$cols[5] }
   $limit = 0
   if ($cols[6]) { $limit = [int]$cols[6] }
-  if ($kind -eq 'age' -and $days -lt 1) { throw "age rule needs days >= 1 in ${Source}: $t" }
+  if (@('age', 'age-files') -contains $kind -and $days -lt 1) { throw "$kind rule needs days >= 1 in ${Source}: $t" }
   if ($kind -eq 'keep-latest' -and $limit -lt 1) { throw "keep-latest rule needs limit >= 1 in ${Source}: $t" }
   if ($kind -eq 'archive' -and ($days -lt 1 -or $limit -lt 1)) { throw "archive rule needs days >= 1 (archive after) and limit >= 1 (delete after) in ${Source}: $t" }
   if ($kind -eq 'codex' -and $days -lt 1) { throw "codex rule needs days >= 1 in ${Source}: $t" }
@@ -247,9 +300,20 @@ function Send-AicmAttention([string]$Key, [string[]]$Items) {
   if ($due.Count -gt 0) { Send-AicmNotification 'AI CLI Auto Manager' ($due.ToArray() -join '; ') }
 }
 
-# Desktop notification. Never fails the caller. Disable with AICM_NOTIFY=0.
+# Desktop notification. Never fails the caller. Disable the desktop part with AICM_NOTIFY=0.
+# Every notification is also appended to logs\notifications.log (last 500 lines kept), so one that
+# never showed on screen can still be read with `aicm.ps1 status`.
 function Send-AicmNotification([string]$Title, [string]$Body) {
   Write-Host "notify: $Title - $Body"
+  try {
+    $dir = Join-Path (Get-AicmHome) 'logs'
+    Initialize-AicmDirectory $dir
+    $log = Join-Path $dir 'notifications.log'
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::AppendAllText($log, ("{0} {1} - {2}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Title, ($Body -replace "`r?`n", ' ')), $utf8)
+    $lines = [System.IO.File]::ReadAllLines($log, $utf8)
+    if ($lines.Count -gt 600) { [System.IO.File]::WriteAllLines($log, [string[]]($lines[($lines.Count - 500)..($lines.Count - 1)]), $utf8) }
+  } catch { }
   if ($env:AICM_NOTIFY -eq '0') { return }
   try {
     [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
@@ -314,7 +378,7 @@ function Get-AicmCodexId([string]$Name) {
   return ''
 }
 
-# Codex threads from its state DB (read-only): id -> rollout path, last update (unix seconds), archived.
+# Codex threads from its state DB (read-only): id -> last update (unix seconds, 0 = unknown), archived.
 # Needs Python with sqlite3; returns $null when that is not available or the layout is unknown.
 function Get-AicmCodexThreads([string]$CodexHome) {
   if ($env:AICM_CODEX_DB_READER -eq '0') { return $null }
@@ -323,20 +387,22 @@ function Get-AicmCodexThreads([string]$CodexHome) {
   if (-not $db) { return $null }
   $python = @('python', 'python3', 'py') | Where-Object { Resolve-AicmExecutable $_ } | Select-Object -First 1
   if (-not $python) { return $null }
-  $code = "import sqlite3,sys`ncon=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)`nfor r in con.execute('select id, rollout_path, updated_at, archived from threads'):`n    print('\t'.join('' if v is None else str(v) for v in r))"
+  # Stops (exit 3) when the table lacks the expected columns, so an unknown layout is never guessed at.
+  $code = "import sqlite3,sys`ncon=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)`ncols={r[1] for r in con.execute('pragma table_info(threads)')}`nif not {'id','updated_at'} <= cols: sys.exit(3)`narch='archived' if 'archived' in cols else '0'`nfor r in con.execute('select id, updated_at, '+arch+' from threads'):`n    print('\t'.join('' if v is None else str(v) for v in r))"
   $script = [System.IO.Path]::GetTempFileName() + '.py'
   [System.IO.File]::WriteAllText($script, $code)
   try {
     $r = Invoke-AicmWithTimeout $python @($script, $db.FullName) 120
     if ($r.ExitCode -ne 0) { return $null }
     $threads = @{}
-    foreach ($line in ($r.Output -split "`r?`n")) {
+    foreach ($line in ($r.StdOut -split "`r?`n")) {
       $c = $line.Split("`t")
-      if ($c.Count -lt 4 -or -not $c[0]) { continue }
+      if ($c.Count -lt 3 -or -not $c[0]) { continue }
+      # Only unix seconds or milliseconds; anything else (a date text) leaves Updated at 0 = unknown.
       $u = 0.0
-      [void][double]::TryParse($c[2], [ref]$u)
+      if ($c[1] -match '^\d+(\.\d+)?$') { [void][double]::TryParse($c[1], [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$u) }
       if ($u -gt 1e11) { $u = $u / 1000 }
-      $threads[$c[0]] = [pscustomobject]@{ Rollout = $c[1]; Updated = $u; Archived = ($c[3] -eq '1') }
+      $threads[$c[0]] = [pscustomobject]@{ Updated = $u; Archived = ($c[2] -eq '1') }
     }
     return $threads
   } finally {
@@ -352,42 +418,118 @@ function Get-AicmCodexThreads([string]$CodexHome) {
 
 function Get-AicmAppDir { return (Join-Path (Get-AicmHome) 'app') }
 
-# Copies bin, lib, rules, windows and VERSION from $Source into the app folder via a swap.
+# Marks AICM_HOME as this tool's folder; `aicm.ps1 uninstall -Purge` removes only a marked folder (or
+# the default one), so AICM_HOME pointing at another folder can never wipe it.
+function Set-AicmHomeMarker {
+  try {
+    $marker = Join-Path (Get-AicmHome) '.aicm-home'
+    if (Test-Path -LiteralPath $marker) { return }
+    Initialize-AicmDirectory (Get-AicmHome)
+    [System.IO.File]::WriteAllText($marker, "AI CLI Auto Manager home (logs, state, archive, installed copy)`r`n")
+  } catch { }
+}
+
+# Antivirus scanners briefly lock freshly written files, so a folder move is retried a few times.
+function Move-AicmDirectory([string]$From, [string]$To) {
+  for ($i = 1; ; $i++) {
+    try { Move-Item -LiteralPath $From -Destination $To -ErrorAction Stop; return }
+    catch { if ($i -ge 5) { throw }; Start-Sleep -Milliseconds (300 * $i) }
+  }
+}
+
+# Files of $Source (bin, lib, rules, windows) that are missing from $Copy or differ in size, plus the
+# files every copy needs. Empty when the copy is complete.
+function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
+  $gaps = New-Object System.Collections.Generic.List[string]
+  foreach ($f in 'VERSION', 'bin\aicm.ps1', 'lib\aicm-common.ps1', 'windows\run-hidden.vbs') {
+    if (-not (Test-Path -LiteralPath (Join-Path $Copy $f) -PathType Leaf)) { $gaps.Add($f) }
+  }
+  if (-not (Get-ChildItem -LiteralPath (Join-Path $Copy 'rules') -File -ErrorAction SilentlyContinue)) { $gaps.Add('rules') }
+  $base = [System.IO.Path]::GetFullPath($Source).TrimEnd('\')
+  foreach ($d in 'bin', 'lib', 'rules', 'windows') {
+    $dir = Join-Path $base $d
+    if (-not (Test-Path -LiteralPath $dir)) { continue }
+    foreach ($f in (Get-ChildItem -LiteralPath $dir -Recurse -File -Force)) {
+      $rel = $f.FullName.Substring($base.Length + 1)
+      $copied = Get-Item -LiteralPath (Join-Path $Copy $rel) -Force -ErrorAction SilentlyContinue
+      if (-not $copied -or $copied.Length -ne $f.Length) { $gaps.Add($rel) }
+    }
+  }
+  return $gaps.ToArray()
+}
+
+# Copies bin, lib, rules, windows and VERSION from $Source into the app folder. The new copy is built
+# next to the old one and checked file by file before the swap; when anything fails, the old copy
+# stays (or is put back), so the scheduled tasks never point at a missing or half-copied folder.
 function Sync-AicmAppCopy([string]$Source) {
   $app = Get-AicmAppDir
   if (Test-AicmSamePath $Source $app) { return $app }
+  Set-AicmHomeMarker
   $new = "$app.new"
   $old = "$app.old"
+  # A run that stopped between the two moves left only app.old behind: put it back first.
+  if (-not (Test-Path -LiteralPath $app) -and (Test-Path -LiteralPath $old)) { Move-AicmDirectory $old $app }
   foreach ($d in $new, $old) { if (Test-Path -LiteralPath $d) { Remove-AicmTree ([System.IO.DirectoryInfo]::new($d)) } }
-  New-Item -ItemType Directory -Path $new -Force | Out-Null
-  foreach ($d in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $Source $d) -Destination (Join-Path $new $d) -Recurse -Force }
-  foreach ($f in 'VERSION', 'LICENSE', 'README.md') {
-    $p = Join-Path $Source $f
-    if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force }
+  try {
+    New-Item -ItemType Directory -Path $new -Force | Out-Null
+    foreach ($d in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $Source $d) -Destination (Join-Path $new $d) -Recurse -Force -ErrorAction Stop }
+    foreach ($f in 'VERSION', 'LICENSE', 'README.md') {
+      $p = Join-Path $Source $f
+      if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force -ErrorAction Stop }
+    }
+    [System.IO.File]::WriteAllText((Join-Path $new 'SOURCE'), $Source)
+    $gaps = @(Get-AicmAppCopyGaps $Source $new)
+    if ($gaps.Count -gt 0) { throw "the new copy is incomplete (missing or different: $($gaps[0]))" }
+  } catch {
+    if (Test-Path -LiteralPath $new) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($new)) } catch { } }
+    throw
   }
-  [System.IO.File]::WriteAllText((Join-Path $new 'SOURCE'), $Source)
-  if (Test-Path -LiteralPath $app) { Move-Item -LiteralPath $app -Destination $old }
-  Move-Item -LiteralPath $new -Destination $app
+  if (Test-Path -LiteralPath $app) { Move-AicmDirectory $app $old }
+  try {
+    Move-AicmDirectory $new $app
+  } catch {
+    if (-not (Test-Path -LiteralPath $app) -and (Test-Path -LiteralPath $old)) { Move-AicmDirectory $old $app }
+    if (Test-Path -LiteralPath $new) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($new)) } catch { } }
+    throw
+  }
   if (Test-Path -LiteralPath $old) { try { Remove-AicmTree ([System.IO.DirectoryInfo]::new($old)) } catch { } }
   return $app
 }
 
-# Called at the end of the daily update when it runs from the installed copy.
+# Called at the end of the daily update when it runs from the installed copy. Copies only a newer
+# version (checking out an old tag in the clone never downgrades the jobs), then re-registers the
+# scheduled tasks from the new copy so changed script names or arguments take effect.
 function Update-AicmAppCopy {
+  $ErrorActionPreference = 'Continue'
   $app = Get-AicmAppDir
   if (-not (Test-AicmSamePath (Get-AicmRoot) $app)) { return }
   $sourceFile = Join-Path $app 'SOURCE'
   if (-not (Test-Path -LiteralPath $sourceFile)) { return }
   $source = (Get-Content -LiteralPath $sourceFile -TotalCount 1).Trim()
+  $current = Get-AicmVersion
   $srcVersion = Join-Path $source 'VERSION'
   if (-not $source -or -not (Test-Path -LiteralPath $srcVersion) -or -not (Test-Path -LiteralPath (Join-Path $source 'bin\aicm.ps1'))) {
-    Write-Host "installed copy: source $source is gone; keeping version $(Get-AicmVersion)"
+    Write-Host "installed copy: source $source is gone; keeping version $current"
     return
   }
   $newVersion = (Get-Content -LiteralPath $srcVersion -TotalCount 1).Trim()
-  if ($newVersion -eq (Get-AicmVersion)) { return }
-  try { [void](Sync-AicmAppCopy $source); Write-Host "installed copy: updated $(Get-AicmVersion) -> $newVersion from $source" }
-  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); trying again next run" }
+  if ($newVersion -eq $current) { return }
+  if ((Compare-AicmVersion $newVersion $current) -le 0) {
+    Write-Host "installed copy: $source has version $newVersion, not newer than $current; keeping $current"
+    return
+  }
+  try { [void](Sync-AicmAppCopy $source) }
+  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); keeping $current, trying again next run"; return }
+  Write-Host "installed copy: updated $current -> $newVersion from $source"
+  if (-not (Read-AicmState 'schedule')) { return }
+  try {
+    $exe = (Get-Process -Id $PID).Path
+    $out = & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $app 'bin\aicm.ps1') schedule refresh 2>&1
+    foreach ($line in @($out)) { if ("$line".Trim()) { Write-Host "schedule refresh: $line" } }
+    if ($LASTEXITCODE -ne 0) { Write-Host "schedule refresh: failed (exit code $LASTEXITCODE); run: aicm.ps1 schedule install" }
+  } catch {
+    Write-Host "schedule refresh: failed ($($_.Exception.Message)); run: aicm.ps1 schedule install"
+  }
 }
 
 # AICM_TASK_PATH lets tests register throwaway tasks in their own folder.
@@ -395,6 +537,48 @@ $script:AicmTaskPath = if ($env:AICM_TASK_PATH) { $env:AICM_TASK_PATH } else { '
 
 function Get-AicmTask([string]$Name) {
   return (Get-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $Name -ErrorAction SilentlyContinue)
+}
+
+# Registry keys that turn Windows Script Host off (value Enabled = 0); the tasks normally start
+# through wscript.exe, so they cannot run then. AICM_WSH_KEYS (paths separated by ';') replaces the
+# two real keys in tests.
+function Get-AicmWshDisabled {
+  $keys = if ($env:AICM_WSH_KEYS) { $env:AICM_WSH_KEYS -split ';' } else {
+    @('HKCU:\Software\Microsoft\Windows Script Host\Settings', 'HKLM:\Software\Microsoft\Windows Script Host\Settings')
+  }
+  foreach ($k in $keys) {
+    if (-not $k) { continue }
+    $v = $null
+    try { $v = (Get-ItemProperty -LiteralPath $k -Name 'Enabled' -ErrorAction Stop).Enabled } catch { continue }
+    if ("$v".Trim() -eq '0') { $k }
+  }
+}
+
+# A registered task that cannot do its work: turned off, pointing at a file that is gone, or failed
+# on its last run. Result codes 0x41301 (running), 0x41303 (has not run yet) and 0x41325 (queued) are
+# not failures. Exit code 1 is the job reporting its own failure, which it already notified, so it is
+# only reported when the job did not get as far as writing its state file.
+function Get-AicmTaskProblems($Task, [string]$Job) {
+  if ($Task.State -eq 'Disabled') {
+    "scheduled task '$Job' is disabled; enable it in Task Scheduler or run: aicm.ps1 schedule install"
+  }
+  foreach ($a in @($Task.Actions)) {
+    $files = @([regex]::Matches([string]$a.Arguments, '"([^"]+\.(?:ps1|vbs))"') | ForEach-Object { $_.Groups[1].Value })
+    if ($a.Execute -and [System.IO.Path]::IsPathRooted([string]$a.Execute)) { $files += [string]$a.Execute }
+    foreach ($f in $files) {
+      if (-not (Test-Path -LiteralPath $f)) { "scheduled task '$Job' starts $f, which does not exist; run: aicm.ps1 schedule install"; break }
+    }
+  }
+  $info = $null
+  try { $info = $Task | Get-ScheduledTaskInfo -ErrorAction Stop } catch { return }
+  $code = [int64]$info.LastTaskResult
+  if ($code -in @(0, 0x41301, 0x41303, 0x41325)) { return }
+  if ($code -eq 1) {
+    $stateName = @{ Update = 'last-update'; Inventory = 'inventory'; Clean = 'last-clean' }[$Job]
+    $state = if ($stateName) { Read-AicmState $stateName } else { $null }
+    try { if ($state -and [datetime]::Parse($state.finishedAt) -ge $info.LastRunTime.AddMinutes(-1)) { return } } catch { }
+  }
+  "scheduled task '$Job' failed on its last run (result 0x{0:X}); see {1}" -f $code, (Join-Path (Get-AicmHome) 'logs')
 }
 
 # Checks that every scheduled job recorded at install time still exists.
@@ -408,12 +592,20 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
   $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9) }
   $installedDays = 0
   try { $installedDays = ((Get-Date).ToUniversalTime() - [datetime]::Parse($sched.installedAt).ToUniversalTime()).TotalDays } catch { }
+  $launcher = if ($sched.PSObject.Properties['launcher']) { [string]$sched.launcher } else { 'wscript' }
+  if ($launcher -eq 'wscript') {
+    foreach ($k in @(Get-AicmWshDisabled)) {
+      $problems.Add("Windows Script Host is turned off ($k = 0), so the scheduled tasks cannot start; run: aicm.ps1 schedule install (it then starts them through PowerShell)")
+    }
+  }
   foreach ($job in @($sched.jobs)) {
     if ($job -eq $Skip) { continue }
-    if (-not (Get-AicmTask $job)) {
+    $task = Get-AicmTask $job
+    if (-not $task) {
       $problems.Add("scheduled task '$job' is missing; run: aicm.ps1 schedule install")
       continue
     }
+    foreach ($p in @(Get-AicmTaskProblems $task $job)) { $problems.Add($p) }
     if ($NoStale -or -not $limits.ContainsKey($job)) { continue }
     $state = Read-AicmState $limits[$job][0]
     $days = [double]::PositiveInfinity
@@ -456,6 +648,20 @@ function Resolve-AicmExecutable([string]$Name) {
   return $path
 }
 
+# Ends a process and everything it started. npm.cmd runs cmd.exe, which runs node; killing only
+# cmd.exe would leave node (and a hanging postinstall) running.
+function Stop-AicmProcessTree([System.Diagnostics.Process]$Process) {
+  $ErrorActionPreference = 'Continue'
+  $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+  if ($env:SystemRoot -and (Test-Path -LiteralPath $taskkill)) {
+    try { & $taskkill /T /F /PID $Process.Id 2>&1 | Out-Null } catch { }
+  }
+  try { if (-not $Process.HasExited) { $Process.Kill() } } catch { }
+  try { [void]$Process.WaitForExit(5000) } catch { }
+}
+
+# Runs a command with a time limit. Returns .ExitCode (124 on timeout), .StdOut, .StdErr and .Output
+# (both streams together, for display). Parse .StdOut only: npm prints warnings on stderr.
 function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds) {
   $exe = Resolve-AicmExecutable $Name
   if (-not $exe) { throw "command not found: $Name" }
@@ -471,21 +677,18 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
     $process = Start-Process @startArgs
     # Touch the handle now; otherwise ExitCode stays empty after a timed WaitForExit.
     $null = $process.Handle
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-      try { $process.Kill() } catch { }
-      $partial = @(
-        Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
-        Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
-        "TIMEOUT after ${TimeoutSeconds}s"
-      ) -join ''
-      return [pscustomobject]@{ ExitCode = 124; Output = $partial }
+    $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+    if ($timedOut) { Stop-AicmProcessTree $process } else { $process.WaitForExit() }
+    # An empty file gives no value at all, which stays $null even through [string]; callers get ''.
+    $stdout = Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $stdout) { $stdout = '' }
+    $stderr = Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $stderr) { $stderr = '' }
+    if ($timedOut) {
+      $stderr += "TIMEOUT after ${TimeoutSeconds}s"
+      return [pscustomobject]@{ ExitCode = 124; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
     }
-    $process.WaitForExit()
-    $output = @(
-      Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
-      Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
-    ) -join ''
-    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $output }
+    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
   } finally {
     Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
   }
@@ -496,12 +699,39 @@ function Get-AicmSemver([string]$Text) {
   return ''
 }
 
-# 1 when $A is newer, -1 when older, 0 when equal or not comparable.
+# 1 when $A is newer, -1 when older, 0 when equal or not comparable. Semver order: the dotted numbers
+# first (missing parts count as 0), then a prerelease (2.0.0-beta.3) is older than its release (2.0.0);
+# two prereleases compare part by part, numbers numerically and below words. Build metadata (+x) is ignored.
 function Compare-AicmVersion([string]$A, [string]$B) {
   if (-not $A -or -not $B -or $A -eq $B) { return 0 }
-  $va = $null; $vb = $null
-  if ([version]::TryParse(($A -replace '[-+].*$', ''), [ref]$va) -and [version]::TryParse(($B -replace '[-+].*$', ''), [ref]$vb)) {
-    return $va.CompareTo($vb)
+  $pa = $A.Trim() -replace '\+.*$', ''
+  $pb = $B.Trim() -replace '\+.*$', ''
+  if ($pa -notmatch '^v?(\d+(\.\d+)*)(-(.+))?$') { return 0 }
+  $na = $Matches[1]; $ra = if ($Matches[4]) { $Matches[4] } else { '' }
+  if ($pb -notmatch '^v?(\d+(\.\d+)*)(-(.+))?$') { return 0 }
+  $nb = $Matches[1]; $rb = if ($Matches[4]) { $Matches[4] } else { '' }
+  $xa = @($na.Split('.')); $xb = @($nb.Split('.'))
+  $count = [Math]::Max($xa.Count, $xb.Count)
+  for ($i = 0; $i -lt $count; $i++) {
+    $ea = if ($i -lt $xa.Count) { [decimal]$xa[$i] } else { [decimal]0 }
+    $eb = if ($i -lt $xb.Count) { [decimal]$xb[$i] } else { [decimal]0 }
+    if ($ea -ne $eb) { if ($ea -gt $eb) { return 1 } else { return -1 } }
+  }
+  if ($ra -eq $rb) { return 0 }
+  if (-not $ra) { return 1 }
+  if (-not $rb) { return -1 }
+  $ia = @($ra.Split('.')); $ib = @($rb.Split('.'))
+  $count = [Math]::Max($ia.Count, $ib.Count)
+  for ($i = 0; $i -lt $count; $i++) {
+    if ($i -ge $ia.Count) { return -1 }
+    if ($i -ge $ib.Count) { return 1 }
+    $sa = $ia[$i]; $sb = $ib[$i]
+    $da = $sa -match '^\d+$'; $db = $sb -match '^\d+$'
+    if ($da -and $db) { $c = ([decimal]$sa).CompareTo([decimal]$sb) }
+    elseif ($da) { $c = -1 }
+    elseif ($db) { $c = 1 }
+    else { $c = [string]::CompareOrdinal($sa, $sb) }
+    if ($c -ne 0) { if ($c -gt 0) { return 1 } else { return -1 } }
   }
   return 0
 }
@@ -544,12 +774,12 @@ function Get-AicmNpmInfo {
     $info.Available = $true
     $prefix = Invoke-AicmWithTimeout 'npm' @('prefix', '-g') 30
     if ($prefix.ExitCode -eq 0) {
-      $first = @($prefix.Output -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+      $first = @($prefix.StdOut -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
       if ($first) { $info.Prefix = $first.Trim() }
     }
     $list = Invoke-AicmWithTimeout 'npm' @('ls', '-g', '--depth=0', '--json') 60
     try {
-      $deps = ($list.Output | ConvertFrom-Json).dependencies
+      $deps = ($list.StdOut | ConvertFrom-Json).dependencies
       if ($deps) { foreach ($p in $deps.PSObject.Properties) { $info.Packages[$p.Name] = [string]$p.Value.version } }
     } catch { }
   }
@@ -640,25 +870,73 @@ function Invoke-AicmNpmGuard([string[]]$Arguments) {
   $guard = Join-Path (Get-AicmRoot) 'lib\npm-guard.js'
   $r = Invoke-AicmWithTimeout 'node' (@($guard) + $Arguments) 60
   if ($r.ExitCode -ne 0) { throw "npm-guard failed: $($r.Output.Trim())" }
-  return @($r.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  return @($r.StdOut -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
+# Writes `npm view <args> --json` to a temp file. Only stdout goes into the file: npm prints warnings
+# (for example about an old setting in .npmrc) on stderr, and they would break the JSON.
 function Save-AicmNpmView([string[]]$Arguments) {
   $r = Invoke-AicmWithTimeout 'npm' (@('view') + $Arguments + @('--json')) 90
   if ($r.ExitCode -ne 0) { throw "npm view $($Arguments -join ' ') failed: $($r.Output.Trim())" }
   $file = [System.IO.Path]::GetTempFileName()
-  [System.IO.File]::WriteAllText($file, $r.Output)
+  [System.IO.File]::WriteAllText($file, $r.StdOut)
   return $file
 }
 
-# npm leaves its staging folders (node_modules\.<name>-XXXXXXXX) behind when an install fails half way;
-# on this tool's first test machine one of them was 238 MB. Removes those older than a day.
-function Remove-AicmNpmLeftovers {
+# A value read back from a state file as a date. PowerShell 7's ConvertFrom-Json already turns ISO
+# strings into DateTime; Windows PowerShell leaves strings. $null when it is not a date.
+function ConvertTo-AicmDate($Value) {
+  if ($null -eq $Value) { return $null }
+  if ($Value -is [datetime]) { return $Value }
+  $d = [datetime]::MinValue
+  $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+  if ([datetime]::TryParse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$d)) { return $d }
+  return $null
+}
+
+# A local calendar day (yyyy-MM-dd) read back from a state file ('' when there is none).
+function ConvertTo-AicmDay($Value) {
+  if ($null -eq $Value) { return '' }
+  if ($Value -is [datetime]) { return $Value.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }
+  return [string]$Value
+}
+
+function Get-AicmToday { return (Get-Date).ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) }
+
+# The global node_modules folder ('' when npm is missing).
+function Get-AicmNpmRoot {
   $prefix = (Get-AicmNpmInfo).Prefix
-  if (-not $prefix) { return }
-  $root = Join-Path $prefix 'node_modules'
-  if (-not (Test-Path -LiteralPath $root)) { $root = Join-Path $prefix 'lib\node_modules' }
-  if (-not (Test-Path -LiteralPath $root)) { return }
+  if (-not $prefix) { return '' }
+  foreach ($root in @((Join-Path $prefix 'node_modules'), (Join-Path $prefix 'lib\node_modules'))) {
+    if (Test-Path -LiteralPath $root) { return $root }
+  }
+  return ''
+}
+
+# npm's backup of a package it was replacing (node_modules\[@scope\].<name>-XXXXXXXX with a package.json),
+# left behind when the install was interrupted. '' when there is none.
+function Get-AicmNpmBackup([string]$Package) {
+  $root = Get-AicmNpmRoot
+  if (-not $root) { return '' }
+  $parts = $Package.Split('/')
+  $parent = if ($parts.Count -gt 1) { Join-Path $root $parts[0] } else { $root }
+  $name = $parts[$parts.Count - 1]
+  if (-not (Test-Path -LiteralPath $parent)) { return '' }
+  foreach ($d in ([System.IO.DirectoryInfo]::new($parent)).GetDirectories(".$name-*")) {
+    if ($d.Name -match ('^\.' + [regex]::Escape($name) + '-[A-Za-z0-9]{8}$') -and -not (Test-AicmLink $d) -and (Test-Path -LiteralPath (Join-Path $d.FullName 'package.json'))) {
+      return $d.FullName
+    }
+  }
+  return ''
+}
+
+# npm leaves folders named node_modules\.<name>-XXXXXXXX behind when an install stops half way: its
+# staging folder, or its backup of the copy it was replacing. On this tool's first test machine one of
+# them was 238 MB. Removes those older than a day, but only while <name> itself is installed (has a
+# package.json): otherwise the leftover may be the only good copy of a CLI whose install was cut off.
+function Remove-AicmNpmLeftovers {
+  $root = Get-AicmNpmRoot
+  if (-not $root) { return }
   $cutoff = (Get-Date).AddDays(-1)
   $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
   foreach ($d in ([System.IO.DirectoryInfo]::new($root)).GetDirectories()) {
@@ -666,7 +944,13 @@ function Remove-AicmNpmLeftovers {
     if ($d.Name.StartsWith('@')) { foreach ($s in $d.GetDirectories()) { $dirs.Add($s) } } else { $dirs.Add($d) }
   }
   foreach ($d in $dirs) {
-    if ($d.Name -notmatch '^\.[^.].*-[A-Za-z0-9]{8}$' -or (Test-AicmLink $d) -or $d.LastWriteTime -gt $cutoff) { continue }
+    if ($d.Name -notmatch '^\.([^.].*)-[A-Za-z0-9]{8}$') { continue }
+    $owner = $Matches[1]
+    if ((Test-AicmLink $d) -or $d.LastWriteTime -gt $cutoff) { continue }
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $d.Parent.FullName $owner) 'package.json'))) {
+      Write-Host "kept npm leftover $($d.FullName) ($owner is not installed; this may be its only copy)"
+      continue
+    }
     $bytes = 0L
     foreach ($f in (Get-AicmFiles $d.FullName)) { $bytes += $f.Length }
     try { Remove-AicmTree $d; Write-Host "removed npm leftover $($d.FullName) ($(Format-AicmSize $bytes))" }
@@ -675,18 +959,71 @@ function Remove-AicmNpmLeftovers {
 }
 
 # The version to install: the newest stable release that is at least N days old ('' when none is).
-function Get-AicmNpmTarget([string]$Package, [int]$MinAgeDays) {
-  if ($MinAgeDays -le 0) {
+# Unpublished versions never count. -SkipDeprecated (the updater) also passes over deprecated releases
+# newer than -Installed; when every newer one is deprecated, -Installed is returned (nothing to do).
+function Get-AicmNpmTarget([string]$Package, [int]$MinAgeDays, [string]$Installed = '', [switch]$SkipDeprecated) {
+  if ($MinAgeDays -le 0 -and -not $SkipDeprecated) {
     $r = Invoke-AicmWithTimeout 'npm' @('view', $Package, 'version') 60
-    return (Get-AicmSemver $r.Output)
+    return (Get-AicmSemver $r.StdOut)
   }
-  $view = Save-AicmNpmView @($Package, 'time', 'dist-tags')
-  try { return (@(Invoke-AicmNpmGuard @('pick', "$MinAgeDays", $view)) | Select-Object -First 1) }
+  $view = Save-AicmNpmView @($Package, 'time', 'dist-tags', 'versions')
+  try { $list = @(Invoke-AicmNpmGuard @('candidates', "$([Math]::Max(0, $MinAgeDays))", $view)) }
   finally { Remove-Item -LiteralPath $view -Force -ErrorAction SilentlyContinue }
+  if (-not $SkipDeprecated) { if ($list.Count -gt 0) { return $list[0] } else { return '' } }
+  $checked = 0
+  foreach ($v in $list) {
+    if ($Installed -and (Compare-AicmVersion $v $Installed) -le 0) { return $v }
+    if ($checked -ge 5) { break }
+    $checked++
+    $r = Invoke-AicmWithTimeout 'npm' @('view', "$Package@$v", 'deprecated') 60
+    if ($r.ExitCode -ne 0) { throw "npm view $Package@$v deprecated failed: $($r.Output.Trim())" }
+    $why = $r.StdOut.Trim()
+    if (-not $why) { return $v }
+    Write-Host "skip: $Package@$v is deprecated ($why)"
+  }
+  return $Installed
 }
 
+# --before=<now minus the waiting period>: npm then resolves the dependencies, too, to versions published
+# before that moment, so the waiting period covers them (their install scripts run in the real install).
+# Nothing when there is no waiting period.
+function Get-AicmNpmBeforeArgs([int]$MinAgeDays) {
+  if ($MinAgeDays -le 0) { return }
+  return ('--before=' + (Get-Date).ToUniversalTime().AddDays(-$MinAgeDays).ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture))
+}
+
+# Signature verdicts per package@version, kept for the day, so the scheduled retries do not download
+# and stage the same release again. Values: ok | unverifiable | bad: <summary>.
+function Get-AicmNpmVerdict([string]$Spec) {
+  $s = Read-AicmState 'npm-verdicts'
+  if (-not $s -or -not $s.PSObject.Properties[$Spec]) { return '' }
+  $e = $s.PSObject.Properties[$Spec].Value
+  if (-not $e -or -not $e.PSObject.Properties['day'] -or -not $e.PSObject.Properties['verdict']) { return '' }
+  if ((ConvertTo-AicmDay $e.day) -ne (Get-AicmToday)) { return '' }
+  return [string]$e.verdict
+}
+
+function Set-AicmNpmVerdict([string]$Spec, [string]$Verdict) {
+  $today = Get-AicmToday
+  $keep = [ordered]@{}
+  $s = Read-AicmState 'npm-verdicts'
+  if ($s) {
+    foreach ($p in $s.PSObject.Properties) {
+      if ($p.Name -ne $Spec -and $p.Value -and $p.Value.PSObject.Properties['day'] -and (ConvertTo-AicmDay $p.Value.day) -eq $today) { $keep[$p.Name] = $p.Value }
+    }
+  }
+  $keep[$Spec] = [ordered]@{ day = $today; verdict = $Verdict }
+  Write-AicmState 'npm-verdicts' $keep
+}
+
+# Notes for the caller's attention list (stable texts, so they are announced once a week at most).
+$script:AicmNpmNotes = New-Object System.Collections.Generic.List[string]
+$script:AicmNoKeysNote = 'the npm registry publishes no signing keys (a private registry?), so release signatures cannot be checked; updates go on without that check. Set AICM_VERIFY_SIGNATURES=0 to skip it'
+function Add-AicmNpmNote([string]$Text) { if (-not $script:AicmNpmNotes.Contains($Text)) { $script:AicmNpmNotes.Add($Text) } }
+
 # Throws when the candidate looks unlike the installed release or fails the registry signature check.
-function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Target) {
+function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Target, [int]$MinAgeDays = -1) {
+  if ($MinAgeDays -lt 0) { $MinAgeDays = Get-AicmMinReleaseAgeDays }
   $allowed = @(($env:AICM_ALLOW -split ',') | ForEach-Object { $_.Trim() }) -contains "$Package@$Target"
   if ($Installed) {
     $old = Save-AicmNpmView @("$Package@$Installed")
@@ -699,16 +1036,34 @@ function Test-AicmNpmRelease([string]$Package, [string]$Installed, [string]$Targ
     }
   }
   if ($env:AICM_VERIFY_SIGNATURES -eq '0') { return }
+  $spec = "$Package@$Target"
+  $verdict = Get-AicmNpmVerdict $spec
+  if ($verdict -eq 'ok') { Write-Host "signatures ok (checked earlier today): $spec"; return }
+  if ($verdict -eq 'unverifiable') { Write-Host "signatures not checkable (checked earlier today): $spec"; Add-AicmNpmNote $script:AicmNoKeysNote; return }
+  if ($verdict -like 'bad:*') { throw "signature check failed for ${spec} (checked earlier today): $($verdict.Substring(4).Trim())" }
   $stage = Join-Path ([System.IO.Path]::GetTempPath()) ('aicm-stage-' + [guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $stage -Force | Out-Null
   try {
     # --ignore-scripts: nothing from the candidate runs before it has passed the checks.
-    $r = Invoke-AicmWithTimeout 'npm' @('install', "$Package@$Target", '--prefix', $stage, '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error') 900
-    if ($r.ExitCode -ne 0) { throw "staged install of $Package@$Target failed: $($r.Output.Trim())" }
+    $r = Invoke-AicmWithTimeout 'npm' (@('install', $spec, '--prefix', $stage, '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error') + @(Get-AicmNpmBeforeArgs $MinAgeDays)) 900
+    if ($r.ExitCode -ne 0) { throw "staged install of $spec failed: $($r.Output.Trim())" }
     $r = Invoke-AicmWithTimeout 'npm' @('audit', 'signatures', '--prefix', $stage) 300
     $summary = @($r.Output -split "`r?`n" | Where-Object { $_.Trim() }) -join ' / '
-    if ($r.ExitCode -ne 0) { throw "signature check failed for $Package@${Target}: $summary" }
-    Write-Host "signatures ok: $summary"
+    if ($r.ExitCode -eq 0) {
+      Set-AicmNpmVerdict $spec 'ok'
+      Write-Host "signatures ok: $summary"
+      return
+    }
+    # A registry without signing keys (Verdaccio and other private registries): nothing can be checked.
+    if ($r.Output -match 'installed from a supported registry') {
+      Set-AicmNpmVerdict $spec 'unverifiable'
+      Write-Host "warn: signatures not checkable for ${spec}: $summary"
+      Add-AicmNpmNote $script:AicmNoKeysNote
+      return
+    }
+    # Remember a real signature problem for the day; other errors (network) are tried again next run.
+    if ($r.Output -match '(?i)(invalid|missing)[^\r\n]*signature') { Set-AicmNpmVerdict $spec "bad: $summary" }
+    throw "signature check failed for ${spec}: $summary"
   } finally {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
   }

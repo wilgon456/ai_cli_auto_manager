@@ -27,7 +27,13 @@ function New-TestFile([string]$Path, [int]$DaysOld, [int]$Bytes = 16) {
   (Get-Item -LiteralPath $Path).LastWriteTime = (Get-Date).AddDays(-$DaysOld)
 }
 
-function Invoke-Clean([string[]]$Arguments, [switch]$NoFakeCodex) {
+# The folder and every folder below it look untouched for that many days.
+function Set-DirAge([string]$Path, [int]$DaysOld) {
+  $when = (Get-Date).AddDays(-$DaysOld)
+  foreach ($d in @(Get-ChildItem -LiteralPath $Path -Recurse -Directory -Force) + @(Get-Item -LiteralPath $Path -Force)) { $d.LastWriteTime = $when }
+}
+
+function Invoke-Clean([string[]]$Arguments, [switch]$NoFakeCodex, [hashtable]$Env = @{}) {
   $exe = (Get-Process -Id $PID).Path
   $saved = @{}
   foreach ($k in 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'CODEX_HOME', 'PATH') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
@@ -37,6 +43,7 @@ function Invoke-Clean([string[]]$Arguments, [switch]$NoFakeCodex) {
     # If a real codex were ever reached, it would only see the throwaway home.
     $env:CODEX_HOME = $codexHome
     if (-not $NoFakeCodex) { $env:PATH = "$fakeBin;$($saved['PATH'])" }
+    foreach ($k in $Env.Keys) { if (-not $saved.ContainsKey($k)) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }; [Environment]::SetEnvironmentVariable($k, $Env[$k]) }
     $ErrorActionPreference = 'Continue'
     $output = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'bin\clean_ai_leftovers.ps1') @Arguments 2>&1 | Out-String -Width 300
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
@@ -49,6 +56,8 @@ $U1 = '11111111-1111-4111-8111-111111111111'; $U2 = '22222222-2222-4222-8222-222
 $U3 = '33333333-3333-4333-8333-333333333333'; $U4 = '44444444-4444-4444-8444-444444444444'
 $UX = 'ffffffff-ffff-4fff-8fff-ffffffffffff'; $UO = '55555555-5555-4555-8555-555555555555'; $UY = '66666666-6666-4666-8666-666666666666'
 $UE = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+# UT: a thread whose date is text; UM: a thread whose stored path is from an old home folder, file present
+$UT = '99999999-9999-4999-8999-999999999999'; $UM = '88888888-8888-4888-8888-888888888888'
 $python = @('python', 'python3', 'py') | Where-Object { Get-Command $_ -CommandType Application -ErrorAction SilentlyContinue } | Select-Object -First 1
 $pythonPath = if ($python) { (Get-Command $python -CommandType Application | Select-Object -First 1).Source } else { 'python' }
 
@@ -82,10 +91,17 @@ exit 0
   "& '$fakeBin\codex-impl.ps1' @args; exit `$LASTEXITCODE" | Set-Content -LiteralPath "$fakeBin\codex.ps1" -Encoding ASCII
   "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0codex-impl.ps1`" %*" | Set-Content -LiteralPath "$fakeBin\codex.cmd" -Encoding ASCII
 
-  # age rule: old scratch file goes, new one stays, protected names stay, junctions are not followed.
-  New-TestFile "$codexHome\.tmp\2026\08\old.bin" 40
-  New-TestFile "$codexHome\.tmp\2026\10\new.bin" 1
+  # age rule: a folder untouched for the rule's days goes as a whole; a folder with one fresh file stays
+  # whole (its old files too); protected names stay, junctions are not followed.
+  New-TestFile "$codexHome\.tmp\old-run\08\old.bin" 40
+  New-TestFile "$codexHome\.tmp\old-run\id_ed25519" 40
+  New-TestFile "$codexHome\.tmp\old-run\Memory\notes.md" 40
+  New-TestFile "$codexHome\.tmp\live\first.bin" 40
+  New-TestFile "$codexHome\.tmp\live\new.bin" 1
+  New-TestFile "$codexHome\.tmp\old-single.bin" 40
   New-TestFile "$codexHome\.tmp\MEMORY.md" 90
+  Set-DirAge "$codexHome\.tmp\old-run" 40
+  Set-DirAge "$codexHome\.tmp\live" 40
   New-TestFile "$outside\precious.txt" 90
   New-Item -ItemType Junction -Path "$codexHome\.tmp\linked" -Target $outside | Out-Null
   # archive rule: Claude transcripts, only *.jsonl, memory folder untouched; Claude's own setting is 20 days.
@@ -109,6 +125,7 @@ exit 0
   New-TestFile "$fakeHome\.codex\logs_9.sqlite" 1 10
   New-TestFile "$fakeTemp\claude\old\diff.txt" 5
   New-TestFile "$fakeTemp\claude\new\diff.txt" 0
+  Set-DirAge "$fakeTemp\claude\old" 5
   New-TestFile "$fakeTemp\stale.tmp" 10
   New-TestFile "$fakeTemp\fresh.tmp" 1
   foreach ($b in 1000, 1100, 1200) { New-TestFile "$fakeLocal\ms-playwright\chromium-$b\chrome.exe" 1 }
@@ -123,7 +140,10 @@ exit 0
       "insert into threads values ('$U1', '$($codexHome -replace '\\', '/')/sessions/x-$U1.jsonl', $($now - 40 * 86400), 0);" +
       "insert into threads values ('$UO', '$($codexHome -replace '\\', '/')/sessions/gone-$UO.jsonl', $($now - 100 * 86400), 0);" +
       "insert into threads values ('$UY', '$($codexHome -replace '\\', '/')/sessions/gone-$UY.jsonl', $($now - 50 * 86400), 0);" +
-      "insert into threads values ('$UE', '$($codexHome -replace '\\', '/')/sessions/gone-$UE.jsonl', $($now - 100 * 86400), 0);"
+      "insert into threads values ('$UE', '$($codexHome -replace '\\', '/')/sessions/gone-$UE.jsonl', $($now - 100 * 86400), 0);" +
+      "insert into threads values ('$UT', '$($codexHome -replace '\\', '/')/sessions/gone-$UT.jsonl', '2026-09-01', 0);" +
+      "insert into threads values ('$UM', 'D:/old-home/.codex/archived_sessions/rollout-$UM.jsonl', $($now - 100 * 86400), 1);"
+    New-TestFile "$codexHome\archived_sessions\rollout-2026-09-27T10-00-00-$UM.jsonl" 10
     & $python -c 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.commit()' "$codexHome\state_5.sqlite" $sql
     $dbOk = ($LASTEXITCODE -eq 0)
     "import sqlite3,sys`nc=sqlite3.connect(r'$codexHome\state_5.sqlite')`nc.execute('delete from threads where id = ?', (sys.argv[1],))`nc.commit()" |
@@ -144,7 +164,7 @@ exit 0
   $r = Invoke-Clean @('-DryRun')
   Write-Host $r.Output
   if ($r.ExitCode -eq 1) { Pass 'dry run reports refused rules with exit 1' } else { Fail "dry run exit was $($r.ExitCode)" }
-  Expect-Exists "$codexHome\.tmp\2026\08\old.bin" 'dry run removes nothing'
+  Expect-Exists "$codexHome\.tmp\old-run\08\old.bin" 'dry run removes nothing'
   Expect-Exists "$fakeHome\.claude\projects\p\old.jsonl" 'dry run archives nothing'
   Expect-Exists "$fakeLocal\ms-playwright\chromium-1000" 'dry run keeps old builds'
   if (@(Get-CodexCalls).Count -eq 0) { Pass 'dry run does not call codex' } else { Fail 'dry run called codex' }
@@ -155,10 +175,14 @@ exit 0
   Write-Host '# real run'
   $r = Invoke-Clean @()
   Write-Host $r.Output
-  Expect-Gone "$codexHome\.tmp\2026\08\old.bin" 'old scratch file removed'
-  Expect-Gone "$codexHome\.tmp\2026\08" 'emptied folder pruned'
+  Expect-Gone "$codexHome\.tmp\old-run\08\old.bin" 'old scratch file removed'
+  Expect-Gone "$codexHome\.tmp\old-run\08" 'emptied folder pruned'
+  Expect-Gone "$codexHome\.tmp\old-single.bin" 'old single file removed'
+  Expect-Exists "$codexHome\.tmp\old-run\id_ed25519" 'key file kept'
+  Expect-Exists "$codexHome\.tmp\old-run\Memory\notes.md" 'Memory folder kept (any letter case)'
   Expect-Exists "$codexHome\.tmp" 'rule root kept'
-  Expect-Exists "$codexHome\.tmp\2026\10\new.bin" 'fresh scratch file kept'
+  Expect-Exists "$codexHome\.tmp\live\new.bin" 'fresh scratch file kept'
+  Expect-Exists "$codexHome\.tmp\live\first.bin" 'old file of a folder still in use kept'
   Expect-Exists "$codexHome\.tmp\MEMORY.md" 'protected name kept'
   Expect-Exists "$outside\precious.txt" 'junction target outside never touched'
   Expect-Exists "$codexHome\.tmp\linked" 'junction itself kept by age rule'
@@ -181,6 +205,8 @@ exit 0
   if ($dbOk) {
     if ($calls -contains "delete --force $UO") { Pass 'session whose file is gone and unused 90+ days deleted' } else { Fail 'orphan delete' }
     if (-not ($calls -match $UY)) { Pass 'session whose file is gone but used within 90 days kept' } else { Fail 'young orphan touched' }
+    if (-not ($calls -match $UT)) { Pass 'thread with a date text left alone' } else { Fail 'text-date thread touched' }
+    if (-not ($calls -match $UM)) { Pass 'thread with a stale stored path but a present file is not an orphan' } else { Fail 'moved-home thread deleted' }
     $codexRow = @($r.Output -split "`r?`n" | Where-Object { $_ -like 'codex-sessions *' }) | Select-Object -First 1
     if ($codexRow -and $codexRow -notmatch 'in use or failed') { Pass 'sub-agent session removed with its parent is not reported as failed' } else { Fail "sub-agent recount: $codexRow" }
     Expect-Gone "$codexHome\archived_sessions\rollout-2026-05-01T10-00-00-$UX.jsonl" 'file Codex does not know is removed directly'
@@ -219,7 +245,7 @@ exit 0
     Write-Host 'skip - a real codex is installed on this machine'
   } else {
     $r = Invoke-Clean @('-Rules', 'codex-sessions') -NoFakeCodex
-    if ($r.Output -match 'codex command not found: nothing touched') { Pass 'missing codex command reported' } else { Fail 'missing codex' }
+    if ($r.Output -match 'codex command not found, Codex sessions were not cleaned' -and $r.ExitCode -eq 1) { Pass 'missing codex command reported as a problem' } else { Fail 'missing codex' }
     Expect-Exists "$codexHome\sessions\2026\07\01\rollout-2026-07-01T10-00-00-$U2.jsonl" 'codex files kept without the codex command'
   }
 
@@ -242,6 +268,30 @@ exit 0
   $null = Invoke-Clean @('-Rules', 'codex-images')
   Expect-Gone "$fakeHome\.codex\generated_images\pic.png" '-Rules runs an off rule'
   Expect-Exists "$aicmHome\archive\codex-images\$today\pic.png" '... and archives it'
+
+  Write-Host '# a temp folder above the home folder is never a cleanup area'
+  New-TestFile "$fakeHome\Documents\thesis.docx" 40
+  Set-DirAge "$fakeHome\Documents" 40
+  'temp-sweep | all | age | {temp} | * | 7 | | on |' | Set-Content -LiteralPath "$work\temp.conf" -Encoding UTF8
+  foreach ($t in $work, ([System.IO.Path]::GetPathRoot($work))) {
+    $r = Invoke-Clean @('-Rules', 'temp-sweep', '-LocalRulesFile', "$work\temp.conf") -Env @{ TEMP = $t; TMP = $t }
+    Expect-Exists "$fakeHome\Documents\thesis.docx" "TEMP=$t : home files kept"
+    if ($r.Output -match 'refused') { Pass "TEMP=$t : rule refused" } else { Fail "TEMP=$t not refused" }
+  }
+
+  Write-Host '# a clock far off deletes nothing'
+  New-TestFile "$codexHome\.tmp\clock-run\old.bin" 40
+  Set-DirAge "$codexHome\.tmp\clock-run" 40
+  (Get-Item -LiteralPath "$aicmHome\state\last-clean.json").LastWriteTime = (Get-Date).AddDays(3)
+  $r = Invoke-Clean @('-Rules', 'codex-tmp')
+  if ($r.ExitCode -eq 1 -and $r.Output -match 'system clock is earlier') { Pass 'clock behind the last run: refused' } else { Fail "clock check: exit $($r.ExitCode)" }
+  Expect-Exists "$codexHome\.tmp\clock-run\old.bin" 'clock behind the last run: nothing deleted'
+  (Get-Item -LiteralPath "$aicmHome\state\last-clean.json").LastWriteTime = (Get-Date).AddDays(-500)
+  $r = Invoke-Clean @('-Rules', 'codex-tmp')
+  if ($r.ExitCode -eq 1 -and $r.Output -match '400 days past') { Pass 'clock far ahead of the last run: refused' } else { Fail "clock jump: exit $($r.ExitCode)" }
+  Expect-Exists "$codexHome\.tmp\clock-run\old.bin" 'clock far ahead: nothing deleted'
+  $null = Invoke-Clean @('-Rules', 'codex-tmp') -Env @{ AICM_CLOCK_CHECK = '0' }
+  Expect-Gone "$codexHome\.tmp\clock-run\old.bin" 'AICM_CLOCK_CHECK=0 runs anyway'
 
   Write-Host '# unknown rule id'
   $r = Invoke-Clean @('-Rules', 'nope')

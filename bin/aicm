@@ -18,9 +18,9 @@ AI CLI Auto Manager $(aicm_version)
   aicm processes [--kill] [--min-age-hours 2]   agent processes left running after their session ended
   aicm status    disk use per cleanup rule, schedules, last runs
   aicm doctor    exit 1 when a schedule is missing or a run is overdue or failed
-  aicm schedule  install|remove|show [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
-                                     [--clean-day mon] [--clean-at 12:30] [--targets list]
-                                     [--no-update] [--no-inventory] [--no-clean]
+  aicm schedule  install|remove|show|refresh [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
+                                             [--clean-day mon] [--clean-at 12:30] [--targets list]
+                                             [--no-update] [--no-inventory] [--no-clean]
   aicm uninstall [--purge]
   aicm version
 EOF
@@ -43,16 +43,16 @@ state_older_than_days() { # name days
   [[ -n "$(find "$file" -mmin +"$(($2 * 1440))" 2>/dev/null)" ]]
 }
 
-scheduled_jobs() {
-  local file="$STATE_DIR/schedule.json"
-  [[ -f "$file" ]] || return 0
-  grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean|inventory)$' || true
-}
+scheduled_jobs() { aicm_scheduled_jobs; }
+
+# HH:MM or H:MM with hour 0-23 and minute 0-59.
+valid_time() { [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; }
 
 hm_hour() { local h="${1%%:*}"; echo $((10#$h)); }
 hm_minute() { local m="${1##*:}"; echo $((10#$m)); }
+hm_text() { printf '%02d:%02d' "$(hm_hour "$1")" "$(hm_minute "$1")"; }
 
-weekday_number() { # mon..sun or 1..7 -> 1..7 (Monday = 1, Sunday = 7)
+weekday_number() { # mon..sun or 0..7 -> 1..7 (Monday = 1, Sunday = 7)
   case "$(aicm_lower "$1")" in
     1|mon|monday) echo 1 ;; 2|tue|tuesday) echo 2 ;; 3|wed|wednesday) echo 3 ;;
     4|thu|thursday) echo 4 ;; 5|fri|friday) echo 5 ;; 6|sat|saturday) echo 6 ;;
@@ -61,39 +61,138 @@ weekday_number() { # mon..sun or 1..7 -> 1..7 (Monday = 1, Sunday = 7)
   esac
 }
 
+# A PATH entry the jobs can use: an absolute folder that exists, without quotes, backslashes, % or
+# XML characters (it goes into a plist and into schedule.json).
+path_entry_ok() {
+  [[ "$1" == /* && -d "$1" ]] || return 1
+  case "$1" in *[\"\'\\%\<\>\&]*) return 1 ;; esac
+  return 0
+}
+
+# Sets JOB_PATH: this shell's PATH, plus the folders of node, npm, brew and codex as found now (node
+# also by its real location, since nvm and fnm put it behind per-shell links), plus the system folders.
+# Sets JOB_TOOLS to the JSON members recording where node and npm were found.
+JOB_PATH="" JOB_TOOLS=""
+capture_job_path() {
+  local out="" e t found real
+  add_entry() {
+    path_entry_ok "$1" || return 0
+    case ":$out:" in *":$1:"*) ;; *) out="${out:+$out:}$1" ;; esac
+  }
+  # shellcheck disable=SC2031 # the PATH change in aicm_schedule_problems is in a subshell on purpose
+  while IFS= read -r -d ':' e; do add_entry "$e"; done <<< "${PATH:-}:"
+  JOB_TOOLS=""
+  for t in node npm brew codex; do
+    found="$(command -v "$t" 2>/dev/null || true)"
+    [[ "$found" == /* ]] || continue
+    add_entry "${found%/*}"
+    if [[ "$t" == node ]]; then
+      real="$(aicm_realpath "$found")"
+      [[ "$real" == /* ]] && add_entry "${real%/*}"
+    fi
+    if [[ "$t" == node || "$t" == npm ]]; then JOB_TOOLS+="${JOB_TOOLS:+,}\"$t\":\"$(aicm_json_escape "$found")\""; fi
+  done
+  for e in /usr/local/bin /opt/homebrew/bin /usr/bin /bin /usr/sbin /sbin; do add_entry "$e"; done
+  JOB_PATH="$out"
+}
+
+# Succeeds when weekly job $1 (due on day $2, 1 = Monday .. 7 = Sunday, at HH:MM $3) completed a run
+# after its latest due time, so a daily start can skip it. Any completed run counts, also a failed one:
+# it already reported its errors, and running it again every day would only repeat them.
+weekly_done() { # job day HH:MM
+  local state="$STATE_DIR/last-clean.json" today now_hm at_hm days_back ref rc=0
+  [[ "$1" == inventory ]] && state="$STATE_DIR/inventory.json"
+  [[ -f "$state" && "$2" =~ ^[1-7]$ ]] && valid_time "$3" || return 1
+  today="$(date +%u)"; now_hm="$(date +%H%M)"
+  at_hm="$(printf '%02d%02d' "$(hm_hour "$3")" "$(hm_minute "$3")")"
+  days_back=$(( (today - $2 + 7) % 7 ))
+  if ((days_back == 0 && 10#$now_hm < 10#$at_hm)); then days_back=7; fi
+  ref="$STATE_DIR/.weekly-due.$$"
+  touch -t "$(aicm_date_days_ago "$days_back")$at_hm" "$ref" 2>/dev/null || return 1
+  [[ "$state" -nt "$ref" ]] || rc=1
+  rm -f "$ref"
+  return "$rc"
+}
+
+# Runs a job from its crontab line: puts the PATH captured at install first, and for a weekly job
+# (--weekly day HH:MM) skips the run when this week's run already happened.
+scheduled_run() { # job [--weekly day HH:MM] args...
+  local job="${1:-}" p
+  shift || true
+  p="$(aicm_json_field "$STATE_DIR/schedule.json" path)"
+  # shellcheck disable=SC2031 # (see capture_job_path)
+  [[ -n "$p" ]] && export PATH="$p:$PATH"
+  if [[ "${1:-}" == --weekly ]]; then
+    (($# >= 3)) || { echo "--weekly needs a day and a time" >&2; exit 2; }
+    local day="$2" at="$3"
+    shift 3
+    if weekly_done "$job" "$day" "$at"; then
+      echo "[$(aicm_ts)] $job: this week's run already happened; nothing to do"
+      exit 0
+    fi
+  fi
+  case "$job" in
+    update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
+    inventory) exec "$BIN_DIR/inventory_ai_clis.sh" "$@" ;;
+    clean) exec "$BIN_DIR/clean_ai_leftovers.sh" "$@" ;;
+    *) echo "unknown scheduled job: $job" >&2; exit 2 ;;
+  esac
+}
+
+# Schedule options (set by schedule_install from the command line, by schedule_refresh from schedule.json).
+S_UPDATE_AT=05:00 S_INVENTORY_DAY=mon S_INVENTORY_AT=12:00 S_CLEAN_DAY=mon S_CLEAN_AT=12:30 S_TARGETS=""
+S_NO_UPDATE=false S_NO_INVENTORY=false S_NO_CLEAN=false
+SCHEDULE_CHANGED=false
+
+plist_content() { # label script hour minute weekday(or empty) args...
+  local label="$1" script="$2" hour="$3" minute="$4" weekday="$5" arg h
+  shift 5
+  echo '<?xml version="1.0" encoding="UTF-8"?>'
+  echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+  echo '<plist version="1.0"><dict>'
+  echo "  <key>Label</key><string>$label</string>"
+  echo '  <key>ProgramArguments</key><array>'
+  echo '    <string>/bin/bash</string>'
+  echo "    <string>$script</string>"
+  for arg in "$@"; do echo "    <string>$arg</string>"; done
+  echo '  </array>'
+  # launchd starts jobs with PATH=/usr/bin:/bin:/usr/sbin:/sbin; give them the PATH captured at install.
+  if [[ -n "$JOB_PATH" ]]; then
+    echo '  <key>EnvironmentVariables</key><dict>'
+    echo "    <key>PATH</key><string>$JOB_PATH</string>"
+    echo '  </dict>'
+  fi
+  # One start time per hour in the comma-separated list (the update job retries during the day).
+  echo '  <key>StartCalendarInterval</key><array>'
+  for h in ${hour//,/ }; do
+    echo '    <dict>'
+    [[ -n "$weekday" ]] && echo "      <key>Weekday</key><integer>$((weekday % 7))</integer>"
+    echo "      <key>Hour</key><integer>$h</integer>"
+    echo "      <key>Minute</key><integer>$minute</integer>"
+    echo '    </dict>'
+  done
+  echo '  </array>'
+  echo "  <key>StandardOutPath</key><string>$LOG_DIR/launchd.$job.out.log</string>"
+  echo "  <key>StandardErrorPath</key><string>$LOG_DIR/launchd.$job.err.log</string>"
+  echo '</dict></plist>'
+}
+
+# Writes and loads the job's plist; a plist that already has this content and is loaded is left alone.
 write_plist() { # job script hour minute weekday(or empty) args...
-  local job="$1" script="$2" hour="$3" minute="$4" weekday="$5"; shift 5
-  local label="$AICM_LAUNCHD_PREFIX.$job" plist arg
+  local job="$1" label="$AICM_LAUNCHD_PREFIX.$1" plist content
   plist="$HOME/Library/LaunchAgents/$label.plist"
   mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
-  {
-    echo '<?xml version="1.0" encoding="UTF-8"?>'
-    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
-    echo '<plist version="1.0"><dict>'
-    echo "  <key>Label</key><string>$label</string>"
-    echo '  <key>ProgramArguments</key><array>'
-    echo '    <string>/bin/bash</string>'
-    echo "    <string>$script</string>"
-    for arg in "$@"; do echo "    <string>$arg</string>"; done
-    echo '  </array>'
-    # One start time per hour in the comma-separated list (the update job retries during the day).
-    echo '  <key>StartCalendarInterval</key><array>'
-    local h
-    for h in ${hour//,/ }; do
-      echo '    <dict>'
-      [[ -n "$weekday" ]] && echo "      <key>Weekday</key><integer>$((weekday % 7))</integer>"
-      echo "      <key>Hour</key><integer>$h</integer>"
-      echo "      <key>Minute</key><integer>$minute</integer>"
-      echo '    </dict>'
-    done
-    echo '  </array>'
-    echo "  <key>StandardOutPath</key><string>$LOG_DIR/launchd.$job.out.log</string>"
-    echo "  <key>StandardErrorPath</key><string>$LOG_DIR/launchd.$job.err.log</string>"
-    echo '</dict></plist>'
-  } > "$plist"
+  shift
+  content="$(plist_content "$label" "$@")"
+  if [[ -f "$plist" && "$(cat "$plist")" == "$content" ]] && aicm_job_exists "$job"; then
+    [[ "$SCHEDULE_MODE" == refresh ]] || echo "unchanged:  $label"
+    return 0
+  fi
+  printf '%s\n' "$content" > "$plist"
   launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || launchctl load -w "$plist"
   echo "registered: $label"
+  SCHEDULE_CHANGED=true
 }
 
 remove_plist() {
@@ -103,92 +202,209 @@ remove_plist() {
   launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
   rm -f "$plist"
   echo "removed: $label"
+  SCHEDULE_CHANGED=true
 }
 
-cron_without_aicm() { crontab -l 2>/dev/null | grep -v '# aicm:' || true; }
+cron_without_aicm() { aicm_crontab -l 2>/dev/null | grep -v '# aicm:' || true; }
+cron_aicm_lines() { aicm_crontab -l 2>/dev/null | grep '# aicm:' || true; }
+
+# The clone the installed copy came from (when this runs from the installed copy itself).
+schedule_source() {
+  if [[ -f "$AICM_APP_DIR/SOURCE" && -d "$AICM_APP_DIR" && "$(cd "$AICM_ROOT" && pwd -P)" == "$(cd "$AICM_APP_DIR" && pwd -P)" ]]; then
+    head -n 1 "$AICM_APP_DIR/SOURCE"
+  else
+    printf '%s\n' "$AICM_ROOT"
+  fi
+}
 
 schedule_install() {
-  local update_at=05:00 inventory_day=mon inventory_at=12:00 clean_day=mon clean_at=12:30 targets=""
-  local no_update=false no_inventory=false no_clean=false
   while (($#)); do
     case "$1" in
-      --update-at) shift; update_at="${1:-}" ;;
-      --inventory-day) shift; inventory_day="${1:-}" ;;
-      --inventory-at) shift; inventory_at="${1:-}" ;;
-      --no-inventory) no_inventory=true ;;
-      --clean-day) shift; clean_day="${1:-}" ;;
-      --clean-at) shift; clean_at="${1:-}" ;;
-      --targets) shift; targets="${1:-}" ;;
-      --no-update) no_update=true ;;
-      --no-clean) no_clean=true ;;
+      --update-at) shift; S_UPDATE_AT="${1:-}" ;;
+      --inventory-day) shift; S_INVENTORY_DAY="${1:-}" ;;
+      --inventory-at) shift; S_INVENTORY_AT="${1:-}" ;;
+      --no-inventory) S_NO_INVENTORY=true ;;
+      --clean-day) shift; S_CLEAN_DAY="${1:-}" ;;
+      --clean-at) shift; S_CLEAN_AT="${1:-}" ;;
+      --targets) shift; S_TARGETS="${1:-}" ;;
+      --no-update) S_NO_UPDATE=true ;;
+      --no-clean) S_NO_CLEAN=true ;;
       *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
   done
-  local t
-  for t in "$update_at" "$inventory_at" "$clean_at"; do
-    [[ "$t" =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || { echo "times must look like 05:00" >&2; exit 2; }
+  schedule_apply install
+}
+
+plist_time() { # job -> "H:M weekday" from its plist
+  local f="$HOME/Library/LaunchAgents/$AICM_LAUNCHD_PREFIX.$1.plist"
+  [[ -f "$f" ]] || return 1
+  printf '%s:%s %s\n' \
+    "$(sed -n 's/.*<key>Hour<\/key><integer>\([0-9]*\)<.*/\1/p' "$f" | head -n 1)" \
+    "$(sed -n 's/.*<key>Minute<\/key><integer>\([0-9]*\)<.*/\1/p' "$f" | head -n 1)" \
+    "$(sed -n 's/.*<key>Weekday<\/key><integer>\([0-9]*\)<.*/\1/p' "$f" | head -n 1)"
+}
+
+# Options of a schedule installed by 2.5.1 or older (no "options" in schedule.json), read back from
+# the crontab lines or plists.
+schedule_options_from_jobs() {
+  local line m h d
+  if [[ "$(aicm_os)" == mac ]]; then
+    if line="$(plist_time update)"; then S_UPDATE_AT="${line%% *}"
+      S_TARGETS="$(awk '/<string>--targets<\/string>/ { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$HOME/Library/LaunchAgents/$AICM_LAUNCHD_PREFIX.update.plist")"
+    fi
+    if line="$(plist_time inventory)"; then S_INVENTORY_AT="${line%% *}"; [[ -n "${line#* }" ]] && S_INVENTORY_DAY="${line#* }"; fi
+    if line="$(plist_time clean)"; then S_CLEAN_AT="${line%% *}"; [[ -n "${line#* }" ]] && S_CLEAN_DAY="${line#* }"; fi
+  else
+    # "M H[,H...] * * D command # aicm:job"
+    line="$(cron_aicm_lines | grep '# aicm:update$' | head -n 1)"
+    if [[ -n "$line" ]]; then
+      read -r m h _ <<< "$line"
+      S_UPDATE_AT="${h%%,*}:$m"
+      if [[ "$line" == *" --targets "* ]]; then
+        S_TARGETS="${line#* --targets }"; S_TARGETS="${S_TARGETS%% *}"; S_TARGETS="${S_TARGETS//\\/}"
+      fi
+    fi
+    line="$(cron_aicm_lines | grep '# aicm:inventory$' | head -n 1)"
+    if [[ -n "$line" ]]; then read -r m h _ _ d _ <<< "$line"; S_INVENTORY_AT="$h:$m"; [[ "$d" != '*' ]] && S_INVENTORY_DAY="$d"; fi
+    line="$(cron_aicm_lines | grep '# aicm:clean$' | head -n 1)"
+    if [[ -n "$line" ]]; then read -r m h _ _ d _ <<< "$line"; S_CLEAN_AT="$h:$m"; [[ "$d" != '*' ]] && S_CLEAN_DAY="$d"; fi
+    # Lines of this version carry the weekly day and time as "--weekly day HH:MM".
+    line="$(cron_aicm_lines | grep '# aicm:inventory$' | sed -n 's/.* --weekly \([1-7]\) \([0-9:]*\) .*/\1 \2/p' | head -n 1)"
+    if [[ -n "$line" ]]; then S_INVENTORY_DAY="${line% *}"; S_INVENTORY_AT="${line#* }"; fi
+    line="$(cron_aicm_lines | grep '# aicm:clean$' | sed -n 's/.* --weekly \([1-7]\) \([0-9:]*\) .*/\1 \2/p' | head -n 1)"
+    if [[ -n "$line" ]]; then S_CLEAN_DAY="${line% *}"; S_CLEAN_AT="${line#* }"; fi
+  fi
+  # Crontab and plists hold plain numbers: 13:5 becomes 13:05.
+  local v
+  for v in S_UPDATE_AT S_INVENTORY_AT S_CLEAN_AT; do
+    if [[ "${!v}" =~ ^[0-9]{1,2}:[0-9]{1,2}$ ]]; then printf -v "$v" '%s' "$(hm_text "${!v}")"; fi
   done
-  [[ "$no_update" == true && "$no_inventory" == true && "$no_clean" == true ]] && { echo "nothing to install" >&2; exit 2; }
+  return 0
+}
+
+# Re-registers the installed jobs with their stored options (run by the update after it refreshed
+# the installed copy). Changes nothing when the jobs already match.
+schedule_refresh() {
+  local file="$STATE_DIR/schedule.json" jobs
+  [[ -f "$file" ]] || { echo "no schedule installed; nothing to refresh"; return 0; }
+  jobs="$(aicm_scheduled_jobs)"
+  [[ -n "$jobs" ]] || { echo "no scheduled jobs recorded; nothing to refresh"; return 0; }
+  if grep -q '"options":{' "$file"; then
+    S_UPDATE_AT="$(aicm_json_field "$file" updateAt)"; S_INVENTORY_DAY="$(aicm_json_field "$file" inventoryDay)"
+    S_INVENTORY_AT="$(aicm_json_field "$file" inventoryAt)"; S_CLEAN_DAY="$(aicm_json_field "$file" cleanDay)"
+    S_CLEAN_AT="$(aicm_json_field "$file" cleanAt)"; S_TARGETS="$(aicm_json_field "$file" targets)"
+  else
+    schedule_options_from_jobs
+  fi
+  grep -qx update <<< "$jobs" || S_NO_UPDATE=true
+  grep -qx inventory <<< "$jobs" || S_NO_INVENTORY=true
+  grep -qx clean <<< "$jobs" || S_NO_CLEAN=true
+  schedule_apply refresh
+}
+
+# Registers the jobs from the S_* options; jobs that already match are left alone, so running it again
+# changes nothing. Mode "refresh" keeps installedAt (and the file time the stale check reads).
+schedule_apply() {
+  SCHEDULE_MODE="$1"
+  local t
+  for t in "$S_UPDATE_AT" "$S_INVENTORY_AT" "$S_CLEAN_AT"; do
+    valid_time "$t" || { echo "invalid time '$t': use HH:MM with hour 0-23 and minute 0-59, like 05:00" >&2; exit 2; }
+  done
+  # 6:5 read back from a crontab line is stored as 06:05.
+  S_UPDATE_AT="$(hm_text "$S_UPDATE_AT")"; S_INVENTORY_AT="$(hm_text "$S_INVENTORY_AT")"; S_CLEAN_AT="$(hm_text "$S_CLEAN_AT")"
+  [[ "$S_NO_UPDATE" == true && "$S_NO_INVENTORY" == true && "$S_NO_CLEAN" == true ]] && { echo "nothing to install" >&2; exit 2; }
   local wd iwd jobs="" update_args=()
-  wd="$(weekday_number "$clean_day")" || exit 2
-  iwd="$(weekday_number "$inventory_day")" || exit 2
+  wd="$(weekday_number "$S_CLEAN_DAY")" || exit 2
+  iwd="$(weekday_number "$S_INVENTORY_DAY")" || exit 2
   update_args=(--scheduled)
-  [[ -n "$targets" ]] && update_args+=(--targets "$targets")
+  [[ -n "$S_TARGETS" ]] && update_args+=(--targets "$S_TARGETS")
   mkdir -p "$LOG_DIR"
   local app retry_hours h
-  app="$(aicm_sync_app_copy "$AICM_ROOT")"
-  echo "installed copy: $app (version $(aicm_version))"
+  app="$(aicm_sync_app_copy "$AICM_ROOT")" || { echo "could not create the installed copy in $AICM_APP_DIR" >&2; exit 1; }
+  [[ "$SCHEDULE_MODE" == refresh ]] || echo "installed copy: $app (version $(aicm_version))"
+  # The PATH the jobs get, and where node and npm were found. A refresh (run by the scheduled update,
+  # whose PATH is not the user's) keeps what the install captured.
+  local sched_file="$STATE_DIR/schedule.json"
+  if [[ "$SCHEDULE_MODE" == refresh && -n "$(aicm_json_field "$sched_file" path)" ]]; then
+    JOB_PATH="$(aicm_json_field "$sched_file" path)"
+    JOB_TOOLS="$(sed -n 's/.*"tools":{\([^}]*\)}.*/\1/p' "$sched_file" | head -n 1)"
+  else
+    capture_job_path
+  fi
+  if [[ "$SCHEDULE_MODE" != refresh ]]; then
+    for t in node npm; do
+      grep -q "\"$t\":\"" <<< "$JOB_TOOLS" || echo "note: $t not found on PATH; jobs that need it will report it as missing"
+    done
+  fi
   # The update job retries every 3 hours for 15 hours; a run after a complete success that day exits at once.
-  retry_hours="$(hm_hour "$update_at")"
-  for h in 3 6 9 12 15; do retry_hours+=",$(( ($(hm_hour "$update_at") + h) % 24 ))"; done
+  retry_hours="$(hm_hour "$S_UPDATE_AT")"
+  for h in 3 6 9 12 15; do retry_hours+=",$(( ($(hm_hour "$S_UPDATE_AT") + h) % 24 ))"; done
 
   if [[ "$(aicm_os)" == mac ]]; then
-    if [[ "$no_update" == true ]]; then remove_plist update
-    else write_plist update "$app/bin/update_ai_clis.sh" "$retry_hours" "$(hm_minute "$update_at")" "" "${update_args[@]}"; jobs+='"update",'; fi
-    if [[ "$no_inventory" == true ]]; then remove_plist inventory
-    else write_plist inventory "$app/bin/inventory_ai_clis.sh" "$(hm_hour "$inventory_at")" "$(hm_minute "$inventory_at")" "$iwd"; jobs+='"inventory",'; fi
-    if [[ "$no_clean" == true ]]; then remove_plist clean
-    else write_plist clean "$app/bin/clean_ai_leftovers.sh" "$(hm_hour "$clean_at")" "$(hm_minute "$clean_at")" "$wd"; jobs+='"clean",'; fi
-    if [[ -f "$HOME/Library/LaunchAgents/com.example.ai-cli-auto-update.plist" ]]; then
+    if [[ "$S_NO_UPDATE" == true ]]; then remove_plist update
+    else write_plist update "$app/bin/update_ai_clis.sh" "$retry_hours" "$(hm_minute "$S_UPDATE_AT")" "" "${update_args[@]}"; jobs+='"update",'; fi
+    if [[ "$S_NO_INVENTORY" == true ]]; then remove_plist inventory
+    else write_plist inventory "$app/bin/inventory_ai_clis.sh" "$(hm_hour "$S_INVENTORY_AT")" "$(hm_minute "$S_INVENTORY_AT")" "$iwd"; jobs+='"inventory",'; fi
+    if [[ "$S_NO_CLEAN" == true ]]; then remove_plist clean
+    else write_plist clean "$app/bin/clean_ai_leftovers.sh" "$(hm_hour "$S_CLEAN_AT")" "$(hm_minute "$S_CLEAN_AT")" "$wd"; jobs+='"clean",'; fi
+    if [[ "$SCHEDULE_MODE" != refresh && -f "$HOME/Library/LaunchAgents/com.example.ai-cli-auto-update.plist" ]]; then
       echo "note: the old template job com.example.ai-cli-auto-update is still installed; remove it with:"
       echo "  launchctl unload ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist && rm ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist"
     fi
   else
-    command -v crontab >/dev/null 2>&1 || { echo "crontab is not available" >&2; exit 1; }
-    local lines="" q_update q_clean q_inventory q_targets=""
-    q_update="$(printf '%q' "$app/bin/update_ai_clis.sh")"
-    q_clean="$(printf '%q' "$app/bin/clean_ai_leftovers.sh")"
-    q_inventory="$(printf '%q' "$app/bin/inventory_ai_clis.sh")"
-    [[ -n "$targets" ]] && q_targets=" --targets $(printf '%q' "$targets")"
-    if [[ "$no_update" != true ]]; then
-      lines+="$(hm_minute "$update_at") $retry_hours * * * /bin/bash $q_update --scheduled$q_targets >> $(printf '%q' "$LOG_DIR/cron.update.log") 2>&1 # aicm:update"$'\n'
+    command -v "${AICM_CRONTAB:-crontab}" >/dev/null 2>&1 || { echo "crontab is not available" >&2; exit 1; }
+    # Each line runs "aicm scheduled <job>", which puts the PATH captured here back first (cron gives
+    # only /usr/bin:/bin, and a long PATH on the line itself would be cut at 1000 characters by
+    # Debian's cron). cron does not run missed jobs, so the weekly jobs are started every day at
+    # their time and run only when this week's run has not happened yet (--weekly day time).
+    local lines="" q_aicm q_targets=""
+    q_aicm="$(printf '%q' "$app/bin/aicm")"
+    [[ -n "$S_TARGETS" ]] && q_targets=" --targets $(printf '%q' "$S_TARGETS")"
+    if [[ "$S_NO_UPDATE" != true ]]; then
+      lines+="$(hm_minute "$S_UPDATE_AT") $retry_hours * * * /bin/bash $q_aicm scheduled update --scheduled$q_targets >> $(printf '%q' "$LOG_DIR/cron.update.log") 2>&1 # aicm:update"$'\n'
       jobs+='"update",'
     fi
-    if [[ "$no_inventory" != true ]]; then
-      lines+="$(hm_minute "$inventory_at") $(hm_hour "$inventory_at") * * $((iwd % 7)) /bin/bash $q_inventory >> $(printf '%q' "$LOG_DIR/cron.inventory.log") 2>&1 # aicm:inventory"$'\n'
+    if [[ "$S_NO_INVENTORY" != true ]]; then
+      lines+="$(hm_minute "$S_INVENTORY_AT") $(hm_hour "$S_INVENTORY_AT") * * * /bin/bash $q_aicm scheduled inventory --weekly $iwd $S_INVENTORY_AT >> $(printf '%q' "$LOG_DIR/cron.inventory.log") 2>&1 # aicm:inventory"$'\n'
       jobs+='"inventory",'
     fi
-    if [[ "$no_clean" != true ]]; then
-      lines+="$(hm_minute "$clean_at") $(hm_hour "$clean_at") * * $((wd % 7)) /bin/bash $q_clean >> $(printf '%q' "$LOG_DIR/cron.clean.log") 2>&1 # aicm:clean"$'\n'
+    if [[ "$S_NO_CLEAN" != true ]]; then
+      lines+="$(hm_minute "$S_CLEAN_AT") $(hm_hour "$S_CLEAN_AT") * * * /bin/bash $q_aicm scheduled clean --weekly $wd $S_CLEAN_AT >> $(printf '%q' "$LOG_DIR/cron.clean.log") 2>&1 # aicm:clean"$'\n'
       jobs+='"clean",'
     fi
-    local current
-    current="$(cron_without_aicm)"
-    { [[ -n "$current" ]] && printf '%s\n' "$current"; printf '%s' "$lines"; } | crontab -
-    printf '%s' "$lines" | sed 's/^/registered: /'
+    if [[ "$(cron_aicm_lines)" == "${lines%$'\n'}" ]]; then
+      [[ "$SCHEDULE_MODE" == refresh ]] || printf '%s' "$lines" | sed 's/^/unchanged:  /'
+    else
+      local current
+      current="$(cron_without_aicm)"
+      { [[ -n "$current" ]] && printf '%s\n' "$current"; printf '%s' "$lines"; } | aicm_crontab -
+      printf '%s' "$lines" | sed 's/^/registered: /'
+      SCHEDULE_CHANGED=true
+    fi
   fi
-  aicm_state_write schedule "{\"installedAt\":\"$(aicm_ts)\",\"version\":\"$(aicm_version)\",\"app\":\"$(aicm_json_escape "$app")\",\"source\":\"$(aicm_json_escape "$AICM_ROOT")\",\"jobs\":[${jobs%,}]}"
-  echo "Each run checks that the other jobs still exist and shows a desktop notification if one is gone."
+  local file="$STATE_DIR/schedule.json" installed_at ref=""
+  installed_at="$(aicm_ts)"
+  if [[ "$SCHEDULE_MODE" == refresh && -f "$file" ]]; then
+    t="$(aicm_json_field "$file" installedAt)"; [[ -n "$t" ]] && installed_at="$t"
+    ref="$STATE_DIR/.schedule-time.$$"; touch -r "$file" "$ref"
+  fi
+  aicm_state_write schedule "{\"installedAt\":\"$installed_at\",\"version\":\"$(aicm_version)\",\"app\":\"$(aicm_json_escape "$app")\",\"source\":\"$(aicm_json_escape "$(schedule_source)")\",\"jobs\":[${jobs%,}],\"options\":{\"updateAt\":\"$S_UPDATE_AT\",\"inventoryDay\":\"$iwd\",\"inventoryAt\":\"$S_INVENTORY_AT\",\"cleanDay\":\"$wd\",\"cleanAt\":\"$S_CLEAN_AT\",\"targets\":\"$(aicm_json_escape "$S_TARGETS")\"},\"path\":\"$(aicm_json_escape "$JOB_PATH")\",\"tools\":{$JOB_TOOLS}}"
+  if [[ -n "$ref" ]]; then touch -r "$ref" "$file"; rm -f "$ref"; fi
+  if [[ "$SCHEDULE_MODE" == refresh ]]; then
+    [[ "$SCHEDULE_CHANGED" == true ]] || echo "scheduled jobs already match the installed copy"
+  else
+    echo "Each run checks that the other jobs still exist and shows a desktop notification if one is gone."
+  fi
 }
 
 schedule_remove() {
   if [[ "$(aicm_os)" == mac ]]; then
     remove_plist update; remove_plist inventory; remove_plist clean
-  elif command -v crontab >/dev/null 2>&1; then
+  elif command -v "${AICM_CRONTAB:-crontab}" >/dev/null 2>&1; then
     local current
     current="$(cron_without_aicm)"
-    if [[ -n "$current" ]]; then printf '%s\n' "$current" | crontab -; else crontab -r 2>/dev/null || printf '' | crontab -; fi
+    if [[ -n "$current" ]]; then printf '%s\n' "$current" | aicm_crontab -; else aicm_crontab -r 2>/dev/null || printf '' | aicm_crontab -; fi
     echo "removed aicm crontab lines"
   fi
   rm -f "$STATE_DIR/schedule.json"
@@ -199,8 +415,8 @@ schedule_show() {
   for job in update inventory clean; do
     if aicm_job_exists "$job"; then printf '%-10s registered\n' "$job"; else printf '%-10s not registered\n' "$job"; fi
   done
-  if [[ "$(aicm_os)" != mac ]] && command -v crontab >/dev/null 2>&1; then
-    crontab -l 2>/dev/null | grep '# aicm:' | sed 's/^/  /' || true
+  if [[ "$(aicm_os)" != mac ]] && command -v "${AICM_CRONTAB:-crontab}" >/dev/null 2>&1; then
+    aicm_crontab -l 2>/dev/null | grep '# aicm:' | sed 's/^/  /' || true
   fi
 }
 
@@ -229,16 +445,58 @@ doctor() {
   fi
   if ((${#problems[@]} == 0)); then
     echo "healthy: schedules registered, recent runs succeeded"
+    recent_notifications 3
     return 0
   fi
   for p in "${problems[@]}"; do echo "problem: $p"; done
+  recent_notifications 3
   return 1
+}
+
+# The last N notifications (they may never have shown on screen, e.g. from cron).
+recent_notifications() { # count
+  local log="$LOG_DIR/notifications.log"
+  [[ -s "$log" ]] || return 0
+  echo "recent notifications ($log):"
+  tail -n "$1" "$log" | sed 's/^/  /'
+}
+
+# What --purge removes: only what this tool writes. Hooks, *.local.conf, repos.conf and anything else
+# the user put there stay, and the folder itself goes only when nothing is left in it. A folder
+# without the .aicm-home marker is purged only when it is the default ~/.ai-cli-auto-manager.
+purge_home() {
+  local h="$AICM_HOME" item
+  [[ -d "$h" ]] || { echo "nothing to purge: $h does not exist"; return 0; }
+  if [[ ! -f "$h/.aicm-home" && "$(basename "$h")" != .ai-cli-auto-manager ]]; then
+    echo "refusing to purge $h: it has no .aicm-home marker, so it may not be an AI CLI Auto Manager folder" >&2
+    exit 1
+  fi
+  for item in app app.new app.old logs state archive inventory.md; do
+    [[ -e "$h/$item" || -L "$h/$item" ]] || continue
+    rm -rf -- "${h:?}/$item" && echo "removed $h/$item"
+  done
+  local left="" f
+  for f in "$h"/* "$h"/.[!.]* "$h"/..?*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    [[ "${f##*/}" == .aicm-home ]] && continue
+    left+="${f##*/} "
+  done
+  if [[ -z "$left" ]]; then
+    rm -f -- "$h/.aicm-home"
+    rmdir -- "$h" && echo "removed $h"
+  else
+    echo "kept $h, which still holds files you wrote: ${left% }"
+  fi
 }
 
 cmd="${1:-help}"
 (($#)) && shift
+# The commands that write into AICM_HOME mark it as ours (uninstall never does).
+case "$cmd" in update|inventory|clean|schedule|scheduled) aicm_mark_home ;; esac
 case "$cmd" in
   update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
+  # Internal: what the crontab lines run.
+  scheduled) scheduled_run "$@" ;;
   inventory) exec "$BIN_DIR/inventory_ai_clis.sh" "$@" ;;
   clean) exec "$BIN_DIR/clean_ai_leftovers.sh" "$@" ;;
   worktrees|config|processes)
@@ -264,6 +522,9 @@ case "$cmd" in
       grep '^| ' "$AICM_HOME/inventory.md" | tail -n +3 | awk -F '|' '{ for (i = 2; i <= 7; i++) gsub(/^ +| +$/, "", $i); printf "%-20s %-11s %-14s %-9s %s\n", $2, $3, $4, $6, $7 }'
     fi
     echo
+    echo "== recent notifications =="
+    if [[ -s "$LOG_DIR/notifications.log" ]]; then tail -n 5 "$LOG_DIR/notifications.log"; else echo "none"; fi
+    echo
     echo "== disk use by cleanup rule =="
     exec "$BIN_DIR/clean_ai_leftovers.sh" --report
     ;;
@@ -273,20 +534,21 @@ case "$cmd" in
     (($#)) && shift
     case "$action" in
       install) schedule_install "$@" ;;
+      refresh) schedule_refresh ;;
       remove) schedule_remove ;;
       show) schedule_show ;;
-      *) echo "unknown schedule action: $action (use install, remove or show)" >&2; exit 2 ;;
+      *) echo "unknown schedule action: $action (use install, remove, show or refresh)" >&2; exit 2 ;;
     esac
     ;;
   uninstall)
     # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless --purge.
     schedule_remove
-    if [[ -d "$AICM_APP_DIR" && "$(cd "$AICM_ROOT" && pwd -P)" != "$(cd "$AICM_APP_DIR" && pwd -P)" ]]; then
+    # Only a folder that holds an installed copy (it has the SOURCE file) is removed.
+    if [[ -f "$AICM_APP_DIR/SOURCE" && "$(cd "$AICM_ROOT" && pwd -P)" != "$(cd "$AICM_APP_DIR" && pwd -P)" ]]; then
       rm -rf -- "${AICM_APP_DIR:?}"; echo "removed installed copy: $AICM_APP_DIR"
     fi
     if [[ "${1:-}" == --purge ]]; then
-      [[ "$(basename "$AICM_HOME")" == .ai-cli-auto-manager || -n "${AICM_HOME_SET:-}" ]] || { echo "refusing to purge $AICM_HOME" >&2; exit 1; }
-      rm -rf -- "${AICM_HOME:?}"; echo "removed $AICM_HOME (logs, state, archive)"
+      purge_home
     else
       echo "kept $AICM_HOME (logs, state, archive, local rules); add --purge to remove it too"
     fi

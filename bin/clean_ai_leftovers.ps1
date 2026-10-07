@@ -58,7 +58,46 @@ function Remove-FileQuietly([System.IO.FileInfo]$File) {
   }
 }
 
+function Get-NewestWrite([System.IO.FileSystemInfo]$Item) {
+  $newest = $Item.LastWriteTime
+  if ($Item -is [System.IO.DirectoryInfo]) {
+    foreach ($f in (Get-AicmFiles $Item.FullName)) { if ($f.LastWriteTime -gt $newest) { $newest = $f.LastWriteTime } }
+  }
+  return $newest
+}
+
+# Each entry directly in $Root (a session folder, a temp folder, a file) is one unit: it goes only when
+# nothing inside it changed for Days. Deleting old files one by one would break folders still in use
+# (an open session whose first file is old, a plugin checkout). Units are checked and deleted one at a
+# time, so a session resumed while the cleanup runs is seen before anything of it is deleted.
 function Invoke-AgeRule($Rule, [string]$Root) {
+  $cutoff = (Get-Date).AddDays(-$Rule.Days)
+  $result = [ordered]@{ files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0 }
+  $units = @()
+  try { $units = @(([System.IO.DirectoryInfo]::new($Root)).GetFileSystemInfos($Rule.Pattern)) } catch { return $result }
+  foreach ($unit in $units) {
+    if (Test-AicmLink $unit) { continue }
+    if ((Get-NewestWrite $unit) -ge $cutoff) { continue }
+    $files = if ($unit -is [System.IO.DirectoryInfo]) { @(Get-AicmFiles $unit.FullName) } else { @($unit) }
+    $files = @($files | Where-Object { -not (Test-AicmProtected $_) })
+    $result.files += $files.Count
+    foreach ($f in $files) { $result.bytes += $f.Length }
+    if ($DryRun) { continue }
+    foreach ($f in $files) {
+      $len = $f.Length
+      if (Remove-FileQuietly $f) { $result.removed++; $result.removedBytes += $len } else { $result.inUse++ }
+    }
+    if ($unit -is [System.IO.DirectoryInfo]) {
+      [void](Remove-AicmEmptyDirs $unit.FullName)
+      try { if (@($unit.GetFileSystemInfos()).Count -eq 0) { $unit.Delete($false) } } catch { }
+    }
+  }
+  return $result
+}
+
+# Single old files, wherever they are: for caches whose entries stand alone (content-addressed npm and
+# pip caches), where a folder is never "in use" as a whole.
+function Invoke-AgeFilesRule($Rule, [string]$Root) {
   $cutoff = (Get-Date).AddDays(-$Rule.Days)
   $candidates = @(Get-AicmFiles $Root $Rule.Pattern | Where-Object { $_.LastWriteTime -lt $cutoff -and -not (Test-AicmProtected $_) })
   $result = [ordered]@{ files = $candidates.Count; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0 }
@@ -191,7 +230,12 @@ function Invoke-ArchiveRule($Rule, [string]$Root, [bool]$PurgeDry) {
 function Invoke-CodexRule($Rule, [string]$Root) {
   $result = New-ArchiveResult
   $codex = Resolve-AicmExecutable 'codex'
-  if (-not $codex) { $result.detail = 'codex command not found: nothing touched'; return $result }
+  if (-not $codex) {
+    # Sessions without the codex command: Codex was used here, but scheduled runs cannot find it.
+    if (Test-Path -LiteralPath (Join-Path $Root 'sessions')) { throw 'codex command not found, Codex sessions were not cleaned' }
+    $result.detail = 'codex command not found: nothing touched'
+    return $result
+  }
   $now = Get-Date
   $archiveCut = $now.AddDays(-$Rule.Days)
   $deleteCut = $now.AddDays(-($Rule.Days + $Rule.Limit))
@@ -209,13 +253,20 @@ function Invoke-CodexRule($Rule, [string]$Root) {
   $threads = Get-AicmCodexThreads $Root
   $orphans = @()
   if ($threads) {
+    # A thread is orphaned only when no rollout file with its id exists anywhere under sessions or
+    # archived_sessions; the stored path is not trusted (a moved home folder, WSL, encodings).
+    $present = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($sub in 'sessions', 'archived_sessions') {
+      $dir = Join-Path $Root $sub
+      if (Test-Path -LiteralPath $dir) { foreach ($f in (Get-AicmFiles $dir 'rollout-*')) { $id = Get-AicmCodexId $f.Name; if ($id) { [void]$present.Add($id) } } }
+    }
     $epochCut = ($deleteCut.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
     foreach ($id in $threads.Keys) {
       $t = $threads[$id]
-      if ($t.Rollout -and -not (Test-Path -LiteralPath $t.Rollout) -and $t.Updated -gt 0 -and $t.Updated -lt $epochCut) { $orphans += $id }
+      if (-not $present.Contains($id) -and $t.Updated -gt 0 -and $t.Updated -lt $epochCut) { $orphans += $id }
     }
   } else {
-    $result.detail = 'Codex database not read (Python not found): sessions whose file is already gone are left alone'
+    $result.detail = 'Codex database not read (Python not found, or an unknown layout): sessions whose file is already gone are left alone'
   }
   $result.files = $toArchive.Count
   foreach ($f in $toArchive) { $result.bytes += $f.Length }
@@ -265,6 +316,19 @@ function Invoke-CommandRule($Rule) {
   return [ordered]@{ status = "ran: $detail" }
 }
 
+# Every age comes from the clock, so a clock far off (a dead CMOS battery, a restored VM snapshot, a
+# wrong NTP answer) would make everything look old. Compared with when the last run wrote its state.
+function Get-ClockProblem {
+  if ($env:AICM_CLOCK_CHECK -eq '0') { return '' }
+  $file = Join-Path (Join-Path (Get-AicmHome) 'state') 'last-clean.json'
+  if (-not (Test-Path -LiteralPath $file)) { return '' }
+  $when = (Get-Item -LiteralPath $file).LastWriteTimeUtc
+  $now = (Get-Date).ToUniversalTime()
+  if ($now -lt $when.AddDays(-1)) { return 'the system clock is earlier than the last cleanup run: nothing deleted until the clock is right' }
+  if ($now -gt $when.AddDays(400)) { return 'the system clock is more than 400 days past the last cleanup run: nothing deleted (if the date is right, run once with AICM_CLOCK_CHECK=0)' }
+  return ''
+}
+
 function Remove-OldCleanLogs {
   if ($DryRun -or $LogRetentionDays -le 0) { return }
   $cutoff = (Get-Date).AddDays(-$LogRetentionDays)
@@ -291,8 +355,7 @@ if (-not $Report) {
   Start-Transcript -Path $transcript -Force | Out-Null
 }
 
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$mutex = [System.Threading.Mutex]::new($false, "Local\ai-cli-auto-manager-clean-$($identity.User.Value)")
+$mutex = [System.Threading.Mutex]::new($false, (Get-AicmLockName 'clean'))
 $hasLock = $false
 $exitCode = 0
 try {
@@ -305,6 +368,12 @@ try {
   $mode = if ($Report) { 'report' } elseif ($DryRun) { 'dry-run' } else { 'clean' }
   if (-not $Report) {
     Write-Host "[$(Get-AicmTimestamp)] AI leftover cleanup started (mode=$mode, version=$(Get-AicmVersion))"
+  }
+  $clockProblem = Get-ClockProblem
+  if ($clockProblem) {
+    Write-Host "problem: $clockProblem"
+    # No state is written, so the guard keeps comparing with the last good run.
+    if (-not $DryRun) { Send-AicmAttention 'clean' @("cleanup: $clockProblem"); exit 1 }
   }
 
   $rows = New-Object System.Collections.Generic.List[object]
@@ -325,7 +394,7 @@ try {
       } else {
         $root = Expand-AicmPath $rule.Path
         $row.path = Get-DisplayPath $root
-        if (-not (Test-AicmAllowedPath $root)) {
+        if (-not (Test-AicmAllowedPath $root ($rule.Path -like '*{temp}*'))) {
           $row.status = 'refused: outside home and temp'
           $errors.Add("$($rule.Id): path outside home and temp")
         } elseif (-not (Test-Path -LiteralPath $root -PathType Container)) {
@@ -339,6 +408,7 @@ try {
           try {
             $r = switch ($rule.Kind) {
               'age' { Invoke-AgeRule $rule $root }
+              'age-files' { Invoke-AgeFilesRule $rule $root }
               'cap' { Invoke-CapRule $rule $root }
               'keep-latest' { Invoke-KeepLatestRule $rule $root }
               'archive' { Invoke-ArchiveRule $rule $root $wasDry }
@@ -365,7 +435,7 @@ try {
 
   Write-Host ''
   foreach ($row in $rows) {
-    $age = switch ($row.kind) { 'age' { 'age' } 'cap' { 'cap' } 'keep-latest' { 'keep' } 'archive' { 'arch' } 'codex' { if ($row.direct) { 'del' } else { 'arch' } } default { 'cmd' } }
+    $age = switch ($row.kind) { 'age' { 'age' } 'age-files' { 'age' } 'cap' { 'cap' } 'keep-latest' { 'keep' } 'archive' { 'arch' } 'codex' { if ($row.direct) { 'del' } else { 'arch' } } default { 'cmd' } }
     $unit = if ($row.kind -eq 'keep-latest') { 'dirs ' } else { 'files' }
     $done = @('removed', 'archived') -contains $row.status
     $size = if ($row.kind -eq 'command') { '' } elseif ($row.direct -and $done) { "{0,6} {1} {2,10}" -f $row.purged, $unit, (Format-AicmSize $row.purgedBytes) } elseif ($row.direct) { "{0,6} {1} {2,10}" -f $row.purge, $unit, (Format-AicmSize $row.purgeBytes) } elseif ($done) { "{0,6} {1} {2,10}" -f $row.removed, $unit, (Format-AicmSize $row.removedBytes) } else { "{0,6} {1} {2,10}" -f $row.files, $unit, (Format-AicmSize $row.bytes) }

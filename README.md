@@ -191,13 +191,13 @@ Write rows in the same format to `~/.ai-cli-auto-manager/clean-rules.local.conf`
 ```text
 # id                | os      | kind        | path                          | pattern   | days | limit | default | note
 playwright-browsers | windows | keep-latest | {localappdata}/ms-playwright  | *         |      | 2     | on      | clean old builds
-codex-sessions      | all     | codex       | ~/.codex                      | rollout-* | 30   | 60    | on      | archive at 30 days, delete at 90
+codex-sessions      | all     | codex       | {codex}                       | rollout-* | 30   | 60    | on      | archive at 30 days, delete at 90
 claude-transcripts  | all     | archive     | ~/.claude/projects            | *.jsonl   | 30   | 60    | on      | archive Claude transcripts too
 os-temp             | windows | age         | {temp}                        | *         | 7    |       | off     | turn off
 my-notebook-cache   | all     | age         | ~/.cache/my-tool              | *.tmp     | 14   |       | on      | add your own
 ```
 
-There are six kinds. `age` deletes files older than `days` and prunes empty folders. `codex` deletes through Codex's commands (`limit` 0) or archives first. `archive` moves files to the archive and deletes them `limit` days later. `cap` deletes files directly in the folder when older than `days` or larger than `limit` MB. `keep-latest` keeps the newest `limit` versioned folders (`name-1234`) per name. `command` runs a tool's own cleanup command.
+There are seven kinds. `age` treats each entry directly in the folder (a session folder, a file) as one unit and deletes it once nothing inside it changed for `days`, so a folder still in use is never thinned out. `age-files` deletes single files older than `days` anywhere below the folder (for caches whose entries stand alone). `codex` deletes through Codex's commands (`limit` 0) or archives first. `archive` moves files to the archive and deletes them `limit` days later. `cap` deletes files directly in the folder when older than `days` or larger than `limit` MB. `keep-latest` keeps the newest `limit` versioned folders (`name-1234`) per name. `command` runs a tool's own cleanup command.
 
 ## Running many sessions (Paseo, Orca, ...)
 
@@ -231,12 +231,16 @@ Links inside the worktree (for example a `node_modules` junction to a shared cop
 | macOS | `~/Library/LaunchAgents/io.github.wilgon456.ai-cli-auto-manager.{update,inventory,clean}.plist` | `--update-at 05:00 --inventory-day mon --inventory-at 12:00 --clean-day mon --clean-at 12:30` |
 | Linux | user crontab (only lines tagged `# aicm:update`, `# aicm:inventory`, `# aicm:clean` are touched) | same as macOS |
 
-`schedule install` copies the tool to `~/.ai-cli-auto-manager/app` and the jobs run that copy, so moving or deleting your git clone cannot stop them. When the clone gets a newer version (`git pull`), the next daily update refreshes the copy. On Windows the jobs start through a small launcher (`windows/run-hidden.vbs`), so no PowerShell window flashes on screen.
+`schedule install` copies the tool to `~/.ai-cli-auto-manager/app` and the jobs run that copy, so moving or deleting your git clone cannot stop them. When the clone gets a newer version (`git pull`), the next daily update refreshes the copy and then re-registers the jobs from it with the days and times you installed them with (`schedule refresh` does the same by hand; jobs that already match are left alone). An older version in the clone (an old tag checked out) never replaces the copy. The new copy is checked file by file before it is swapped in; if anything fails, the old copy stays.
 
-On Windows a run missed while the PC was off starts at the next boot; on macOS a run missed during sleep starts on wake.
-Leave out jobs you do not want with `--no-update`, `--no-inventory`, `--no-clean` (`-NoUpdate`, `-NoInventory`, `-NoClean`).
+On Windows the jobs start through a small launcher (`windows/run-hidden.vbs`), so no PowerShell window flashes on screen. `schedule install` first tests that launcher; where Windows Script Host is turned off it starts PowerShell directly with a hidden window instead (it may flash briefly).
 
-Scheduled jobs can disappear or stop working silently. The jobs installed are recorded at install time, and every run checks that the others still exist and have completed recently (update within 3 days, inventory and clean within 9), and shows a desktop notification when one is gone or stuck. State files are written atomically, so a crash never leaves a half-written file behind. Set `AICM_NOTIFY=0` to turn notifications off.
+On macOS and Linux the jobs get the `PATH` of the shell you ran `schedule install` in (plus the folders of `node`, `npm`, `brew` and `codex`), so CLIs installed with nvm, fnm, volta, mise, `~/.npm-global` or Homebrew are found. If you later move Node.js, run `schedule install` again; `doctor` tells you when the jobs no longer find `node` or `npm`.
+
+On Windows a run missed while the PC was off starts at the next boot; on macOS a run missed during sleep starts on wake. cron (Linux) skips missed runs, so there the weekly jobs start every day at their time and run only when this week's run has not happened yet.
+Leave out jobs you do not want with `--no-update`, `--no-inventory`, `--no-clean` (`-NoUpdate`, `-NoInventory`, `-NoClean`). On Windows, `-KeepOtherJobs` leaves the jobs you did not ask for as they are instead of removing them.
+
+Scheduled jobs can disappear or stop working silently. The jobs installed are recorded at install time, and every run checks that the others still exist, are not disabled, still point at existing files, did not fail on their last run, and have completed recently (update within 3 days, inventory and clean within 9). It also checks that Windows Script Host is on (Windows) and that a cron daemon runs (Linux; WSL starts none by default). It shows a desktop notification when something is wrong. Every notification is also written to `logs/notifications.log`, and `status` and `doctor` show the latest ones, so a notification that never reached the screen is not lost. State files are written atomically, so a crash never leaves a half-written file behind. Set `AICM_NOTIFY=0` to turn desktop notifications off.
 
 ## Logs and state
 
@@ -247,16 +251,19 @@ Scheduled jobs can disappear or stop working silently. The jobs installed are re
 | `~/.ai-cli-auto-manager/logs/clean-*.log` | Clean runs (files and bytes per rule) |
 | `~/.ai-cli-auto-manager/inventory.md` | The last inventory as a readable table |
 | `~/.ai-cli-auto-manager/state/last-update.json`, `inventory.json`, `last-clean.json` | Last run results (read by `status` and `doctor`) |
-| `~/.ai-cli-auto-manager/state/schedule.json` | Installed jobs |
+| `~/.ai-cli-auto-manager/state/schedule.json` | Installed jobs, their days and times, and the `PATH` the jobs get |
+| `~/.ai-cli-auto-manager/logs/notifications.log` | Every notification (last 500) |
 | `~/.ai-cli-auto-manager/archive/` | Files moved by archive rules (per rule and date) |
 
 Logs are kept for 30 days; change that with `LOG_RETENTION_DAYS` (or `-LogRetentionDays` on Windows). Set `AICM_HOME` to move everything elsewhere.
+
+`uninstall --purge` (`-Purge`) removes only what the tool wrote (`app`, `logs`, `state`, `archive`, `inventory.md`) and keeps your own files there (`hooks/`, `*.local.conf`, `repos.conf`); the folder goes only when nothing is left in it. A folder without the `.aicm-home` marker is purged only when it is the default `~/.ai-cli-auto-manager`.
 
 ## Moving from 1.x (ai_cli_auto_update)
 
 - The repository was renamed from `ai_cli_auto_update_public` to `ai_cli_auto_manager`; GitHub redirects the old URL.
 - `bin/update_ai_clis.sh` and `bin/update_ai_clis.ps1` are still there, so existing automation keeps working.
-- On Windows, `aicm.ps1 schedule install` replaces the old `AI CLI Auto Update` task (keep it with `-KeepLegacyTask`). `windows\install_scheduled_task.ps1` still works and registers only the update job, as before.
+- On Windows, `aicm.ps1 schedule install` replaces the old `AI CLI Auto Update` task (keep it with `-KeepLegacyTask`). `windows\install_scheduled_task.ps1` still works and registers only the update job, as before; Inventory and Clean jobs that are already registered stay as they are.
 - Logs moved from `~/.ai-cli-auto-update` to `~/.ai-cli-auto-manager`. The old folder is left alone; delete it when you no longer need it.
 - If you installed the old macOS template (`com.example.ai-cli-auto-update`), `aicm schedule install` prints the commands to remove it.
 
