@@ -10,7 +10,7 @@
   aicm.ps1 processes [-Kill] [-MinAgeHours 2]   agent processes left running after their session ended
   aicm.ps1 status    disk use per cleanup rule, schedules, last runs
   aicm.ps1 doctor    exit 1 when a schedule is missing or a run is overdue or failed
-  aicm.ps1 schedule  install | remove | show   [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]
+  aicm.ps1 schedule  install | remove | show | refresh   [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]
                                                [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean]
   aicm.ps1 version
 #>
@@ -66,7 +66,7 @@ function Show-Help {
   Write-Host '  aicm.ps1 status'
   Write-Host '  aicm.ps1 doctor'
   Write-Host '  aicm.ps1 schedule  install|remove|show|refresh [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
-  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean]'
+  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean] [-KeepOtherJobs]'
   Write-Host '  aicm.ps1 uninstall [-Purge]'
   Write-Host '  aicm.ps1 version'
 }

@@ -19,8 +19,8 @@ AI CLI Auto Manager $(aicm_version)
   aicm status    disk use per cleanup rule, schedules, last runs
   aicm doctor    exit 1 when a schedule is missing or a run is overdue or failed
   aicm schedule  install|remove|show|refresh [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
-                                     [--clean-day mon] [--clean-at 12:30] [--targets list]
-                                     [--no-update] [--no-inventory] [--no-clean]
+                                             [--clean-day mon] [--clean-at 12:30] [--targets list]
+                                             [--no-update] [--no-inventory] [--no-clean]
   aicm uninstall [--purge]
   aicm version
 EOF

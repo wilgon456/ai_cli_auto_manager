@@ -231,12 +231,16 @@ worktree 안의 링크(공용 `node_modules`로 이어진 정션 등)는 먼저 
 | macOS | `~/Library/LaunchAgents/io.github.wilgon456.ai-cli-auto-manager.{update,inventory,clean}.plist` | `--update-at 05:00 --inventory-day mon --inventory-at 12:00 --clean-day mon --clean-at 12:30` |
 | Linux | 사용자 crontab(`# aicm:update`, `# aicm:inventory`, `# aicm:clean` 표시가 붙은 줄만 건드림) | 위와 같음 |
 
-`schedule install`은 도구를 `~/.ai-cli-auto-manager/app`에 복사하고 예약 작업은 그 사본을 실행합니다. 그래서 git 저장소 폴더를 옮기거나 지워도 작업이 멈추지 않습니다. 저장소에서 새 버전을 받으면(`git pull`) 다음 날 업데이트 작업이 사본도 새것으로 바꿉니다. 윈도우에서는 작은 실행기(`windows/run-hidden.vbs`)를 거쳐 시작해서 PowerShell 창이 번쩍이지 않습니다.
+`schedule install`은 도구를 `~/.ai-cli-auto-manager/app`에 복사하고 예약 작업은 그 사본을 실행합니다. 그래서 git 저장소 폴더를 옮기거나 지워도 작업이 멈추지 않습니다. 저장소에서 새 버전을 받으면(`git pull`) 다음 날 업데이트 작업이 사본을 새것으로 바꾸고, 처음 등록할 때 정한 요일·시각 그대로 예약 작업을 새 사본 기준으로 다시 등록합니다(`schedule refresh`로 직접 해도 됩니다. 이미 맞는 작업은 건드리지 않습니다). 저장소에서 옛 태그를 꺼내 버전이 더 낮아져도 사본은 바뀌지 않습니다. 새 사본은 파일을 하나하나 대조한 뒤에 바꿔 넣고, 중간에 실패하면 옛 사본을 그대로 둡니다.
 
-Windows는 PC가 꺼져 있어 시각을 놓치면 다음에 켜질 때 실행합니다. macOS는 잠자기 중이었다면 깨어날 때 실행합니다.
-필요 없는 작업은 `--no-update`, `--no-inventory`, `--no-clean`(`-NoUpdate`, `-NoInventory`, `-NoClean`)으로 뺍니다.
+윈도우에서는 작은 실행기(`windows/run-hidden.vbs`)를 거쳐 시작해서 PowerShell 창이 번쩍이지 않습니다. `schedule install`이 이 실행기가 도는지 먼저 시험해 보고, Windows Script Host가 꺼져 있으면 PowerShell을 숨긴 창으로 바로 띄웁니다(창이 잠깐 보일 수 있습니다).
 
-예약 작업은 조용히 사라지거나 멈출 수 있습니다. 그래서 등록할 때 어떤 작업을 등록했는지 기록해 두고, 매번 실행할 때 다른 작업이 아직 있는지, 최근에 끝까지 돌았는지(업데이트는 3일, 목록·정리는 9일 안)를 확인합니다. 없어졌거나 멈췄으면 바탕화면 알림을 띄웁니다. 상태 파일은 임시 파일에 쓴 뒤 바꿔 넣어서, 쓰는 도중에 꺼져도 깨진 파일이 남지 않습니다. 알림을 끄려면 환경 변수 `AICM_NOTIFY=0`을 둡니다.
+macOS와 리눅스에서는 `schedule install`을 실행한 셸의 `PATH`(여기에 `node`, `npm`, `brew`, `codex`가 있는 폴더를 더해서)를 예약 작업에 넘깁니다. 그래서 nvm, fnm, volta, mise, `~/.npm-global`, Homebrew로 깐 CLI도 찾습니다. 나중에 Node.js를 옮겼으면 `schedule install`을 다시 실행하세요. 예약 작업이 `node`나 `npm`을 못 찾게 되면 `doctor`가 알려 줍니다.
+
+Windows는 PC가 꺼져 있어 시각을 놓치면 다음에 켜질 때 실행합니다. macOS는 잠자기 중이었다면 깨어날 때 실행합니다. 리눅스의 cron은 놓친 실행을 건너뛰기 때문에, 주 1회 작업을 매일 같은 시각에 깨워서 이번 주에 아직 안 돌았을 때만 실행합니다.
+필요 없는 작업은 `--no-update`, `--no-inventory`, `--no-clean`(`-NoUpdate`, `-NoInventory`, `-NoClean`)으로 뺍니다. Windows에서 `-KeepOtherJobs`를 붙이면 지정하지 않은 작업을 지우지 않고 그대로 둡니다.
+
+예약 작업은 조용히 사라지거나 멈출 수 있습니다. 그래서 등록할 때 어떤 작업을 등록했는지 기록해 두고, 매번 실행할 때 다른 작업이 아직 있는지, 꺼져 있지 않은지, 실행할 파일이 남아 있는지, 지난번 실행이 실패하지 않았는지, 최근에 끝까지 돌았는지(업데이트는 3일, 목록·정리는 9일 안)를 확인합니다. Windows에서는 Windows Script Host가 켜져 있는지, 리눅스에서는 cron이 돌고 있는지도 봅니다(WSL은 기본으로 cron을 띄우지 않습니다). 문제가 있으면 바탕화면 알림을 띄웁니다. 알림은 `logs/notifications.log`에도 남기고 `status`와 `doctor`가 최근 것을 보여 주니, 화면에 안 떴더라도 놓치지 않습니다. 상태 파일은 임시 파일에 쓴 뒤 바꿔 넣어서, 쓰는 도중에 꺼져도 깨진 파일이 남지 않습니다. 바탕화면 알림을 끄려면 환경 변수 `AICM_NOTIFY=0`을 둡니다.
 
 ## 로그와 상태 파일
 
@@ -247,16 +251,19 @@ Windows는 PC가 꺼져 있어 시각을 놓치면 다음에 켜질 때 실행�
 | `~/.ai-cli-auto-manager/logs/clean-*.log` | 정리 실행 기록(규칙별로 지운 개수와 용량) |
 | `~/.ai-cli-auto-manager/inventory.md` | 마지막 목록(사람이 읽는 표) |
 | `~/.ai-cli-auto-manager/state/last-update.json`, `inventory.json`, `last-clean.json` | 마지막 실행 결과(`status`, `doctor`가 읽음) |
-| `~/.ai-cli-auto-manager/state/schedule.json` | 등록한 예약 목록 |
+| `~/.ai-cli-auto-manager/state/schedule.json` | 등록한 예약 목록, 요일·시각, 예약 작업에 넘기는 `PATH` |
+| `~/.ai-cli-auto-manager/logs/notifications.log` | 띄운 알림 전부(최근 500줄) |
 | `~/.ai-cli-auto-manager/archive/` | 아카이브 규칙을 켰을 때 옮긴 파일(규칙별·날짜별 폴더) |
 
 로그는 30일 지나면 지웁니다. 기간은 `LOG_RETENTION_DAYS` 환경 변수(Windows는 `-LogRetentionDays`도 됨)로 바꿉니다. 위치는 `AICM_HOME` 환경 변수로 바꿀 수 있습니다.
+
+`uninstall --purge`(`-Purge`)는 이 도구가 만든 것(`app`, `logs`, `state`, `archive`, `inventory.md`)만 지우고, 직접 넣은 파일(`hooks/`, `*.local.conf`, `repos.conf`)은 남깁니다. 폴더는 안이 비었을 때만 지웁니다. `.aicm-home` 표시 파일이 없는 폴더는 기본 위치 `~/.ai-cli-auto-manager`일 때만 지웁니다.
 
 ## 1.x(ai_cli_auto_update)에서 옮기기
 
 - 저장소 이름이 `ai_cli_auto_update_public`에서 `ai_cli_auto_manager`로 바뀌었습니다. 옛 주소는 GitHub가 새 주소로 넘겨 줍니다.
 - `bin/update_ai_clis.sh`, `bin/update_ai_clis.ps1`는 그대로 있어서 기존 자동화가 깨지지 않습니다.
-- Windows에서 `aicm.ps1 schedule install`을 실행하면 옛 작업 `AI CLI Auto Update`를 새 작업으로 바꿉니다(`-KeepLegacyTask`로 남길 수 있습니다). `windows\install_scheduled_task.ps1`도 계속 동작하며, 예전처럼 업데이트 작업만 등록합니다.
+- Windows에서 `aicm.ps1 schedule install`을 실행하면 옛 작업 `AI CLI Auto Update`를 새 작업으로 바꿉니다(`-KeepLegacyTask`로 남길 수 있습니다). `windows\install_scheduled_task.ps1`도 계속 동작하며, 예전처럼 업데이트 작업만 등록합니다. 이미 등록된 목록·정리 작업은 그대로 둡니다.
 - 로그 위치가 `~/.ai-cli-auto-update`에서 `~/.ai-cli-auto-manager`로 바뀌었습니다. 옛 폴더는 건드리지 않으니 필요 없으면 직접 지우면 됩니다.
 - macOS에서 예전 템플릿(`com.example.ai-cli-auto-update`)을 등록해 두었다면 `aicm schedule install`이 지우는 명령을 알려 줍니다.
 
