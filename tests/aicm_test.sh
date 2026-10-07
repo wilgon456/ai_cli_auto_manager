@@ -40,6 +40,11 @@ if "$AICM" bogus >/dev/null 2>&1; then fail "unknown command accepted"; else pas
 out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 1 ]] && grep -q 'no schedule installed' <<< "$out" && pass "doctor flags missing schedule" || fail "doctor without schedule: $out"
 
+for bad in 25:99 24:00 7:60 5 ab:cd; do
+  if "$AICM" schedule install --clean-at "$bad" >/dev/null 2>&1; then fail "time $bad accepted"; fi
+done
+! grep -q '# aicm:' "$WORK/crontab.txt" && pass "invalid times rejected before anything is registered" || fail "invalid time registered jobs"
+
 "$AICM" schedule install --update-at 06:15 --inventory-day wed --inventory-at 11:40 --clean-day sun --clean-at 13:05 --targets codex,claude >/dev/null
 grep -Eq '^15 6,9,12,15,18,21 \* \* \* /bin/bash \S*\.ai-cli-auto-manager/app/bin/update_ai_clis.sh --scheduled --targets codex\\?,claude .*# aicm:update$' "$WORK/crontab.txt" && pass "update cron line" || fail "update cron line: $(cat "$WORK/crontab.txt")"
 grep -q '^5 13 \* \* 0 .*clean_ai_leftovers.sh .*# aicm:clean$' "$WORK/crontab.txt" && pass "clean cron line (sunday = 0)" || fail "clean cron line"

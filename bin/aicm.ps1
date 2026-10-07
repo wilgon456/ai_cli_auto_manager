@@ -95,8 +95,14 @@ function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra) {
   return (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ($argList -join ' '))
 }
 
+# HH:MM or H:MM with hour 0-23 and minute 0-59.
+function Test-TimeText([string]$Text) { return ($Text -match '^([01]?[0-9]|2[0-3]):[0-5][0-9]$') }
+
 function Install-Schedule {
   if ($NoUpdate -and $NoInventory -and $NoClean) { throw 'nothing to install: -NoUpdate, -NoInventory and -NoClean were all given' }
+  foreach ($t in @(@('UpdateAt', $UpdateAt), @('InventoryAt', $InventoryAt), @('CleanAt', $CleanAt))) {
+    if (-not (Test-TimeText $t[1])) { throw "invalid time '$($t[1])' for -$($t[0]): use HH:MM with hour 0-23 and minute 0-59, like 05:00" }
+  }
   $jobs = New-Object System.Collections.Generic.List[string]
   $app = Sync-AicmAppCopy (Get-AicmRoot)
   Write-Host "installed copy: $app (version $(Get-AicmVersion))"

@@ -52,6 +52,13 @@ try {
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 1 -and $r.Output -match 'no schedule installed') { Pass 'doctor flags missing schedule' } else { Fail "doctor without schedule: $($r.Output)" }
 
+  $accepted = @()
+  foreach ($bad in '25:99', '24:00', '7:60', '5', 'ab:cd') {
+    $r = Invoke-Aicm @('schedule', 'install', '-CleanAt', $bad, '-KeepLegacyTask')
+    if ($r.ExitCode -eq 0) { $accepted += $bad }
+  }
+  if ($accepted.Count -eq 0 -and -not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'invalid times rejected before anything is registered' } else { Fail "invalid times accepted: $($accepted -join ', ')" }
+
   $r = Invoke-Aicm @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')
   $update = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -ErrorAction SilentlyContinue
   $inventory = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue

@@ -49,6 +49,9 @@ scheduled_jobs() {
   grep -o '"[a-z]*"' "$file" | tr -d '"' | grep -E '^(update|clean|inventory)$' || true
 }
 
+# HH:MM or H:MM with hour 0-23 and minute 0-59.
+valid_time() { [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+
 hm_hour() { local h="${1%%:*}"; echo $((10#$h)); }
 hm_minute() { local m="${1##*:}"; echo $((10#$m)); }
 
@@ -127,7 +130,7 @@ schedule_install() {
   done
   local t
   for t in "$update_at" "$inventory_at" "$clean_at"; do
-    [[ "$t" =~ ^[0-9]{1,2}:[0-9]{2}$ ]] || { echo "times must look like 05:00" >&2; exit 2; }
+    valid_time "$t" || { echo "invalid time '$t': use HH:MM with hour 0-23 and minute 0-59, like 05:00" >&2; exit 2; }
   done
   [[ "$no_update" == true && "$no_inventory" == true && "$no_clean" == true ]] && { echo "nothing to install" >&2; exit 2; }
   local wd iwd jobs="" update_args=()
