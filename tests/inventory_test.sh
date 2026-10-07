@@ -116,6 +116,9 @@ out="$("$UPD" --targets fakenpm 2>&1)" || true
 grep -q 'already current: @fake/npmcli 1.1.0' <<< "$out" && pass "nothing newer than the waiting period: not reinstalled" || fail "reinstalled: $out"
 [[ "$(grep -c ran "$WORK/hook.log" 2>/dev/null)" == 1 ]] && pass "post-update hook ran once: only the run that changed a version" || fail "hook runs: $(cat "$WORK/hook.log" 2>/dev/null)"
 grep -q 'post-update hook skipped: no CLI version changed' <<< "$out" && pass "hook skipped when nothing changed" || fail "hook skip message"
+# npm with an old .npmrc setting prints a warning on stderr; the JSON it prints must still parse.
+out="$(FAKE_NPM_WARN=1 "$UPD" --targets fakenpm 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -q 'already current: @fake/npmcli 1.1.0' <<< "$out" && pass "npm warnings on stderr do not break the JSON" || fail "npm warning: rc=$rc $out"
 out="$("${INV[@]}" 2>&1)" || true
 grep -Eq '^Fake NPM +npm +1\.1\.0 +1\.2\.0 +held +yes' <<< "$out" && pass "inventory shows a release in its waiting period as held" || fail "held state: $out"
 
@@ -164,6 +167,17 @@ out="$(FAKE_NPM_OFFLINE=1 "$UPD" --targets fakenpm 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 ]] && grep -q 'registry unreachable' <<< "$out" && grep -q '"pending":true' "$AICM_HOME/state/last-update.json" && pass "offline run succeeds and stays pending" || fail "offline: rc=$rc $out"
 out="$("$UPD" --targets fakenpm --scheduled 2>&1)" || true
 ! grep -q 'already updated today' <<< "$out" && pass "a pending day is retried by the scheduled run" || fail "pending day not retried"
+
+echo "# a timeout ends what the command started"
+for tool in default perl; do
+  rc=0
+  # shellcheck disable=SC1091
+  ( [[ "$tool" == perl ]] && export AICM_TIMEOUT_TOOL=perl; . "$ROOT/lib/aicm-common.sh"
+    aicm_timeout 2 bash -c "sleep 120 & echo \$! > '$WORK/grandchild'; wait" ) || rc=$?
+  sleep 1
+  if [[ "$rc" == 124 ]] && ! kill -0 "$(cat "$WORK/grandchild")" 2>/dev/null; then pass "timeout ($tool) returns 124 and no grandchild survives"
+  else fail "timeout ($tool): rc=$rc"; kill "$(cat "$WORK/grandchild")" 2>/dev/null || true; fi
+done
 
 echo "# bad catalog"
 printf 'Bad Id | x | x |  |  |  |  |\n' > "$WORK/bad.conf"

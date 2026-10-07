@@ -145,6 +145,9 @@ try {
   if ($r.Output -match 'already current: @fake/npmcli 1\.1\.0') { Pass 'nothing newer than the waiting period: not reinstalled' } else { Fail "reinstalled: $($r.Output)" }
   if (@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count -eq 1) { Pass 'post-update hook ran once: only the run that changed a version' } else { Fail "hook runs: $(@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count)" }
   if ($r.Output -match 'post-update hook skipped: no CLI version changed') { Pass 'hook skipped when nothing changed' } else { Fail 'hook skip message' }
+  # npm with an old .npmrc setting prints a warning on stderr; the JSON it prints must still parse.
+  $r = Invoke-Script $upd @('-Targets', 'fakenpm') @{ FAKE_NPM_WARN = '1' }
+  if ($r.ExitCode -eq 0 -and $r.Output -match 'already current: @fake/npmcli 1\.1\.0') { Pass 'npm warnings on stderr do not break the JSON' } else { Fail "npm warning: exit $($r.ExitCode) $($r.Output)" }
   $r = Invoke-Script 'bin\inventory_ai_clis.ps1' $inv
   if ($r.Output -match '(?m)^Fake NPM +npm +1\.1\.0 +1\.2\.0 +held +yes') { Pass 'inventory shows a release in its waiting period as held' } else { Fail "held state: $($r.Output)" }
 
@@ -229,6 +232,23 @@ try {
   if ($r.ExitCode -eq 0 -and $r.Output -match 'registry unreachable' -and $last.pending) { Pass 'offline run succeeds and stays pending' } else { Fail "offline: exit $($r.ExitCode) $($r.Output)" }
   $r = Invoke-Script $upd @('-Targets', 'fakenpm', '-Scheduled')
   if ($r.Output -notmatch 'already updated today') { Pass 'a pending day is retried by the scheduled run' } else { Fail 'pending day not retried' }
+
+  Write-Host '# a timeout ends the whole process tree'
+  # npm.cmd starts cmd.exe, which starts node; on timeout node must not keep running.
+  $marker = 'aicmtreekill' + [guid]::NewGuid().ToString('N')
+  "@node -e `"setTimeout(function(){}, 120000)`" $marker" | Set-Content -LiteralPath "$work\hang.cmd" -Encoding ASCII
+  $savedHome = $env:AICM_HOME
+  try {
+    $env:AICM_HOME = $aicmHome
+    . (Join-Path $root 'lib\aicm-common.ps1')
+    $t = Invoke-AicmWithTimeout "$work\hang.cmd" @() 3
+    $split = Invoke-AicmWithTimeout 'node' @('-e', 'console.log(1); console.error(2)') 30
+  } finally { $env:AICM_HOME = $savedHome }
+  Start-Sleep -Seconds 1
+  $left = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($marker) })
+  if ($t.ExitCode -eq 124 -and $left.Count -eq 0) { Pass 'timeout returns 124 and no grandchild survives' } else { Fail "tree kill: rc=$($t.ExitCode) left=$($left.Count)" }
+  foreach ($p in $left) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
+  if ($split.StdOut.Trim() -eq '1' -and $split.StdErr.Trim() -eq '2' -and $split.Output -match '1' -and $split.Output -match '2') { Pass 'stdout and stderr are returned separately (and together in .Output)' } else { Fail "stream split: [$($split.StdOut)] [$($split.StdErr)]" }
 
   Write-Host '# bad catalog'
   'Bad Id | x | x |  |  |  |  |' | Set-Content -LiteralPath "$work\bad.conf" -Encoding UTF8

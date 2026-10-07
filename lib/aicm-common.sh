@@ -370,18 +370,44 @@ aicm_schedule_problems() {
 # Running CLIs and the AI CLI catalog
 # ---------------------------------------------------------------------------
 
-# aicm_timeout SECONDS CMD ARGS...: exit 124 when the command runs too long.
+# Perl fallback for aicm_timeout (macOS has no timeout(1)). The command runs in its own process group,
+# and on timeout the whole group gets TERM, then KILL: a hanging postinstall started by npm dies too,
+# not only npm itself. Ctrl-C / TERM sent to the wrapper are passed on to the group.
+# shellcheck disable=SC2016 # perl code, not shell
+AICM_TIMEOUT_PERL='
+my $secs = shift;
+my $pid = fork;
+defined $pid or die "fork: $!\n";
+if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV or exit 127; }
+setpgrp($pid, $pid);
+my $timed_out = 0;
+sub stop_group { kill "TERM", -$pid, $pid; for (1 .. 20) { last unless kill 0, -$pid; select undef, undef, undef, 0.25 } kill "KILL", -$pid, $pid; }
+$SIG{ALRM} = sub { $timed_out = 1; stop_group(); };
+$SIG{INT} = $SIG{TERM} = sub { stop_group(); exit 130; };
+alarm $secs;
+waitpid $pid, 0;
+my $status = $?;
+alarm 0;
+if ($timed_out) { kill "KILL", -$pid; exit 124; }
+exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+'
+
+# aicm_timeout SECONDS CMD ARGS...: exit 124 when the command runs too long. Whatever the command
+# started is stopped with it (GNU timeout signals its process group; the perl fallback does the same).
+# AICM_TIMEOUT_TOOL=perl forces the perl fallback (tests).
+AICM_TIMEOUT_GNU=""
 aicm_timeout() {
   local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
+  if [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]] && command -v timeout >/dev/null 2>&1; then
+    # -k: KILL 10 seconds after TERM when the command ignores TERM (GNU coreutils only).
+    if [[ -z "$AICM_TIMEOUT_GNU" ]]; then
+      if timeout --version 2>/dev/null | grep -q GNU; then AICM_TIMEOUT_GNU=yes; else AICM_TIMEOUT_GNU=no; fi
+    fi
+    if [[ "$AICM_TIMEOUT_GNU" == yes ]]; then timeout -k 10 "$secs" "$@"; else timeout "$secs" "$@"; fi
+  elif [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]] && command -v gtimeout >/dev/null 2>&1; then
+    gtimeout -k 10 "$secs" "$@"
   elif command -v perl >/dev/null 2>&1; then
-    local rc=0
-    perl -e 'alarm shift; exec @ARGV or exit 127' "$secs" "$@" || rc=$?
-    ((rc == 142)) && return 124
-    return "$rc"
+    perl -e "$AICM_TIMEOUT_PERL" "$secs" "$@"
   else
     "$@"
   fi

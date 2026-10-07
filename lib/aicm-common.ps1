@@ -470,6 +470,20 @@ function Resolve-AicmExecutable([string]$Name) {
   return $path
 }
 
+# Ends a process and everything it started. npm.cmd runs cmd.exe, which runs node; killing only
+# cmd.exe would leave node (and a hanging postinstall) running.
+function Stop-AicmProcessTree([System.Diagnostics.Process]$Process) {
+  $ErrorActionPreference = 'Continue'
+  $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+  if ($env:SystemRoot -and (Test-Path -LiteralPath $taskkill)) {
+    try { & $taskkill /T /F /PID $Process.Id 2>&1 | Out-Null } catch { }
+  }
+  try { if (-not $Process.HasExited) { $Process.Kill() } } catch { }
+  try { [void]$Process.WaitForExit(5000) } catch { }
+}
+
+# Runs a command with a time limit. Returns .ExitCode (124 on timeout), .StdOut, .StdErr and .Output
+# (both streams together, for display). Parse .StdOut only: npm prints warnings on stderr.
 function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds) {
   $exe = Resolve-AicmExecutable $Name
   if (-not $exe) { throw "command not found: $Name" }
@@ -485,21 +499,15 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
     $process = Start-Process @startArgs
     # Touch the handle now; otherwise ExitCode stays empty after a timed WaitForExit.
     $null = $process.Handle
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-      try { $process.Kill() } catch { }
-      $partial = @(
-        Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
-        Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
-        "TIMEOUT after ${TimeoutSeconds}s"
-      ) -join ''
-      return [pscustomobject]@{ ExitCode = 124; Output = $partial }
+    $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
+    if ($timedOut) { Stop-AicmProcessTree $process } else { $process.WaitForExit() }
+    $stdout = [string](Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue)
+    $stderr = [string](Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue)
+    if ($timedOut) {
+      $stderr += "TIMEOUT after ${TimeoutSeconds}s"
+      return [pscustomobject]@{ ExitCode = 124; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
     }
-    $process.WaitForExit()
-    $output = @(
-      Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
-      Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
-    ) -join ''
-    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $output }
+    return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
   } finally {
     Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
   }
@@ -558,12 +566,12 @@ function Get-AicmNpmInfo {
     $info.Available = $true
     $prefix = Invoke-AicmWithTimeout 'npm' @('prefix', '-g') 30
     if ($prefix.ExitCode -eq 0) {
-      $first = @($prefix.Output -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+      $first = @($prefix.StdOut -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
       if ($first) { $info.Prefix = $first.Trim() }
     }
     $list = Invoke-AicmWithTimeout 'npm' @('ls', '-g', '--depth=0', '--json') 60
     try {
-      $deps = ($list.Output | ConvertFrom-Json).dependencies
+      $deps = ($list.StdOut | ConvertFrom-Json).dependencies
       if ($deps) { foreach ($p in $deps.PSObject.Properties) { $info.Packages[$p.Name] = [string]$p.Value.version } }
     } catch { }
   }
@@ -654,14 +662,16 @@ function Invoke-AicmNpmGuard([string[]]$Arguments) {
   $guard = Join-Path (Get-AicmRoot) 'lib\npm-guard.js'
   $r = Invoke-AicmWithTimeout 'node' (@($guard) + $Arguments) 60
   if ($r.ExitCode -ne 0) { throw "npm-guard failed: $($r.Output.Trim())" }
-  return @($r.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  return @($r.StdOut -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 
+# Writes `npm view <args> --json` to a temp file. Only stdout goes into the file: npm prints warnings
+# (for example about an old setting in .npmrc) on stderr, and they would break the JSON.
 function Save-AicmNpmView([string[]]$Arguments) {
   $r = Invoke-AicmWithTimeout 'npm' (@('view') + $Arguments + @('--json')) 90
   if ($r.ExitCode -ne 0) { throw "npm view $($Arguments -join ' ') failed: $($r.Output.Trim())" }
   $file = [System.IO.Path]::GetTempFileName()
-  [System.IO.File]::WriteAllText($file, $r.Output)
+  [System.IO.File]::WriteAllText($file, $r.StdOut)
   return $file
 }
 
@@ -692,7 +702,7 @@ function Remove-AicmNpmLeftovers {
 function Get-AicmNpmTarget([string]$Package, [int]$MinAgeDays) {
   if ($MinAgeDays -le 0) {
     $r = Invoke-AicmWithTimeout 'npm' @('view', $Package, 'version') 60
-    return (Get-AicmSemver $r.Output)
+    return (Get-AicmSemver $r.StdOut)
   }
   $view = Save-AicmNpmView @($Package, 'time', 'dist-tags')
   try { return (@(Invoke-AicmNpmGuard @('pick', "$MinAgeDays", $view)) | Select-Object -First 1) }

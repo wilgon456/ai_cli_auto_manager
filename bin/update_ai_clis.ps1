@@ -139,11 +139,12 @@ try {
       }
     }
 
+    # npm is run through Invoke-AicmWithTimeout, never with '& npm ... 2>...': a warning on stderr
+    # (an old .npmrc setting) would turn into a terminating error under ErrorActionPreference Stop.
     function Test-NpmGlobalPackage([string]$Package) {
       $npm = Get-CommandPath 'npm'
       if (-not $npm) { return $false }
-      & npm list -g --depth=0 $Package *> $null
-      return ($LASTEXITCODE -eq 0)
+      return ((Invoke-AicmWithTimeout 'npm' @('list', '-g', '--depth=0', $Package) 60).ExitCode -eq 0)
     }
 
     function Invoke-Step([string]$Name, [scriptblock]$Action) {
@@ -167,7 +168,7 @@ try {
     }
 
     function Get-NpmInstalledVersion([string]$Package) {
-      $raw = (& npm list -g --depth=0 --json $Package 2>$null) -join "`n"
+      $raw = (Invoke-AicmWithTimeout 'npm' @('list', '-g', '--depth=0', '--json', $Package) 60).StdOut
       try {
         $deps = ($raw | ConvertFrom-Json).dependencies
         if ($deps -and $deps.PSObject.Properties[$Package]) { return [string]$deps.PSObject.Properties[$Package].Value.version }
