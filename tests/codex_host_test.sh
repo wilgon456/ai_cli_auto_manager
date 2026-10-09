@@ -87,5 +87,60 @@ rm "$cask/codex-code-mode-host"; reset "$stale"
 out="$(recycle_stale_codex_app_servers 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 && ! -e "$WORK/paseo.log" && ! -e "$WORK/kill.log" ]] && pass "no host beside codex: nothing touched" || fail "no host: rc=$rc $out"
 
+# --- quarantine on the cask build ---
+# Fake xattr keeps the quarantined paths in $WORK/qtn and ignores -d while $WORK/xattr-stuck exists.
+# Fake codesign accepts everything unless $WORK/bad-signature exists.
+printf '#!/bin/sh\n' > "$cask/codex-code-mode-host"
+chmod +x "$cask/codex-code-mode-host"
+host="$(aicm_realpath "$cask/codex-code-mode-host")"
+root="$(dirname "$(dirname "$current")")"
+cat > "$WORK/fakebin/xattr" <<EOF
+#!/usr/bin/env bash
+qtn="$WORK/qtn"; touch "\$qtn"
+case "\$1" in
+  -p) grep -qxF -- "\$3" "\$qtn" ;;
+  -dr) echo "\$*" >> "$WORK/xattr.log"; [[ -e "$WORK/xattr-stuck" ]] && exit 0
+       grep -vF -- "\$3/" "\$qtn" > "\$qtn.new" || true; mv "\$qtn.new" "\$qtn" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat > "$WORK/fakebin/codesign" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$WORK/codesign.log"
+[[ ! -e "$WORK/bad-signature" ]]
+EOF
+chmod +x "$WORK/fakebin/xattr" "$WORK/fakebin/codesign"
+qreset() {
+  rm -f "$WORK/qtn" "$WORK/xattr.log" "$WORK/codesign.log" "$WORK/bad-signature" "$WORK/xattr-stuck"
+  touch "$WORK/qtn"
+  if (($#)); then printf '%s\n' "$@" > "$WORK/qtn"; fi
+}
+
+qreset
+out="$(release_codex_cask_quarantine 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && ! -e "$WORK/xattr.log" ]] && grep -q 'no quarantine' <<< "$out" && pass "quarantine: clean build untouched" || fail "clean build: rc=$rc $out"
+
+qreset "$host"
+out="$(release_codex_cask_quarantine 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qxF -- "-dr com.apple.quarantine $root" "$WORK/xattr.log" && ! grep -qF "$host" "$WORK/qtn" \
+  && grep -qF '2DC432GLL2' "$WORK/codesign.log" && pass "quarantine: OpenAI-signed host is cleared" || fail "clear: rc=$rc $out"
+
+qreset "$current" "$host"; touch "$WORK/bad-signature"
+out="$(release_codex_cask_quarantine 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 1 && ! -e "$WORK/xattr.log" ]] && grep -q 'not a notarized OpenAI build' <<< "$out" && pass "quarantine: unverified build is left as is" || fail "bad signature: rc=$rc $out"
+
+qreset "$host"; touch "$WORK/xattr-stuck"
+out="$(release_codex_cask_quarantine 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 1 ]] && grep -q 'still set' <<< "$out" && pass "quarantine: a failed clear is reported" || fail "stuck: rc=$rc $out"
+
+standalone="$WORK/home/.codex/packages/standalone/releases/0.2/bin"
+mkdir -p "$standalone" "$WORK/fakebin2"
+printf '#!/bin/sh\n' > "$standalone/codex"
+chmod +x "$standalone/codex"
+ln -s "$standalone/codex" "$WORK/fakebin2/codex"
+qreset "$(aicm_realpath "$standalone/codex")"
+out="$(PATH="$WORK/fakebin2:$PATH" release_codex_cask_quarantine 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && ! -e "$WORK/xattr.log" ]] && grep -q 'not a Homebrew cask' <<< "$out" && pass "quarantine: non-cask codex untouched" || fail "standalone: rc=$rc $out"
+
 if ((fails)); then echo "$fails failed"; exit 1; fi
 echo "all codex host tests passed"

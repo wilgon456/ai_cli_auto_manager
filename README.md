@@ -139,6 +139,7 @@ Security fixes also arrive as updates, so a long waiting period has a cost. Thre
 - **"Done today" means done.** A retry ends immediately only when a run on the same local calendar day succeeded for the same CLIs; a manual `--targets claude` run does not stop the full scheduled run. Retries with nothing to do write no log. The logs that cron and launchd append to are trimmed.
 - **Vendor install scripts run only when needed.** The install scripts behind Grok Build and `codex update` (Codex from the official installer) run only when a newer release (past the waiting period) exists, not every day.
 - **A Homebrew Codex upgrade does not break running app-servers.** `brew upgrade` deletes the old cask folder, but a long-running `codex app-server` (Paseo keeps one) still starts its terminal host from there, so its terminal tools fail. Right after the Codex step, servers that still map a replaced Codex are found; the Paseo daemon is restarted (`paseo restart`), and any server still stale after that is stopped. Servers already on the current Codex and the ChatGPT app's own copy are left alone. `AICM_CODEX_RECYCLE=0` turns this off.
+- **A Homebrew Codex starts its terminal host.** The cask build is quarantined. When Gatekeeper's online notarization check stalls, `codex-code-mode-host` never starts and every shell and edit tool call fails with `timed out negotiating with the code-mode host`. Each run clears the quarantine from the Codex cask folder, but only after `codesign` confirms a notarized build signed by OpenAI (team `2DC432GLL2`). `AICM_CODEX_UNQUARANTINE=0` turns this off.
 - **One notification per problem.** A problem is notified when it first appears and then at most once a week while it lasts.
 
 ### Post-update hook
@@ -228,6 +229,7 @@ Links inside ignored folders (for example a `node_modules` junction to a shared 
 | `AICM_WORKTREES=0` | Skip worktree and branch cleanup in the Clean job |
 | `AICM_PROCESSES=0` | Skip the process check in the Update job |
 | `AICM_CODEX_RECYCLE=0` | Do not restart Codex app-servers left on a replaced Homebrew Codex |
+| `AICM_CODEX_UNQUARANTINE=0` | Do not clear the quarantine from the notarized OpenAI Codex cask build |
 | `AICM_KILL_ORPHANS=1` | End left-behind processes instead of only reporting them |
 | `AICM_ORPHAN_MIN_AGE_HOURS` | Minimum age before a process counts (default 2) |
 

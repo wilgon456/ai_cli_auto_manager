@@ -753,6 +753,13 @@ if gpt_target_enabled; then
   # The Codex desktop app can put its own copy on PATH and updates it itself; say so when npm's copy is hidden.
   shadow_warning codex
 
+  # A quarantined cask build cannot start its code-mode host when Gatekeeper's online check stalls
+  # (lib/codex-host.sh). Checked on every run, so a version installed by hand is fixed too. It runs
+  # before the recycle below, so the restarted servers find a host that starts.
+  if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 ]] && [[ "$(uname -s)" == Darwin ]] && is_brew_cask_installed codex; then
+    run_step "codex cask quarantine" release_codex_cask_quarantine
+  fi
+
   # A Homebrew upgrade deletes the old cask folder that a running `codex app-server` (Paseo keeps one)
   # still spawns its terminal host from (lib/codex-host.sh). Right after the upgrade: a later update
   # can hang.
