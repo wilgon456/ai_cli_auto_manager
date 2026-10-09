@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.8.0 - 2026-10-09
+
+### Fixed: Codex lost its terminal and edit tools after every Homebrew upgrade
+- Homebrew puts `com.apple.quarantine` on the cask build. On the first exec of
+  `codex-code-mode-host`, Gatekeeper checks notarization online. When that request stalls, the exec
+  hangs. Codex gives up after 30s with `timed out negotiating with the code-mode host`, and the kernel
+  logs `ASP: Security policy would not allow process`. Nothing gets cached, so every shell and
+  apply_patch call on that version failed, even on a freshly restarted app-server. The 2.7.0 recycle
+  could not fix this.
+- Each run now clears the attribute from the Codex cask's version folder. It does this only after
+  `codesign` confirms the binary and its host are notarized and signed with OpenAI's Developer ID
+  (team `2DC432GLL2`). Anything else is left quarantined and the step fails. The step runs before the
+  app-server recycle. A running server picks up the fix on its next tool call because it starts a new
+  host each time. `AICM_CODEX_UNQUARANTINE=0` turns it off.
+
 ## 2.7.0 - 2026-10-07
 
 ### Added
