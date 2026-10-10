@@ -120,6 +120,7 @@ function Test-AicmTempUsable {
 # A rule may only touch the home folder (never the home folder itself) or the temp folder.
 # $FromTemp: the rule's path is written with {temp}; it is allowed only while TEMP looks right.
 function Test-AicmAllowedPath([string]$Path, [bool]$FromTemp = $false) {
+  if (Test-AicmPathHasLink $Path) { return $false }
   $p = Get-AicmLongPath $Path
   $userHome = Get-AicmLongPath (Get-AicmUserHome)
   # The home folder itself, or anything above it, never.
@@ -151,8 +152,26 @@ function Test-AicmLink([System.IO.FileSystemInfo]$Item) {
   return [bool]($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
 
+# Check every existing component, including the root supplied by a cleanup rule.
+# Lexical containment alone does not stop home\junction\cache escaping the home.
+# An unreadable component is unsafe too; never guess when checking a deletion path.
+function Test-AicmPathHasLink([string]$Path) {
+  $current = [System.IO.Path]::GetFullPath($Path)
+  while ($current) {
+    try {
+      $attributes = [System.IO.File]::GetAttributes($current)
+      if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $true }
+    } catch [System.IO.FileNotFoundException] {
+    } catch [System.IO.DirectoryNotFoundException] {
+    } catch { return $true }
+    $current = [System.IO.Path]::GetDirectoryName($current.TrimEnd('\'))
+  }
+  return $false
+}
+
 # Enumerates files below $Root without ever entering a symlink or junction.
 function Get-AicmFiles([string]$Root, [string]$Pattern = '*', [switch]$TopOnly) {
+  if (Test-AicmPathHasLink $Root) { return }
   $stack = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
   $stack.Push([System.IO.DirectoryInfo]::new($Root))
   while ($stack.Count -gt 0) {
@@ -172,6 +191,9 @@ function Get-AicmFiles([string]$Root, [string]$Pattern = '*', [switch]$TopOnly) 
 
 # Removes a folder tree. Links inside it are unlinked, never followed, so their targets survive.
 function Remove-AicmTree([System.IO.DirectoryInfo]$Dir) {
+  if ($Dir.Parent -and (Test-AicmPathHasLink $Dir.Parent.FullName)) {
+    throw "refusing tree cleanup through a linked parent : $($Dir.FullName)"
+  }
   if (Test-AicmLink $Dir) {
     [System.IO.Directory]::Delete($Dir.FullName, $false)
     return
@@ -191,6 +213,7 @@ function Remove-AicmTree([System.IO.DirectoryInfo]$Dir) {
 
 # Removes empty folders below $Root, deepest first. $Root itself, links and "memory" folders are kept.
 function Remove-AicmEmptyDirs([string]$Root) {
+  if (Test-AicmPathHasLink $Root) { return 0 }
   $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
   $stack = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
   $stack.Push([System.IO.DirectoryInfo]::new($Root))
@@ -549,7 +572,11 @@ function Get-AicmWshDisabled {
   foreach ($k in $keys) {
     if (-not $k) { continue }
     $v = $null
-    try { $v = (Get-ItemProperty -LiteralPath $k -Name 'Enabled' -ErrorAction Stop).Enabled } catch { continue }
+    try {
+      $properties = Get-ItemProperty -LiteralPath $k -ErrorAction Stop
+      if (-not $properties.PSObject.Properties['Enabled']) { continue }
+      $v = $properties.Enabled
+    } catch { continue }
     if ("$v".Trim() -eq '0') { $k }
   }
 }
@@ -833,20 +860,26 @@ function Get-AicmCliInstall($Entry) {
 function Get-AicmShadowFix($Install) {
   $npm = Get-AicmNpmInfo
   $dir = Split-Path -Parent $Install.Path
-  return "fix: keep one copy - uninstall the npm copy, or put $($npm.Prefix) before $dir in your user PATH so the daily-updated npm copy is the one that runs."
+  return "fix : keep one copy - uninstall the unused npm copy, or put $($npm.Prefix) before $dir in your user PATH to select npm for daily updates."
 }
 
 # Whether the daily update keeps the copy on PATH current: 'yes' or 'no: <why>'.
 function Get-AicmUpdateCoverage($Entry, $Install) {
+  if ($Entry.Builtin -and $Install.Method -ne 'npm') {
+    switch ($Entry.Id) {
+      'codex' { return 'no : update the PATH copy with its owning app or installer; hidden npm copies are skipped' }
+      'kimi' { return 'no : standalone Kimi is not updated; install with npm for automation' }
+      'claude' { return 'yes' }
+      'opencode' { return 'yes' }
+      'agy' { return 'yes' }
+      'grok' { return 'yes' }
+    }
+  }
   switch ($Install.Method) {
     'npm' { if ($Entry.Npm) { return 'yes' } else { return 'no: unknown npm package' } }
     'winget' { if ($Entry.Winget) { return 'yes' } else { return 'no: add its winget id to the catalog' } }
     'standalone' {
-      # The dedicated updaters for these prefer the npm copy when one exists.
-      if ($Entry.Builtin -and $Install.NpmCopy -and (@('claude', 'codex', 'opencode', 'kimi') -contains $Entry.Id)) {
-        return 'no: the update refreshes the npm copy, not the one on PATH'
-      }
-      if ($Entry.SelfUpdate) { return 'yes' }
+      if ($Entry.SelfUpdate -and $Entry.SelfUpdate -ne '@installer') { return 'yes' }
       if ($Entry.Note) { return "no: $($Entry.Note)" }
       return 'no: installed standalone without a self-update command'
     }

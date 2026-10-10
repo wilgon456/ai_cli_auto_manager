@@ -14,6 +14,8 @@ $fakeBin = Join-Path $work 'fakebin'
 $outside = Join-Path $work 'outside'
 $today = Get-Date -Format 'yyyyMMdd'
 $script:fails = 0
+. (Join-Path $PSScriptRoot 'test-env.ps1')
+$runtimePath = New-TestRuntimePath $work
 
 function Pass([string]$m) { Write-Host "ok   - $m" }
 function Fail([string]$m) { Write-Host "FAIL - $m"; $script:fails++ }
@@ -36,13 +38,14 @@ function Set-DirAge([string]$Path, [int]$DaysOld) {
 function Invoke-Clean([string[]]$Arguments, [switch]$NoFakeCodex, [hashtable]$Env = @{}) {
   $exe = (Get-Process -Id $PID).Path
   $saved = @{}
-  foreach ($k in 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'CODEX_HOME', 'PATH') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
+  foreach ($k in 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'CODEX_HOME', 'PATH', 'AICM_PROCESSES', 'AICM_WORKTREES') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
   try {
     $env:USERPROFILE = $fakeHome; $env:TEMP = $fakeTemp; $env:TMP = $fakeTemp
     $env:LOCALAPPDATA = $fakeLocal; $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'
     # If a real codex were ever reached, it would only see the throwaway home.
-    $env:CODEX_HOME = $codexHome
-    if (-not $NoFakeCodex) { $env:PATH = "$fakeBin;$($saved['PATH'])" }
+    $env:CODEX_HOME = $codexHome; $env:HOME = $fakeHome
+    $env:PATH = $runtimePath
+    if (-not $NoFakeCodex) { $env:PATH = "$fakeBin;$runtimePath" }
     foreach ($k in $Env.Keys) { if (-not $saved.ContainsKey($k)) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }; [Environment]::SetEnvironmentVariable($k, $Env[$k]) }
     $ErrorActionPreference = 'Continue'
     $output = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'bin\clean_ai_leftovers.ps1') @Arguments 2>&1 | Out-String -Width 300
@@ -240,14 +243,61 @@ exit 0
 
   Write-Host '# without a codex command nothing of Codex is touched'
   New-TestFile "$codexHome\sessions\2026\07\01\rollout-2026-07-01T10-00-00-$U2.jsonl" 60
-  # Only where no real codex exists: never let a test reach the real Codex.
-  if (Get-Command codex -ErrorAction SilentlyContinue) {
-    Write-Host 'skip - a real codex is installed on this machine'
-  } else {
+  # The isolated runtime PATH contains no real Codex, even on an installed machine.
+  & {
     $r = Invoke-Clean @('-Rules', 'codex-sessions') -NoFakeCodex
     if ($r.Output -match 'codex command not found, Codex sessions were not cleaned' -and $r.ExitCode -eq 1) { Pass 'missing codex command reported as a problem' } else { Fail 'missing codex' }
     Expect-Exists "$codexHome\sessions\2026\07\01\rollout-2026-07-01T10-00-00-$U2.jsonl" 'codex files kept without the codex command'
   }
+
+  Write-Host '# parent junctions and symlinks cannot escape through a normal child folder'
+  New-TestFile "$outside\child\old.bin" 90
+  New-Item -ItemType Junction -Path "$fakeHome\parent-link" -Target $outside | Out-Null
+  'parent-link | all | age-files | ~/parent-link/child | * | 1 | | on |' |
+    Set-Content -LiteralPath "$work\parent.conf" -Encoding ASCII
+  $r = Invoke-Clean @('-Rules', 'parent-link', '-LocalRulesFile', "$work\parent.conf")
+  Expect-Exists "$outside\child\old.bin" 'normal child under a junction never cleaned'
+  if ($r.Output -match 'refused') { Pass 'parent junction refused' } else { Fail "parent junction : $($r.Output)" }
+  try { New-Item -ItemType SymbolicLink -Path "$fakeHome\parent-symlink" -Target $outside -ErrorAction Stop | Out-Null } catch { Write-Host 'skip - directory symlink creation is unavailable' }
+  if (Test-Path -LiteralPath "$fakeHome\parent-symlink") {
+    'parent-link | all | age | ~/parent-symlink/child | * | 1 | | on |' |
+      Set-Content -LiteralPath "$work\parent.conf" -Encoding ASCII
+    $r = Invoke-Clean @('-Rules', 'parent-link', '-LocalRulesFile', "$work\parent.conf")
+    Expect-Exists "$outside\child\old.bin" 'normal child under a symlink never cleaned'
+    if ($r.Output -match 'refused') { Pass 'parent symlink refused' } else { Fail 'parent symlink not refused' }
+  }
+
+  Write-Host '# SQLite is one unit even when only a sidecar is in use or delete sharing is allowed'
+  foreach ($suffix in '', '-wal', '-shm', '-journal') {
+    foreach ($share in [System.IO.FileShare]::None, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)) {
+      $db = "$codexHome\logs_77.sqlite"
+      foreach ($part in '', '-wal', '-shm', '-journal') { New-TestFile ($db + $part) 40 16 }
+      $lock = [System.IO.File]::Open(($db + $suffix), 'Open', 'Read', $share)
+      try { $r = Invoke-Clean @('-Rules', 'codex-trace-db') } finally { $lock.Dispose() }
+      foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Exists ($db + $part) "SQLite group preserved for busy '$suffix' ($share), member '$part'" }
+      if ($r.ExitCode -eq 0 -and $r.Output -match 'in use') { Pass 'busy group reported without failing cleanup' } else { Fail "busy SQLite : $($r.Output)" }
+      $r = Invoke-Clean @('-Rules', 'codex-trace-db')
+      foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Gone ($db + $part) "released SQLite member '$part' removed" }
+    }
+  }
+
+  $db = "$codexHome\logs_78.sqlite"
+  foreach ($part in '', '-wal', '-shm', '-journal') { New-TestFile ($db + $part) 40 16 }
+  'sqlite-age | all | age-files | {codex} | logs_78.sqlite* | 1 | | on |' |
+    Set-Content -LiteralPath "$work\sqlite-age.conf" -Encoding ASCII
+  $lock = [System.IO.File]::Open(($db + '-wal'), 'Open', 'Read', ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+  try { $r = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf") } finally { $lock.Dispose() }
+  foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Exists ($db + $part) "age-files rule preserves SQLite family member '$part'" }
+  $r = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf")
+  foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Gone ($db + $part) "age-files rule removes released member '$part'" }
+
+  # A later deletion failure must undo earlier deletion marks while handles are held.
+  $db = "$codexHome\logs_79.sqlite"
+  foreach ($part in '', '-wal', '-shm', '-journal') { New-TestFile ($db + $part) 40 16 }
+  (Get-Item -LiteralPath ($db + '-wal')).IsReadOnly = $true
+  try { $r = Invoke-Clean @('-Rules', 'codex-trace-db') } finally { (Get-Item -LiteralPath ($db + '-wal')).IsReadOnly = $false }
+  foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Exists ($db + $part) "failed group deletion rolls back member '$part'" }
+  $null = Invoke-Clean @('-Rules', 'codex-trace-db')
 
   Write-Host '# defaults: Codex sessions deleted after 30 days, Claude transcripts left to Claude, archive remnants purged'
   $local = @(Get-Content -LiteralPath "$aicmHome\clean-rules.local.conf" | Where-Object { $_ -notlike 'codex-sessions*' -and $_ -notlike 'claude-transcripts*' })
@@ -306,10 +356,10 @@ exit 0
   if ($r.ExitCode -ne 0) { Pass 'archive rule needs a delete-after limit' } else { Fail 'archive rule without limit accepted' }
 } finally {
   # Unlink junctions before removing the work folder so their targets are never walked.
-  foreach ($j in "$codexHome\.tmp\linked", "$fakeLocal\ms-playwright\chromium-1000\linked") {
+  foreach ($j in "$codexHome\.tmp\linked", "$fakeLocal\ms-playwright\chromium-1000\linked", "$fakeHome\parent-link", "$fakeHome\parent-symlink") {
     if (Test-Path -LiteralPath $j) { [System.IO.Directory]::Delete($j, $false) }
   }
-  Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-TestWorkspace $work
 }
 
 Write-Host ''

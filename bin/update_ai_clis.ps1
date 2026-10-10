@@ -312,6 +312,14 @@ try {
       $info = Get-AicmNpmInfo
       foreach ($p in @($prev.PSObject.Properties)) {
         $pkg = $p.Name; $version = [string]$p.Value
+        $entry = @(Read-AicmCatalog | Where-Object { $_.Npm -eq $pkg }) | Select-Object -First 1
+        if ($entry) {
+          $active = Get-AicmCliInstall $entry
+          if ($active.Installed -and $active.Method -ne 'npm') {
+            Write-Host "pass : unused npm copy $pkg is not restored while PATH selects $($active.Path)"
+            continue
+          }
+        }
         if ($info.Packages.ContainsKey($pkg)) { $script:knownNpm[$pkg] = $version; continue }
         $backup = Get-AicmNpmBackup $pkg
         Write-Host ""
@@ -348,6 +356,12 @@ try {
     }
 
     function Update-KimiCli {
+      $inst = Get-ActiveInstall 'kimi'
+      if ($inst -and $inst.Installed -and $inst.Method -ne 'npm') {
+        Write-Host 'pass : standalone Kimi is not updated; hidden npm copies are skipped'
+        Write-ShadowWarning 'kimi'
+        return
+      }
       if (Test-NpmGlobalPackage '@moonshot-ai/kimi-code') {
         Update-NpmPackage '@moonshot-ai/kimi-code'
       } elseif (Get-CommandPath 'kimi') {
@@ -384,7 +398,7 @@ try {
 
     function Update-ClaudeCli {
       $inst = Get-ActiveInstall 'claude'
-      if ($inst -and $inst.Installed -and $inst.Method -eq 'standalone') {
+      if ($inst -and $inst.Installed -and $inst.Method -ne 'npm') {
         Invoke-ActiveSelfUpdate $inst @('update')
         Write-ShadowWarning 'claude'
       } elseif (Test-NpmGlobalPackage '@anthropic-ai/claude-code') {
@@ -402,7 +416,7 @@ try {
 
     function Update-OpenCodeCli {
       $inst = Get-ActiveInstall 'opencode'
-      if ($inst -and $inst.Installed -and $inst.Method -eq 'standalone') {
+      if ($inst -and $inst.Installed -and $inst.Method -ne 'npm') {
         Invoke-ActiveSelfUpdate $inst @('upgrade')
         Write-ShadowWarning 'opencode'
       } elseif (Test-NpmGlobalPackage 'opencode-ai') {
@@ -507,7 +521,10 @@ try {
     foreach ($x in $catalogExtras) { if ($x.Entry.Command) { Write-Version $x.Entry.Command } else { Write-Host "$($x.Entry.Name): $(Get-AicmWingetVersion $x.Entry.Winget) (winget)" } }
 
     if (Test-GptTargetEnabled) {
-      if (Test-NpmGlobalPackage '@openai/codex') {
+      $codexInstall = Get-ActiveInstall 'codex'
+      if ($codexInstall -and $codexInstall.Installed -and $codexInstall.Method -ne 'npm') {
+        Pass-Missing 'gpt' 'update the PATH copy with its owning app or installer; hidden npm copies are skipped'
+      } elseif (Test-NpmGlobalPackage '@openai/codex') {
         Invoke-Step 'gpt/codex via npm' { Update-NpmPackage '@openai/codex' }
       } elseif (-not (Get-CommandPath 'codex') -and $InstallMissing) {
         Invoke-Step 'gpt/codex via npm install' { Install-NpmPackage '@openai/codex' }

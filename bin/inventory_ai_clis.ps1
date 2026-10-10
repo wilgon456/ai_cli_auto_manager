@@ -104,11 +104,11 @@ try {
     foreach ($c in $changes) { Write-Host "  $c" }
   }
 
-  # Two copies where the daily update only reaches the one the terminal does not run.
+  # Duplicate installs whose active copy has no supported updater here.
   $shadow = New-Object System.Collections.Generic.List[string]
   foreach ($row in $rows) {
     if ($row.npmCopy -and $row.autoUpdate -like 'no*') {
-      $shadow.Add("$($row.name): PATH runs $($row.version) at $($row.path), but the daily update refreshes the npm copy ($($row.npmCopy)). $(Get-AicmShadowFix ([pscustomobject]@{ Path = $row.path }))")
+      $shadow.Add("$($row.name) : PATH runs $($row.version) at $($row.path); an unused npm copy ($($row.npmCopy)) is also installed. $(Get-AicmShadowFix ([pscustomobject]@{ Path = $row.path }))")
     }
   }
   if ($shadow.Count -gt 0) {
@@ -117,8 +117,8 @@ try {
     foreach ($s in $shadow) { Write-Host "  $s" }
   }
   $previousShadow = @()
-  if ($previous -and $previous.PSObject.Properties['shadowProblems']) { $previousShadow = @($previous.shadowProblems | ForEach-Object { ($_ -split ':')[0] }) }
-  $newShadow = @($shadow | Where-Object { $previousShadow -notcontains ($_ -split ':')[0] })
+  if ($previous -and $previous.PSObject.Properties['shadowProblems']) { $previousShadow = @($previous.shadowProblems | ForEach-Object { ($_ -split ':')[0].Trim() }) }
+  $newShadow = @($shadow | Where-Object { $previousShadow -notcontains ($_ -split ':')[0].Trim() })
 
   $stamp = Get-AicmTimestamp
   Write-AicmState 'inventory' ([ordered]@{ finishedAt = $stamp; version = Get-AicmVersion; ok = $true; host = $env:COMPUTERNAME; clis = $rows.ToArray(); otherNpm = $otherNpm; changes = $changes.ToArray(); shadowProblems = $shadow.ToArray() })

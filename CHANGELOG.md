@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.6.1 - 2026-10-11 (local Windows fixes)
+
+- Refuse cleanup paths with junctions or symlinks in any parent component.
+- Acquire the SQLite database and its WAL, SHM and journal exclusively before deleting any member.
+  Open files are preserved even when their handles permit delete sharing.
+- Use the active PATH install for built-in updates. Skip separate Codex and Kimi installs and their
+  hidden npm copies, including interrupted-install recovery. Match inventory coverage and guidance
+  to the actual updater behavior.
+- Preserve disabled tasks, custom settings and principals when refreshing a changed task action.
+- Avoid misleading transcript errors when the Windows Script Host Enabled value is absent.
+- Isolate PowerShell regression tests from user HOME, CODEX_HOME and CLI/package-manager PATH.
+
+This patch is based on the Windows checkout at 2.6.0. It does not include the uncommitted Mac 2.8.2 tree.
+
 ## 2.6.0 - 2026-10-07
 
 A round of fixes from three critical reviews (update path, cleanup and inventory, scheduling and

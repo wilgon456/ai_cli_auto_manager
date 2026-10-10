@@ -47,15 +47,30 @@ function Get-TreeBytes([string]$Path) {
 }
 
 function Remove-FileQuietly([System.IO.FileInfo]$File) {
+  if (Test-AicmPathHasLink $File.FullName) { return $false }
   try {
-    if ($File.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
-      $File.Attributes = $File.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+    # Single-file age rules also protect all members of a SQLite family.
+    $checks = @($File)
+    if ($File.FullName -match '^(.*\.(?:sqlite\d*|db))(?:(?:-wal|-shm|-journal))?$') {
+      $base = $Matches[1]
+      $checks = @(foreach ($suffix in '', '-wal', '-shm', '-journal') {
+        if (Test-Path -LiteralPath ($base + $suffix)) { Get-Item -LiteralPath ($base + $suffix) -Force }
+      })
     }
-    $File.Delete()
-    return $true
+    return (Remove-FileGroup @($File) $checks)
   } catch {
     return $false
   }
+}
+
+# Acquire every member exclusively before marking any for deletion. Windows allows
+# File.Delete on an open file with FileShare.Delete, which is not proof it is idle.
+function Remove-FileGroup([System.IO.FileInfo[]]$Files, [System.IO.FileInfo[]]$Checks = $Files) {
+  foreach ($f in $Checks) { if (Test-AicmPathHasLink $f.FullName) { return $false } }
+  if (-not ('Aicm.FileGuard' -as [type])) {
+    Add-Type -Path (Join-Path (Get-AicmRoot) 'lib\aicm-file-guard.cs')
+  }
+  return [Aicm.FileGuard]::TryDelete([string[]]@($Files | ForEach-Object { $_.FullName }), [string[]]@($Checks | ForEach-Object { $_.FullName }))
 }
 
 function Get-NewestWrite([System.IO.FileSystemInfo]$Item) {
@@ -126,13 +141,10 @@ function Invoke-CapRule($Rule, [string]$Root) {
     })
     foreach ($g in $group) { $result.files++; $result.bytes += $g.Length }
     if ($DryRun) { continue }
-    # Remove the main file first: if the owning app holds it open, nothing else is touched.
-    if (-not (Remove-FileQuietly $f)) { $result.inUse += $group.Count; continue }
-    foreach ($g in $group) {
-      if ($g.FullName -eq $f.FullName) { $result.removed++; $result.removedBytes += $g.Length; continue }
-      $len = $g.Length
-      if (Remove-FileQuietly $g) { $result.removed++; $result.removedBytes += $len } else { $result.inUse++ }
-    }
+    if (Remove-FileGroup $group) {
+      $result.removed += $group.Count
+      foreach ($g in $group) { $result.removedBytes += $g.Length }
+    } else { $result.inUse += $group.Count }
   }
   return $result
 }

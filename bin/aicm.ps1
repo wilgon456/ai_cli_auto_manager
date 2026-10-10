@@ -240,7 +240,16 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
       if ($same -and ($Refresh -or $existing.State -ne 'Disabled')) {
         if (-not $Refresh) { Write-Host ("unchanged:  {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text) }
       } else {
-        Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Action $spec.Action -Trigger $spec.Trigger -Settings $settings -Description $spec.Description -Force | Out-Null
+        $register = @{ TaskPath = $script:AicmTaskPath; TaskName = $name; Action = $spec.Action; Trigger = $spec.Trigger
+          Settings = $settings; Description = $spec.Description; Force = $true }
+        if ($Refresh -and $existing) {
+          $register.Settings = $existing.Settings
+          $register.Principal = $existing.Principal
+        }
+        Register-ScheduledTask @register | Out-Null
+        if ($Refresh -and $existing -and $existing.State -eq 'Disabled') {
+          Disable-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name | Out-Null
+        }
         Write-Host ("registered: {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text)
         $changed = $true
       }
