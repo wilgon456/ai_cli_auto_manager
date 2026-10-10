@@ -753,7 +753,7 @@ if gpt_target_enabled; then
   # The Codex desktop app can put its own copy on PATH and updates it itself; say so when npm's copy is hidden.
   shadow_warning codex
 
-  # A quarantined cask build cannot start its code-mode host when Gatekeeper's online check stalls
+  # A quarantined cask build cannot start its code-mode host while Gatekeeper's first-open prompt waits
   # (lib/codex-host.sh). Checked on every run, so a version installed by hand is fixed too. It runs
   # before the recycle below, so the restarted servers find a host that starts.
   if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 ]] && [[ "$(uname -s)" == Darwin ]] && is_brew_cask_installed codex; then
