@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.8.1 - 2026-10-10
+
+### Fixed: the Codex quarantine clear rejected every new build
+- 2.8.0 ran `codesign -R "=notarized and ..."` without `--check-notarization`. The cask binaries
+  carry no stapled ticket, so codesign only looked in the local ticket store. A build Gatekeeper had
+  never assessed is not in it yet, so every new Codex version was reported as `not a notarized OpenAI
+  build` and left quarantined. This happened on every run from the 0.162.0 upgrade on. The check now
+  passes `--check-notarization`, which looks the ticket up online.
+- Scheduled retries that end early after a complete run now clear the quarantine too, so a Codex
+  cask upgraded by hand later that day is fixed within 3 hours instead of waiting for the next
+  day's run. The check prints nothing when there is nothing to clear.
+- Corrected root cause: the host hang is the Gatekeeper first-open prompt, not a stalled network
+  check. syspolicyd logs `GK eval - was allowed: 1, show prompt: 1` and waits for a click. On a
+  Mac that is unattended or used remotely, nobody clicks, and Codex gives up after 30s.
+
 ## 2.8.0 - 2026-10-09
 
 ### Fixed: Codex lost its terminal and edit tools after every Homebrew upgrade

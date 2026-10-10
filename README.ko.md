@@ -139,7 +139,7 @@ my-agent  | myagent | My Agent  | @me/my-agent   |      |        |             |
 - **"오늘 끝남"은 정말 끝났을 때만입니다.** 같은 날(이 컴퓨터의 날짜 기준) 같은 CLI들을 다 올렸을 때만 재시도가 바로 끝납니다. 손으로 `--targets claude`만 돌린 날에도 예약 실행은 전부 돕니다. 할 일 없는 재시도는 로그를 남기지 않고, cron·launchd가 쌓는 로그는 길어지면 줄입니다.
 - **회사 설치 스크립트는 필요할 때만 받습니다.** Grok Build의 설치 스크립트와 `codex update`(공식 설치 프로그램으로 깐 Codex)는 매일이 아니라, 대기 기간이 지난 새 버전이 있을 때만 실행합니다.
 - **Homebrew로 Codex를 올려도 떠 있는 app-server가 고장 나지 않습니다.** `brew upgrade`는 옛 cask 폴더를 지우는데, 오래 떠 있는 `codex app-server`(Paseo가 하나 띄워 둡니다)는 그 폴더에서 터미널 호스트를 실행하려다 실패해 터미널 도구가 멈춥니다. Codex 업데이트 바로 뒤에 바뀌기 전 Codex를 붙잡은 서버를 찾아 Paseo 데몬을 다시 띄우고(`paseo restart`), 그래도 남은 서버만 끕니다. 이미 새 Codex로 도는 서버와 ChatGPT 앱의 자체 사본은 건드리지 않습니다. `AICM_CODEX_RECYCLE=0`으로 끕니다.
-- **Homebrew Codex의 터미널 호스트가 실행됩니다.** cask로 받은 파일에는 격리 표시가 붙습니다. Gatekeeper의 온라인 공증 확인이 응답 없이 멈추면 `codex-code-mode-host`가 끝내 실행되지 않고, 셸·편집 도구 호출이 모두 `timed out negotiating with the code-mode host`로 실패합니다. 매번 실행할 때 Codex cask 폴더의 격리 표시를 지웁니다. 단, `codesign`으로 OpenAI(팀 `2DC432GLL2`)가 서명하고 공증한 빌드인지 확인된 경우에만 지웁니다. `AICM_CODEX_UNQUARANTINE=0`으로 끕니다.
+- **Homebrew Codex의 터미널 호스트가 실행됩니다.** cask로 받은 파일에는 격리 표시가 붙습니다. 그래서 `codex-code-mode-host`를 처음 실행할 때 Gatekeeper가 "인터넷에서 다운로드한 앱" 확인 창을 띄우고 클릭을 기다립니다. 원격으로 쓰거나 자리를 비운 Mac에서는 아무도 누르지 않아 호스트가 실행되지 않고, 셸·편집 도구 호출이 모두 `timed out negotiating with the code-mode host`로 실패합니다. 매번 실행할 때 Codex cask 폴더의 격리 표시를 지웁니다. 단, `codesign --check-notarization`으로 OpenAI(팀 `2DC432GLL2`)가 서명하고 공증한 빌드인지 확인된 경우에만 지웁니다. 그날 업데이트가 끝나 재시도가 일찍 끝날 때도 이 확인은 합니다. `AICM_CODEX_UNQUARANTINE=0`으로 끕니다.
 - **같은 문제는 한 번만 알립니다.** 처음 생길 때 알리고, 계속되면 일주일에 한 번까지만 다시 알립니다.
 
 ### 업데이트 뒤에 할 일 (훅)

@@ -11,13 +11,17 @@
 # `paseo restart`, so those are stopped directly. The ChatGPT.app bundle carries its own host and is
 # left alone.
 #
-# A cask install also carries com.apple.quarantine. The first exec of a quarantined binary makes
-# syspolicyd check its notarization online. When that request stalls (on this setup it timed out after
-# about 38s), the exec hangs. Codex gives up on the host after 30s, and the kernel logs
-# "ASP: Security policy would not allow process ... codex-code-mode-host". Nothing is cached, so every
-# tool call on that version fails the same way, even on a freshly started server. The attribute is
-# removed only from files that pass the signature check below: notarized and signed with OpenAI's
-# Developer ID.
+# A cask install also carries com.apple.quarantine. Even a notarized build makes Gatekeeper show the
+# "downloaded from the Internet" first-open prompt on its first exec (syspolicyd logs "GK eval - was
+# allowed: 1, show prompt: 1"), and the exec waits for a click. On an unattended or remotely used Mac
+# nobody clicks, Codex gives up on the host after 30s, and the kernel logs "ASP: Security policy would
+# not allow process ... codex-code-mode-host". Every tool call on that version fails the same way, even
+# on a freshly started server. The attribute is removed only from files that pass the signature check
+# below: notarized and signed with OpenAI's Developer ID.
+#
+# The cask binaries carry no stapled ticket. Without --check-notarization, codesign only consults the
+# local ticket store, which has no entry for a build Gatekeeper has never assessed, so a new version
+# always failed the check. --check-notarization looks the ticket up online.
 
 CODEX_OPENAI_TEAM_ID="2DC432GLL2"
 CODEX_SIGNATURE_REQUIREMENT="=notarized and anchor apple generic and certificate leaf[subject.OU] = \"$CODEX_OPENAI_TEAM_ID\""
@@ -27,7 +31,7 @@ codex_is_quarantined() {
 }
 
 codex_signed_by_openai() {
-  codesign --verify --strict -R "$CODEX_SIGNATURE_REQUIREMENT" "$1" >/dev/null 2>&1
+  codesign --verify --strict --check-notarization -R "$CODEX_SIGNATURE_REQUIREMENT" "$1" >/dev/null 2>&1
 }
 
 release_codex_cask_quarantine() {
@@ -71,6 +75,17 @@ release_codex_cask_quarantine() {
     fi
   done
   echo "pass: cleared quarantine from the notarized OpenAI build in $root"
+}
+
+# For scheduled retries that end early after a complete run, so a Codex cask upgraded by hand later
+# that day does not stay broken until tomorrow. Prints nothing when there is nothing to clear.
+release_codex_cask_quarantine_quiet() {
+  local out rc=0
+  out="$(release_codex_cask_quarantine 2>&1)" || rc=$?
+  if ((rc != 0)) || [[ "$out" == *"cleared quarantine"* ]]; then
+    printf '%s\n' "$out"
+  fi
+  return "$rc"
 }
 
 codex_server_is_stale() {
