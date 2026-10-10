@@ -217,6 +217,10 @@ trap 'rm -f "$LOCK_DIR/pid" "$LOCK_DIR/started" 2>/dev/null || true; rmdir "$LOC
 
 # The scheduled job retries during the day; after a complete success today there is nothing to do.
 if [[ "$SCHEDULED" == true && "$DRY_RUN" != true ]] && done_today; then
+  # A Codex cask upgraded by hand after today's run is still unquarantined (lib/codex-host.sh).
+  if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 && "$(uname -s)" == Darwin ]]; then
+    release_codex_cask_quarantine_quiet | sed "s/^/[$(ts)] /" || true
+  fi
   echo "[$(ts)] already updated today; nothing to retry"
   exit 0
 fi

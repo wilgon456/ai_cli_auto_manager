@@ -131,6 +131,19 @@ qreset "$current" "$host"; touch "$WORK/bad-signature"
 out="$(release_codex_cask_quarantine 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 1 && ! -e "$WORK/xattr.log" ]] && grep -q 'not a notarized OpenAI build' <<< "$out" && pass "quarantine: unverified build is left as is" || fail "bad signature: rc=$rc $out"
 
+qreset
+out="$(release_codex_cask_quarantine_quiet 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && -z "$out" ]] && pass "quiet: clean build prints nothing" || fail "quiet clean: rc=$rc $out"
+
+qreset "$host"
+out="$(release_codex_cask_quarantine_quiet 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -q 'cleared quarantine' <<< "$out" && ! grep -qF "$host" "$WORK/qtn" \
+  && pass "quiet: a cleared build is reported" || fail "quiet clear: rc=$rc $out"
+
+qreset "$host"; touch "$WORK/bad-signature"
+out="$(release_codex_cask_quarantine_quiet 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 1 ]] && grep -q 'not a notarized OpenAI build' <<< "$out" && pass "quiet: a refused build is reported" || fail "quiet refuse: rc=$rc $out"
+
 qreset "$host"; touch "$WORK/xattr-stuck"
 out="$(release_codex_cask_quarantine 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 1 ]] && grep -q 'still set' <<< "$out" && pass "quarantine: a failed clear is reported" || fail "stuck: rc=$rc $out"

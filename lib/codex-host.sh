@@ -77,6 +77,17 @@ release_codex_cask_quarantine() {
   echo "pass: cleared quarantine from the notarized OpenAI build in $root"
 }
 
+# For scheduled retries that end early after a complete run, so a Codex cask upgraded by hand later
+# that day does not stay broken until tomorrow. Prints nothing when there is nothing to clear.
+release_codex_cask_quarantine_quiet() {
+  local out rc=0
+  out="$(release_codex_cask_quarantine 2>&1)" || rc=$?
+  if ((rc != 0)) || [[ "$out" == *"cleared quarantine"* ]]; then
+    printf '%s\n' "$out"
+  fi
+  return "$rc"
+}
+
 codex_server_is_stale() {
   local current="$1" mapped="$2"
   [[ -n "$current" && -n "$mapped" ]] || return 1
