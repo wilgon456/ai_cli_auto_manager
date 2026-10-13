@@ -74,7 +74,7 @@ for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
   printf '%-20s %-11s %-14s %-14s %-9s %s\n' "$name" "$CLI_METHOD" "$version" "$latest" "$state" "$coverage"
   [[ -n "$CLI_NPMCOPY" ]] && printf '%-20s npm copy %s is also installed, but PATH runs %s\n' "" "$CLI_NPMCOPY" "$CLI_PATH"
   if [[ -n "$CLI_NPMCOPY" && "$coverage" == no* ]]; then
-    shadow+=("$name: PATH runs $version at $CLI_PATH, but the daily update refreshes the npm copy ($CLI_NPMCOPY). $(aicm_shadow_fix "$CLI_PATH")")
+    shadow+=("$name: PATH runs $version at $CLI_PATH, and an inactive npm copy is also installed ($CLI_NPMCOPY). $(aicm_shadow_fix "$CLI_PATH")")
   fi
   rows_tsv+="$id"$'\t'"$name"$'\t'"$version"$'\n'
   rows_json+="${rows_json:+,}{\"id\":\"$(aicm_json_escape "$id")\",\"name\":\"$(aicm_json_escape "$name")\",\"command\":\"$(aicm_json_escape "${AICM_CLI_CMD[$i]}")\",\"method\":\"$CLI_METHOD\",\"version\":\"$(aicm_json_escape "$version")\",\"latest\":\"$(aicm_json_escape "$latest")\",\"state\":\"$state\",\"autoUpdate\":\"$(aicm_json_escape "$coverage")\",\"npmCopy\":\"$(aicm_json_escape "$CLI_NPMCOPY")\",\"path\":\"$(aicm_json_escape "$CLI_PATH")\"}"

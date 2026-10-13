@@ -108,6 +108,9 @@ The default target is `all`: every catalog CLI installed on this machine. CLIs t
 | Claude Code, Codex, OpenCode, Grok Build, Kimi Code, Antigravity | Dedicated paths (Homebrew, npm, the CLI's own updater, the xAI and Codex install scripts), chosen by the copy on PATH |
 | Other catalog CLIs | The way the copy on PATH was installed: npm, Homebrew, winget, or the CLI's own updater from the catalog |
 
+The copy on PATH chooses the update channel. A second Homebrew or npm Codex installation is left
+alone when it is hidden behind the active copy; npm duplicates are reported with a suggested fix.
+
 Pick targets with `--targets codex,claude` (`-Targets`); `gpt` is the same target as `codex`.
 New CLIs are installed only with `--install-missing` (`-InstallMissing`) and the id named explicitly; `all` never installs anything new.
 
@@ -139,7 +142,7 @@ Security fixes also arrive as updates, so a long waiting period has a cost. Thre
 - **Leftovers of interrupted installs are removed, carefully.** npm leaves staging folders (`node_modules/.<name>-XXXXXXXX`, hundreds of MB) behind when an install fails half way; those older than a day are removed after each update, but only while the package itself is installed, because such a folder can be npm's only backup. A managed CLI that disappears is reinstalled at the same version from that backup, or reported once.
 - **"Done today" means done.** A retry ends immediately only when a run on the same local calendar day succeeded for the same CLIs; a manual `--targets claude` run does not stop the full scheduled run. Retries with nothing to do write no log. The logs that cron and launchd append to are trimmed.
 - **Vendor install scripts run only when needed.** The install scripts behind Grok Build and `codex update` (Codex from the official installer) run only when a newer release (past the waiting period) exists, not every day.
-- **A Homebrew Codex upgrade does not break running app-servers.** `brew upgrade` deletes the old cask folder, but a long-running `codex app-server` (Paseo keeps one) still starts its terminal host from there, so its terminal tools fail. Right after the Codex step, servers that still map a replaced Codex are found; the Paseo daemon is restarted (`paseo restart`), and any server still stale after that is stopped. Servers already on the current Codex and the ChatGPT app's own copy are left alone. `AICM_CODEX_RECYCLE=0` turns this off.
+- **A Homebrew Codex upgrade does not break running app-servers.** `brew upgrade` deletes the old cask folder, but a long-running `codex app-server` (Paseo keeps one) still starts its terminal host from there, so its terminal tools fail. Right after the Codex step, servers that still map a replaced Codex are found; the Paseo daemon is restarted (`paseo daemon restart`), and any server still stale after that is stopped. Only older versions under the same Homebrew cask root whose executable was removed qualify; npm, standalone, other cask roots, newer versions and application bundles are left alone. `AICM_CODEX_RECYCLE=0` turns this off.
 - **A Homebrew Codex starts its terminal host.** The cask build is quarantined, so the first exec of `codex-code-mode-host` waits on Gatekeeper's "downloaded from the Internet" prompt. On an unattended or remote Mac nobody answers it, the host never starts, and every shell and edit tool call fails with `timed out negotiating with the code-mode host`. Each run clears the quarantine from the Codex cask folder, but only after `codesign --check-notarization` confirms a notarized build signed by OpenAI (team `2DC432GLL2`). Retries that end early after a complete run still do this check. `AICM_CODEX_UNQUARANTINE=0` turns this off.
 - **One notification per problem.** A problem is notified when it first appears and then at most once a week while it lasts.
 
@@ -154,10 +157,21 @@ A daemon that is already running may keep the old CLI binaries loaded. Put a hoo
 
 ```powershell
 # Example: make the Paseo daemon pick up the updated CLIs
-paseo reload
+paseo daemon restart
 ```
 
 ## Clean
+
+Size/age-capped files, including Codex log databases, are checked together with their WAL/SHM/journal
+before deletion. On macOS/Linux this needs `lsof`; if it is unavailable, fails, or finds an open file,
+the entire group is kept. On Windows cleanup holds handles that exclude readers/writers until it
+finishes deleting the group. An open sidecar alone is enough to keep the database.
+
+Recursive browser/archive cleanup keeps the whole directory if it contains protected files,
+links, or files that cannot be proven idle. Windows age rules only delete a SQLite family when
+all existing members meet the age and pattern conditions; readonly or unexpected sidecars keep
+all members. An explicitly selected Windows `AICM_HOME` may be a junction for installed-copy
+maintenance; user-data cleanup still refuses linked paths.
 
 The built-in rules live in one file, [`rules/clean-rules.conf`](rules/clean-rules.conf), shared by Windows and macOS/Linux. Ages count from the last time a file was used, not when it was created, so a long conversation you are still continuing is never removed. Most rules look at each entry of their folder as a whole (a session folder, say): it goes only when nothing inside it changed for the rule's days, so a session or a plugin checkout that is still in use is never thinned out file by file.
 
@@ -287,8 +301,10 @@ All tests run in a throwaway home folder and never touch your real home folder o
 ```bash
 shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
 bash tests/clean_test.sh
+python3 tests/cleanup_safety_test.py
 bash tests/aicm_test.sh
 bash tests/inventory_test.sh
+bash tests/codex_host_test.sh
 node --test tests/node/*.test.js
 ```
 

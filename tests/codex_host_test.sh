@@ -26,6 +26,12 @@ codex_server_is_stale "$current" "/Applications/ChatGPT.app/Contents/Resources/c
 for old in 0.159.3 0.159.3.upgrading 0.152.0; do
   codex_server_is_stale "$current" "/usr/local/Caskroom/codex/$old/bin/codex" && pass "old cask $old is stale" || fail "old cask $old"
 done
+for mapped in /home/test/.codex/packages/standalone/codex /home/test/.npm/lib/node_modules/@openai/codex/bin/codex \
+  /opt/homebrew/Caskroom/codex/0.159.3/bin/codex /usr/local/Caskroom/codex/0.161.0/bin/codex \
+  /usr/local/Caskroom/codex/not-a-version/bin/codex; do
+  codex_server_is_stale "$current" "$mapped" && fail "separate/current-newer install flagged: $mapped" || pass "separate/current-newer install kept: $mapped"
+done
+codex_server_is_stale /home/test/.codex/packages/standalone/codex "$current" && fail "standalone current flagged cask" || pass "standalone current does not recycle cask servers"
 
 out="$(printf '%s\n' 'ftxt' 'n/usr/lib/dyld' 'ftxt' 'n/usr/local/Caskroom/codex/0.159.3/bin/codex (deleted)' | codex_path_from_lsof_fn)"
 [[ "$out" == /usr/local/Caskroom/codex/0.159.3/bin/codex ]] && pass "lsof: deleted suffix stripped" || fail "lsof deleted: $out"
@@ -43,6 +49,10 @@ chmod +x "$cask/codex" "$cask/codex-code-mode-host"
 ln -s "$cask/codex" "$WORK/fakebin/codex"
 current="$(aicm_realpath "$cask/codex")"
 stale="$WORK/Caskroom/codex/0.1/bin/codex"
+mkdir -p "$(dirname "$stale")"
+touch "$stale"
+codex_server_is_stale "$current" "$stale" && fail "intact older build is stale" || pass "intact older build left alone"
+rm -f "$stale"
 
 cat > "$WORK/fakebin/ps" <<EOF
 #!/usr/bin/env bash
@@ -55,6 +65,11 @@ echo ftxt; echo "n\$(cat "$WORK/mapped") (deleted)"
 EOF
 cat > "$WORK/fakebin/paseo" <<EOF
 #!/usr/bin/env bash
+if [[ "\$*" == 'daemon restart --help' ]]; then
+  [[ ! -e "$WORK/paseo-legacy" ]]
+  exit \$?
+fi
+if [[ ! -e "$WORK/paseo-legacy" && "\$1" == restart ]]; then exit 64; fi
 echo "\$*" >> "$WORK/paseo.log"
 [[ -e "$WORK/paseo-fixes" ]] && echo "$current" > "$WORK/mapped"
 exit 0
@@ -65,7 +80,7 @@ PATH="$WORK/fakebin:$PATH"
 kill() { echo "$*" >> "$WORK/kill.log"; [[ -e "$WORK/kill-fixes" ]] && echo "$current" > "$WORK/mapped"; return 0; }
 sleep() { :; }
 
-reset() { rm -f "$WORK/paseo.log" "$WORK/kill.log" "$WORK/paseo-fixes" "$WORK/kill-fixes"; echo "$1" > "$WORK/mapped"; }
+reset() { rm -f "$WORK/paseo.log" "$WORK/kill.log" "$WORK/paseo-fixes" "$WORK/kill-fixes" "$WORK/paseo-legacy"; echo "$1" > "$WORK/mapped"; }
 
 reset "$current"
 out="$(recycle_stale_codex_app_servers 2>&1)" && rc=0 || rc=$?
@@ -73,7 +88,11 @@ out="$(recycle_stale_codex_app_servers 2>&1)" && rc=0 || rc=$?
 
 reset "$stale"; touch "$WORK/paseo-fixes"
 out="$(recycle_stale_codex_app_servers 2>&1)" && rc=0 || rc=$?
-[[ "$rc" == 0 ]] && grep -q '^restart --timeout' "$WORK/paseo.log" && [[ ! -e "$WORK/kill.log" ]] && pass "stale server: paseo restart is enough" || fail "paseo restart: rc=$rc $out"
+[[ "$rc" == 0 ]] && grep -qx 'daemon restart --timeout 120' "$WORK/paseo.log" && [[ ! -e "$WORK/kill.log" ]] && pass "stale server: modern Paseo daemon restart is enough" || fail "Paseo daemon restart: rc=$rc $out"
+
+reset "$stale"; touch "$WORK/paseo-fixes" "$WORK/paseo-legacy"
+out="$(recycle_stale_codex_app_servers 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'restart --timeout 120' "$WORK/paseo.log" && [[ ! -e "$WORK/kill.log" ]] && pass "legacy Paseo restart remains supported" || fail "legacy Paseo restart: rc=$rc $out"
 
 reset "$stale"; touch "$WORK/kill-fixes"
 out="$(recycle_stale_codex_app_servers 2>&1)" && rc=0 || rc=$?

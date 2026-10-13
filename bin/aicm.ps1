@@ -240,7 +240,16 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
       if ($same -and ($Refresh -or $existing.State -ne 'Disabled')) {
         if (-not $Refresh) { Write-Host ("unchanged:  {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text) }
       } else {
-        Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Action $spec.Action -Trigger $spec.Trigger -Settings $settings -Description $spec.Description -Force | Out-Null
+        $register = @{ TaskPath = $script:AicmTaskPath; TaskName = $name; Action = $spec.Action; Trigger = $spec.Trigger
+          Settings = $settings; Description = $spec.Description; Force = $true }
+        if ($Refresh -and $existing) {
+          $register.Settings = $existing.Settings
+          $register.Principal = $existing.Principal
+        }
+        Register-ScheduledTask @register | Out-Null
+        if ($Refresh -and $existing -and $existing.State -eq 'Disabled') {
+          Disable-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name | Out-Null
+        }
         Write-Host ("registered: {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text)
         $changed = $true
       }
@@ -323,7 +332,7 @@ function Invoke-Purge([string]$HomeDir) {
   foreach ($name in 'app', 'app.new', 'app.old', 'logs', 'state', 'archive', 'inventory.md') {
     $item = Get-Item -LiteralPath (Join-Path $HomeDir $name) -Force -ErrorAction SilentlyContinue
     if (-not $item) { continue }
-    if ($item -is [System.IO.DirectoryInfo]) { Remove-AicmTree $item } else { $item.Delete() }
+    if ($item -is [System.IO.DirectoryInfo]) { Remove-AicmTree $item $HomeDir } else { $item.Delete() }
     Write-Host "removed $($item.FullName)"
   }
   $left = @(Get-ChildItem -LiteralPath $HomeDir -Force | Where-Object { $_.Name -ne '.aicm-home' })
@@ -345,7 +354,7 @@ function Invoke-Uninstall {
   $app = Get-AicmAppDir
   # Only a folder that holds an installed copy (it has the SOURCE file) is removed.
   if ((Test-Path -LiteralPath (Join-Path $app 'SOURCE')) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
-    Remove-AicmTree ([System.IO.DirectoryInfo]::new($app))
+    Remove-AicmTree ([System.IO.DirectoryInfo]::new($app)) (Get-AicmHome)
     Write-Host "removed installed copy: $app"
   }
   $homeDir = Get-AicmHome

@@ -31,6 +31,21 @@ printf '#!/usr/bin/env bash\nexec node "%s/tests/fixtures/npm-fake.js" "$@"\n' "
 chmod +x "$WORK/fakebin/npm"
 export NPM="$WORK/fakebin/npm"
 
+# Always shadow Homebrew, even on a developer machine with real CLIs installed through it.
+cat > "$WORK/fakebin/brew" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$WORK/brew-calls.log"
+case "\${1:-}" in
+  --prefix) echo "$WORK/brew" ;;
+  list) [[ -f "$WORK/brew-installed" ]] ;;
+  outdated) echo "\${@: -1}" ;;
+  update|upgrade) exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$WORK/fakebin/brew"
+export BREW="$WORK/fakebin/brew" AICM_CODEX_RECYCLE=0 AICM_CODEX_UNQUARANTINE=0
+
 cat > "$WORK/registry.json" <<'EOF'
 {
   "@fake/npmcli": { "latest": "1.2.0", "versions": {
@@ -92,7 +107,7 @@ grep -q 'npm copy 3.0.0 is also installed, but PATH runs' <<< "$out" && pass "hi
 grep -q '5 AI CLIs installed (catalog has 7)' <<< "$out" && pass "count line" || fail "count line"
 grep -q '| Fake NPM | npm | 1.0.0 | 1.2.0 | behind | yes |' "$AICM_HOME/inventory.md" && pass "markdown report" || fail "markdown report"
 grep -q '"id":"fakesolo"' "$AICM_HOME/state/inventory.json" && pass "json state" || fail "json state"
-grep -q 'Fake Shadow: PATH runs 3.1.0 at .*fakeshadow, but the daily update refreshes the npm copy (3.0.0). fix: keep one copy' <<< "$out" && pass "unreachable duplicate reported with a fix" || fail "duplicate report"
+grep -q 'Fake Shadow: PATH runs 3.1.0 at .*fakeshadow, and an inactive npm copy is also installed (3.0.0). fix: keep one copy' <<< "$out" && pass "unreachable duplicate reported with a fix" || fail "duplicate report"
 [[ "$(grep -c 'notify:' <<< "$out")" == 1 ]] && grep -q 'notify: .*Fake Shadow: PATH runs' <<< "$out" && pass "first run notifies only about the duplicate" || fail "first run notifications"
 grep -q 'Fake Shadow' "$AICM_HOME/state/inventory-shadow.txt" && pass "duplicate kept in state for doctor" || fail "shadow state"
 
@@ -263,6 +278,9 @@ awk 'BEGIN { for (i = 1; i <= 6000; i++) print "line " i }' > "$AICM_HOME/logs/c
 [[ "$(wc -l < "$AICM_HOME/logs/cron.update.log" | tr -d ' ')" == 2000 ]] && tail -n 1 "$AICM_HOME/logs/cron.update.log" | grep -qx 'line 6000' && pass "cron.update.log is trimmed to its last 2000 lines" || fail "cron log not trimmed: $(wc -l < "$AICM_HOME/logs/cron.update.log")"
 
 echo "# Codex from the official installer updates itself, gated like the Grok installer"
+# A second Homebrew installation must not take priority over the copy on PATH.
+touch "$WORK/brew-installed"
+: > "$WORK/brew-calls.log"
 codex_registry() { # versions as version:daysAgo ...; the last one is latest
   node -e 'const fs=require("fs"),f=process.argv[1],r=JSON.parse(fs.readFileSync(f,"utf8")),v={};let l;
     for(const a of process.argv.slice(2)){const[n,d]=a.split(":");v[n]={daysAgo:+d,provenance:true};l=n;}
@@ -281,14 +299,22 @@ out="$(PATH="$WORK/codexbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$
 codex_registry 0.1.0:30 0.2.0:10
 out="$(PATH="$WORK/codexbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 && "$(codex_updates)" == 1 ]] && pass "standalone Codex is updated with codex update" || fail "codex standalone: rc=$rc $out"
+! grep -Eq '^(update|upgrade)( |$)' "$WORK/brew-calls.log" && pass "standalone Codex does not update the hidden Homebrew copy" || fail "hidden Homebrew Codex touched"
 echo 0.2.0 > "$WORK/codex-version"
 out="$(PATH="$WORK/codexbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 && "$(codex_updates)" == 1 ]] && grep -q 'already current: codex 0.2.0' <<< "$out" && pass "a current Codex does not rerun the installer" || fail "codex current: rc=$rc $out"
 echo 0.1.0 > "$WORK/codex-version"
 out="$(PATH="$WORK/codexbin:$PATH" "$ROOT/bin/inventory_ai_clis.sh" --offline 2>&1)" || true
 grep -Eq '^OpenAI Codex +standalone +0\.1\.0 .* yes$' <<< "$out" && pass "standalone Codex is covered" || fail "codex coverage: $out"
+npm_cli codex @openai/codex 0.1.0
+out="$(PATH="$WORK/codexbin:$PATH" "$ROOT/bin/inventory_ai_clis.sh" --offline 2>&1)" || true
+grep -Eq '^OpenAI Codex +standalone +0\.1\.0 .* yes$' <<< "$out" && pass "standalone Codex stays covered with a hidden npm copy" || fail "codex shadow coverage: $out"
+shadow_installs_before="$(grep -c '^install -g @openai/codex@' "$WORK/npm-calls.log" || true)"
 out="$(PATH="$WORK/appbin:$PATH" "$UPD" --targets codex 2>&1)" || true
 [[ ! -e "$WORK/app-updates.log" ]] && pass "a Codex copy outside the installer (desktop app) is left to its app" || fail "desktop codex updated: $out"
+[[ "$(grep -c '^install -g @openai/codex@' "$WORK/npm-calls.log" || true)" == "$shadow_installs_before" ]] && pass "desktop Codex does not update its hidden npm copy" || fail "hidden npm Codex touched"
+out="$(PATH="$WORK/appbin:$PATH" "$UPD" --targets codex --install-missing 2>&1)" || true
+[[ "$(grep -c '^install -g @openai/codex@' "$WORK/npm-calls.log" || true)" == "$shadow_installs_before" ]] && pass "install-missing does not install over a present desktop Codex" || fail "install-missing touched present Codex: $out"
 out="$(PATH="$WORK/appbin:$PATH" "$ROOT/bin/inventory_ai_clis.sh" --offline 2>&1)" || true
 grep -Eq '^OpenAI Codex +standalone +0\.1\.0 .* no: the Codex desktop app' <<< "$out" && pass "desktop Codex is reported as updated by its app" || fail "desktop codex coverage: $out"
 
@@ -297,6 +323,22 @@ npm_cli opencode @opencode/cli 2.0.0
 # NPM unset: the npm first on PATH must be used, not one in a fallback folder such as /usr/local/bin.
 out="$(env -u NPM "$UPD" --targets opencode 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 ]] && grep -qx 'install -g @opencode/cli@2.1.0' <<< "$(calls)" && pass "OpenCode 2.x is updated through the npm on PATH, not opencode upgrade" || fail "opencode 2.x: rc=$rc $out"
+! grep -Eq '^(update|upgrade)( |$)' "$WORK/brew-calls.log" && pass "npm OpenCode does not update the hidden Homebrew copy" || fail "hidden Homebrew OpenCode touched"
+
+echo "# npm Claude also takes priority over a hidden Homebrew copy"
+node -e 'const fs=require("fs"),f=process.argv[1],r=JSON.parse(fs.readFileSync(f,"utf8"));r["@anthropic-ai/claude-code"]={latest:"2.1.0",versions:{"2.0.0":{daysAgo:30},"2.1.0":{daysAgo:10}}};fs.writeFileSync(f,JSON.stringify(r));' "$WORK/registry.json"
+npm_cli claude @anthropic-ai/claude-code 2.0.0
+out="$("$UPD" --targets claude 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'install -g @anthropic-ai/claude-code@2.1.0' <<< "$(calls)" && pass "npm Claude is updated while Homebrew also has it" || fail "Claude copy: $out"
+! grep -Eq '^(update|upgrade)( |$)' "$WORK/brew-calls.log" && pass "npm Claude does not update the hidden Homebrew copy" || fail "hidden Homebrew Claude touched"
+
+echo "# the active Homebrew copy still updates"
+mkdir -p "$WORK/brew/Cellar/codex/0.1/bin" "$WORK/brewbin"
+printf '#!/bin/sh\necho codex-cli 0.1.0\n' > "$WORK/brew/Cellar/codex/0.1/bin/codex"
+chmod +x "$WORK/brew/Cellar/codex/0.1/bin/codex"
+ln -s "$WORK/brew/Cellar/codex/0.1/bin/codex" "$WORK/brewbin/codex"
+out="$(PATH="$WORK/brewbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx update "$WORK/brew-calls.log" && grep -qx 'upgrade --cask codex' "$WORK/brew-calls.log" && pass "active Homebrew Codex is updated through the fake brew" || fail "active brew: $out"
 
 echo "# bad catalog"
 printf 'Bad Id | x | x |  |  |  |  |\n' > "$WORK/bad.conf"

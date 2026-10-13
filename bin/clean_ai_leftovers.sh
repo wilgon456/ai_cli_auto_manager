@@ -174,6 +174,34 @@ run_age_files_rule() {
   rm -f "$list"
 }
 
+# POSIX permits unlinking an open SQLite DB, including its WAL. Missing/failed checks keep the group.
+cap_group_idle() {
+  local out err rc=0 idle=1
+  command -v lsof >/dev/null 2>&1 || return 1
+  out="$(mktemp)" || return 1
+  err="$(mktemp)" || { rm -f "$out"; return 1; }
+  aicm_timeout 15 lsof -t -- "$@" > "$out" 2> "$err" || rc=$?
+  [[ "$rc" == 1 && ! -s "$out" && ! -s "$err" ]] && idle=0
+  rm -f "$out" "$err"
+  return "$idle"
+}
+
+# Whole-directory cleanup uses the same protections as individual files. Any protected,
+# linked or open member keeps the tree before rm can remove its first file.
+cleanup_tree_idle() {
+  local root="$1" list all safe f
+  [[ -z "$(find "$root" -type l -o -iname memory 2>/dev/null)" ]] || return 1
+  list="$(mktemp)" || return 1
+  find "$root" -type f -print0 > "$list" 2>/dev/null || { rm -f "$list"; return 1; }
+  all="$(count_list "$list")"
+  safe="$(find "$root" -type f "${AICM_PROTECT_ARGS[@]}" -print0 2>/dev/null | tr -cd '\0' | wc -c | tr -d ' ')"
+  [[ "$all" == "$safe" ]] || { rm -f "$list"; return 1; }
+  local files=()
+  while IFS= read -r -d '' f; do files+=("$f"); done < "$list"
+  rm -f "$list"
+  ((${#files[@]} == 0)) || cap_group_idle "${files[@]}"
+}
+
 run_cap_rule() {
   local root="$1" pattern="$2" days="$3" limit_mb="$4" dry="$5" list f size too_old too_big side
   list="$(mktemp)"
@@ -185,7 +213,21 @@ run_cap_rule() {
     if ((limit_mb > 0)) && ((size > limit_mb * 1048576)); then too_big=true; fi
     [[ "$too_old" == true || "$too_big" == true ]] || continue
     local group=("$f")
-    for side in "$f-wal" "$f-shm" "$f-journal"; do [[ -f "$side" && ! -L "$side" ]] && group+=("$side"); done
+    local valid=true
+    for side in "$f-wal" "$f-shm" "$f-journal"; do
+      if [[ -e "$side" || -L "$side" ]]; then
+        if [[ -f "$side" && ! -L "$side" ]]; then group+=("$side"); else valid=false; fi
+      fi
+    done
+    if [[ "$valid" != true ]]; then
+      R_IN_USE=$((R_IN_USE + 1)); R_DETAIL="unexpected SQLite sidecar; kept"
+      continue
+    fi
+    if ! cap_group_idle "${group[@]}"; then
+      R_IN_USE=$((R_IN_USE + ${#group[@]}))
+      R_DETAIL="open-file check found use or could not prove the files idle; kept"
+      continue
+    fi
     for side in "${group[@]}"; do R_FILES=$((R_FILES + 1)); R_BYTES=$((R_BYTES + $(file_bytes "$side"))); done
     [[ "$dry" == true ]] && continue
     for side in "${group[@]}"; do
@@ -219,7 +261,7 @@ run_keep_latest_rule() {
     bytes="$(tree_bytes "$root/$name")"
     R_FILES=$((R_FILES + 1)); R_BYTES=$((R_BYTES + bytes))
     [[ "$dry" == true ]] && continue
-    # rm -rf removes symlinks inside the tree as links; it never follows them.
+    if ! cleanup_tree_idle "$root/$name"; then R_IN_USE=$((R_IN_USE + 1)); continue; fi
     if rm -rf -- "${root:?}/$name" 2>/dev/null; then
       R_REMOVED=$((R_REMOVED + 1)); R_REMOVED_BYTES=$((R_REMOVED_BYTES + bytes))
     else
@@ -241,6 +283,7 @@ purge_archive() { # archive_dir days dry
     bytes="$(tree_bytes "$d")"
     R_PURGE=$((R_PURGE + 1)); R_PURGE_BYTES=$((R_PURGE_BYTES + bytes))
     [[ "$dry" == true ]] && continue
+    if ! cleanup_tree_idle "$d"; then R_IN_USE=$((R_IN_USE + 1)); continue; fi
     if rm -rf -- "${d:?}" 2>/dev/null; then
       R_PURGED=$((R_PURGED + 1)); R_PURGED_BYTES=$((R_PURGED_BYTES + bytes))
     else

@@ -30,6 +30,8 @@ jobs:
       - run: bash --version | head -n 1
       - name: Cleanup tests
         run: bash tests/clean_test.sh
+      - name: Live SQLite and symlink ancestor regressions
+        run: python3 tests/cleanup_safety_test.py
       - name: Command and schedule tests
         run: bash tests/aicm_test.sh
       - name: Inventory and catalog update tests
@@ -58,6 +60,9 @@ jobs:
       - name: Cleanup tests (PowerShell 7)
         shell: pwsh
         run: .\tests\clean_test.ps1
+      - name: Command and schedule tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\aicm_test.ps1
       - name: Inventory and catalog update tests (PowerShell 7)
         shell: pwsh
         run: .\tests\inventory_test.ps1

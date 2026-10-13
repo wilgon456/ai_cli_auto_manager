@@ -8,7 +8,7 @@
 # is what makes them work again.
 #
 # Paseo supervises one of these servers. Others are reparented to launchd or init (ppid 1) and survive
-# `paseo restart`, so those are stopped directly. The ChatGPT.app bundle carries its own host and is
+# a Paseo daemon restart, so those are stopped directly. The ChatGPT.app bundle carries its own host and is
 # left alone.
 #
 # A cask install also carries com.apple.quarantine. Even a notarized build makes Gatekeeper show the
@@ -89,11 +89,21 @@ release_codex_cask_quarantine_quiet() {
 }
 
 codex_server_is_stale() {
-  local current="$1" mapped="$2"
+  local current="$1" mapped="$2" cask_root mapped_root old_version current_version
   [[ -n "$current" && -n "$mapped" ]] || return 1
   [[ "$mapped" == "$current" ]] && return 1
-  [[ "$mapped" == *"/ChatGPT.app/"* ]] && return 1
-  return 0
+  # An older build that still exists has not been replaced and its server can still start its host.
+  [[ -e "$mapped" || -L "$mapped" ]] && return 1
+  [[ "$current" == */Caskroom/codex/*/bin/codex ]] || return 1
+  cask_root="${current%/Caskroom/codex/*}/Caskroom/codex"
+  [[ "$mapped" == */Caskroom/codex/*/bin/codex ]] || return 1
+  mapped_root="${mapped%/Caskroom/codex/*}/Caskroom/codex"
+  [[ "$(aicm_real_dir "$cask_root")" == "$(aicm_real_dir "$mapped_root")" ]] || return 1
+  old_version="${mapped#"$mapped_root/"}"; old_version="${old_version%/bin/codex}"
+  current_version="${current#"$cask_root/"}"; current_version="${current_version%/bin/codex}"
+  [[ "$old_version" != */* ]] || return 1
+  old_version="${old_version%.upgrading}"
+  aicm_version_older "$old_version" "$current_version"
 }
 
 # lsof -Fn prints one "n<path>" field per line. Keep the codex executable and drop dyld and the host.
@@ -160,8 +170,12 @@ recycle_stale_codex_app_servers() {
   if command -v paseo >/dev/null 2>&1; then
     echo "restarting the Paseo daemon so its Codex app-server loads $current"
     rc=0
-    paseo restart --timeout 120 || rc=$?
-    ((rc == 0)) || echo "warn: paseo restart rc=$rc"
+    if paseo daemon restart --help >/dev/null 2>&1; then
+      paseo daemon restart --timeout 120 || rc=$?
+    else
+      paseo restart --timeout 120 || rc=$?
+    fi
+    ((rc == 0)) || echo "warn: Paseo daemon restart rc=$rc"
     codex_collect_stale_pids "$current"
   fi
 

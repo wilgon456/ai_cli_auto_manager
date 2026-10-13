@@ -14,6 +14,7 @@ export HOME="$WORK/home" TMPDIR="$WORK/tmp" AICM_HOME="$WORK/home/.ai-cli-auto-m
 export CODEX_HOME="$WORK/home/.codex" USERPROFILE="$WORK/home"
 # The node checks have their own tests (tests/node); keep these runs away from real processes and repos.
 export AICM_PROCESSES=0 AICM_WORKTREES=0
+export BREW=/usr/bin/false AICM_CODEX_RECYCLE=0 AICM_CODEX_UNQUARANTINE=0
 mkdir -p "$HOME" "$TMPDIR" "$WORK/fakebin"
 
 # Fake crontab that keeps its table in a file.

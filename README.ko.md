@@ -139,9 +139,11 @@ my-agent  | myagent | My Agent  | @me/my-agent   |      |        |             |
 - **중간에 끊긴 설치의 찌꺼기를 조심해서 치웁니다.** 설치가 도중에 실패하면 npm이 임시 폴더(`node_modules/.<이름>-XXXXXXXX`, 수백 MB)를 남깁니다. 업데이트가 끝날 때마다 하루 넘은 것을 지우되, 그 패키지가 제대로 깔려 있을 때만 지웁니다. 그 폴더가 npm의 유일한 백업일 수 있기 때문입니다. 관리하던 CLI가 사라지면 그 백업으로 같은 버전을 다시 깔거나, 한 번 알립니다.
 - **"오늘 끝남"은 정말 끝났을 때만입니다.** 같은 날(이 컴퓨터의 날짜 기준) 같은 CLI들을 다 올렸을 때만 재시도가 바로 끝납니다. 손으로 `--targets claude`만 돌린 날에도 예약 실행은 전부 돕니다. 할 일 없는 재시도는 로그를 남기지 않고, cron·launchd가 쌓는 로그는 길어지면 줄입니다.
 - **회사 설치 스크립트는 필요할 때만 받습니다.** Grok Build의 설치 스크립트와 `codex update`(공식 설치 프로그램으로 깐 Codex)는 매일이 아니라, 대기 기간이 지난 새 버전이 있을 때만 실행합니다.
-- **Homebrew로 Codex를 올려도 떠 있는 app-server가 고장 나지 않습니다.** `brew upgrade`는 옛 cask 폴더를 지우는데, 오래 떠 있는 `codex app-server`(Paseo가 하나 띄워 둡니다)는 그 폴더에서 터미널 호스트를 실행하려다 실패해 터미널 도구가 멈춥니다. Codex 업데이트 바로 뒤에 바뀌기 전 Codex를 붙잡은 서버를 찾아 Paseo 데몬을 다시 띄우고(`paseo restart`), 그래도 남은 서버만 끕니다. 이미 새 Codex로 도는 서버와 ChatGPT 앱의 자체 사본은 건드리지 않습니다. `AICM_CODEX_RECYCLE=0`으로 끕니다.
+- **Homebrew로 Codex를 올려도 떠 있는 app-server가 고장 나지 않습니다.** `brew upgrade`는 옛 cask 폴더를 지우는데, 오래 떠 있는 `codex app-server`(Paseo가 하나 띄워 둡니다)는 그 폴더에서 터미널 호스트를 실행하려다 실패해 터미널 도구가 멈춥니다. Codex 업데이트 바로 뒤에 바뀌기 전 Codex를 붙잡은 서버를 찾아 Paseo 데몬을 다시 띄우고(`paseo daemon restart`), 그래도 남은 서버만 끕니다. 같은 Homebrew cask 경로에서 업데이트로 실행 파일이 삭제된 이전 버전만 대상으로 삼고, npm·standalone·다른 cask 경로·더 새 버전·앱 자체 사본은 남깁니다. `AICM_CODEX_RECYCLE=0`으로 끕니다.
 - **Homebrew Codex의 터미널 호스트가 실행됩니다.** cask로 받은 파일에는 격리 표시가 붙습니다. 그래서 `codex-code-mode-host`를 처음 실행할 때 Gatekeeper가 "인터넷에서 다운로드한 앱" 확인 창을 띄우고 클릭을 기다립니다. 원격으로 쓰거나 자리를 비운 Mac에서는 아무도 누르지 않아 호스트가 실행되지 않고, 셸·편집 도구 호출이 모두 `timed out negotiating with the code-mode host`로 실패합니다. 매번 실행할 때 Codex cask 폴더의 격리 표시를 지웁니다. 단, `codesign --check-notarization`으로 OpenAI(팀 `2DC432GLL2`)가 서명하고 공증한 빌드인지 확인된 경우에만 지웁니다. 그날 업데이트가 끝나 재시도가 일찍 끝날 때도 이 확인은 합니다. `AICM_CODEX_UNQUARANTINE=0`으로 끕니다.
 - **같은 문제는 한 번만 알립니다.** 처음 생길 때 알리고, 계속되면 일주일에 한 번까지만 다시 알립니다.
+
+업데이트 경로는 PATH에서 실행하는 사본을 기준으로 고릅니다. 그 뒤에 가려진 Homebrew나 npm Codex 사본은 건드리지 않고, npm 중복 설치는 해결 방법과 함께 알립니다.
 
 ### 업데이트 뒤에 할 일 (훅)
 
@@ -154,10 +156,21 @@ CLI를 새로 깔아도 이미 떠 있는 데몬이 옛 실행 파일을 붙잡�
 
 ```powershell
 # 예: Paseo 데몬이 새 CLI를 다시 읽게 하기
-paseo reload
+paseo daemon restart
 ```
 
 ## 정리
+
+크기·날짜 기준으로 지우는 파일은 SQLite의 WAL·SHM·journal까지 함께 확인합니다.
+macOS·Linux에서는 `lsof`로 사용 중인지 확인하며, 도구가 없거나 확인에 실패하거나 열려 있는
+파일을 발견하면 전체를 남깁니다. Windows에서는 확인부터 삭제가 끝날 때까지 읽기·쓰기를
+막는 파일 핸들을 유지합니다. DB가 닫혀 있어도 보조 파일이 열려 있으면 지우지 않습니다.
+
+브라우저 캐시·오래된 보관 폴더 안에 보호 파일, 링크 또는 사용 여부를 확인할 수 없는
+파일이 있으면 폴더 전체를 남깁니다. Windows의 날짜 기준 정리는 SQLite 묶음의 모든
+파일이 날짜·패턴 조건에 맞을 때만 함께 삭제합니다. 읽기 전용이거나 예상과 다른 보조
+파일이 있으면 전체를 보존합니다. Windows 설치 사본 관리에서는 사용자가 지정한
+`AICM_HOME`의 junction을 허용하며, 사용자 데이터 정리는 연결 경로를 계속 거부합니다.
 
 기본 규칙은 [`rules/clean-rules.conf`](rules/clean-rules.conf) 한 파일에 있고, Windows와 macOS·Linux가 같은 파일을 읽습니다. 기준은 처음 만든 날이 아니라 마지막으로 쓴 날이라서, 지금 이어서 쓰는 긴 대화는 지워지지 않습니다. 대부분의 규칙은 폴더 바로 아래 항목(세션 폴더 등)을 한 덩어리로 보고, 그 안이 정해 둔 날 동안 하나도 안 바뀌었을 때만 통째로 지웁니다. 그래서 아직 쓰는 세션이나 플러그인 폴더에서 오래된 파일만 빠져 망가지는 일이 없습니다.
 
@@ -287,8 +300,10 @@ Windows는 PC가 꺼져 있어 시각을 놓치면 다음에 켜질 때 실행�
 ```bash
 shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
 bash tests/clean_test.sh
+python3 tests/cleanup_safety_test.py
 bash tests/aicm_test.sh
 bash tests/inventory_test.sh
+bash tests/codex_host_test.sh
 node --test tests/node/*.test.js
 ```
 

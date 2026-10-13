@@ -1,5 +1,40 @@
 # Changelog
 
+## 2.8.2 - 2026-10-11
+
+### Fixed: cleanup boundaries and running files
+- Cleanup refuses symlinks and junctions anywhere below the trusted home/temp root, including
+  parent folders of a rule path. A plain rule folder behind a link can no longer delete outside files.
+- Size/age-capped files and their SQLite WAL/SHM/journal are checked together before deletion.
+  macOS/Linux use `lsof` and keep the group if the check is missing, fails, or finds an open file.
+  Windows acquires exclusive read/delete handles and marks all members for deletion together; any open member keeps
+  the whole group, including when another application allows delete sharing.
+
+- Recursive browser/archive cleanup now checks the entire tree before deleting files and keeps
+  protected, linked or busy units intact. Installed-copy removal uses a separate management path.
+- Windows age rules delete eligible SQLite families together and preserve the family when any
+  member is readonly, fresh, excluded by the pattern, or an unexpected directory/link.
+  Capped cleanup also preserves unexpected sidecars on macOS/Linux.
+- Windows deletion opens reparse points themselves and holds ancestor directories against rename
+  during file deletion. Readonly members are rejected before any deletion mark.
+- Repeated installed-copy synchronization works under an explicitly selected AICM_HOME junction;
+  aliases below that root remain blocked. PowerShell 7 now runs schedule regressions in CI.
+
+- Windows task refresh preserves custom settings, principals and disabled state. Hidden npm recovery is skipped when PATH uses another installation.
+
+### Fixed: Paseo 0.11 compatibility
+- Codex recycling uses `paseo daemon restart` on current Paseo, and detects the legacy restart command for older installations.
+
+### Fixed: update the installation the user runs
+- An inactive Homebrew installation no longer takes priority over the Codex, OpenCode or Claude
+  copy on PATH. An inactive npm Codex copy is reported rather than silently updated on both platforms.
+- Codex server recycling only targets an older version under the same Homebrew cask root whose
+  executable has been removed by an upgrade.
+  Other cask roots, npm, standalone, application bundles, newer versions and unknown versions stay.
+- Unix tests always shadow Homebrew; cleanup tests shadow uv. Inventory tests cover duplicate
+  installations and an active Homebrew install without reaching real package managers. Added
+  live SQLite/WAL and symlink ancestor regressions, plus Windows junction and open-WAL cases.
+
 ## 2.8.1 - 2026-10-10
 
 ### Fixed: the Codex quarantine clear rejected every new build

@@ -46,15 +46,71 @@ function Get-TreeBytes([string]$Path) {
   return $sum
 }
 
+# Include unexpected and dangling sidecars too: an unsafe member keeps the entire family.
+function Get-FileGroup([System.IO.FileInfo]$File) {
+  if ($File.FullName -notmatch '^(.*\.(?:sqlite\d*|db))(?:(?:-wal|-shm|-journal))?$') { return $File }
+  $base = $Matches[1]
+  $names = @(foreach ($suffix in '', '-wal', '-shm', '-journal') { [IO.Path]::GetFileName($base + $suffix) })
+  foreach ($item in $File.Directory.GetFileSystemInfos()) {
+    if ($names -contains $item.Name) { $item }
+  }
+}
+
 function Remove-FileQuietly([System.IO.FileInfo]$File) {
-  try {
-    if ($File.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
-      $File.Attributes = $File.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly)
+  try { return (Remove-FileGroup @(Get-FileGroup $File)) } catch { return $false }
+}
+
+# Acquire every member exclusively before marking any for deletion. Windows allows
+# File.Delete on an open file with FileShare.Delete, which is not proof it is idle.
+function Remove-FileGroup([System.IO.FileSystemInfo[]]$Files, [System.IO.FileSystemInfo[]]$Checks = $Files) {
+  if ($Files.Count -eq 0) { return $false }
+  foreach ($f in $Checks) {
+    if ($f -isnot [System.IO.FileInfo] -or (Test-AicmProtected $f) -or (Test-AicmPathHasLink $f.FullName)) { return $false }
+  }
+  if (-not ('Aicm.FileGuard' -as [type])) {
+    Add-Type -Path (Join-Path (Get-AicmRoot) 'lib\aicm-file-guard.cs')
+  }
+  return [Aicm.FileGuard]::TryDelete([string[]]@($Files | ForEach-Object { $_.FullName }), [string[]]@($Checks | ForEach-Object { $_.FullName }))
+}
+
+# A cleanup directory is one unit. Never partially remove a protected or busy tree.
+function Remove-CleanupTree([System.IO.DirectoryInfo]$Dir) {
+  if (Test-AicmPathHasLink $Dir.FullName) { throw "linked cleanup tree : $($Dir.FullName)" }
+  $stack = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+  $dirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
+  $files = New-Object System.Collections.Generic.List[System.IO.FileSystemInfo]
+  $stack.Push($Dir)
+  while ($stack.Count) {
+    $current = $stack.Pop()
+    if ((Test-AicmProtected $current) -or (Test-AicmPathHasLink $current.FullName)) { throw "protected or linked cleanup tree" }
+    $dirs.Add($current)
+    foreach ($child in $current.GetFileSystemInfos()) {
+      if ((Test-AicmLink $child) -or (Test-AicmProtected $child)) { throw "protected or linked cleanup member" }
+      if ($child -is [System.IO.DirectoryInfo]) { $stack.Push($child) } else { $files.Add($child) }
     }
-    $File.Delete()
-    return $true
-  } catch {
-    return $false
+  }
+  if ($files.Count -and -not (Remove-FileGroup $files.ToArray())) { throw "cleanup tree is in use or cannot be deleted" }
+  foreach ($d in @($dirs | Sort-Object { $_.FullName.Length } -Descending)) {
+    if (Test-AicmPathHasLink $d.FullName) { throw "cleanup tree changed to a link" }
+    $d.Delete($false)
+  }
+}
+
+# Age rules only delete a family if EVERY member is eligible. A fresh, protected,
+# or pattern-excluded sidecar must not disappear because its database is old.
+function Remove-AgeCandidates([System.IO.FileInfo[]]$Candidates, $Result) {
+  $eligible = @{}; $seen = @{}
+  foreach ($f in $Candidates) { $eligible[$f.FullName] = $true }
+  foreach ($f in $Candidates) {
+    if ($seen.ContainsKey($f.FullName)) { continue }
+    $group = @(Get-FileGroup $f)
+    $allowed = $true; $bytes = 0L; $count = 0
+    foreach ($member in $group) {
+      $seen[$member.FullName] = $true
+      if (-not $eligible.ContainsKey($member.FullName)) { $allowed = $false } else { $bytes += $member.Length; $count++ }
+    }
+    if ($allowed -and (Remove-FileGroup $group)) { $Result.removed += $count; $Result.removedBytes += $bytes }
+    else { $Result.inUse += $count }
   }
 }
 
@@ -74,6 +130,8 @@ function Invoke-AgeRule($Rule, [string]$Root) {
   $cutoff = (Get-Date).AddDays(-$Rule.Days)
   $result = [ordered]@{ files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0 }
   $units = @()
+  $candidates = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+  $oldDirs = New-Object System.Collections.Generic.List[System.IO.DirectoryInfo]
   try { $units = @(([System.IO.DirectoryInfo]::new($Root)).GetFileSystemInfos($Rule.Pattern)) } catch { return $result }
   foreach ($unit in $units) {
     if (Test-AicmLink $unit) { continue }
@@ -82,12 +140,12 @@ function Invoke-AgeRule($Rule, [string]$Root) {
     $files = @($files | Where-Object { -not (Test-AicmProtected $_) })
     $result.files += $files.Count
     foreach ($f in $files) { $result.bytes += $f.Length }
-    if ($DryRun) { continue }
-    foreach ($f in $files) {
-      $len = $f.Length
-      if (Remove-FileQuietly $f) { $result.removed++; $result.removedBytes += $len } else { $result.inUse++ }
-    }
-    if ($unit -is [System.IO.DirectoryInfo]) {
+    foreach ($f in $files) { $candidates.Add($f) }
+    if ($unit -is [System.IO.DirectoryInfo]) { $oldDirs.Add($unit) }
+  }
+  if (-not $DryRun) {
+    Remove-AgeCandidates $candidates.ToArray() $result
+    foreach ($unit in $oldDirs) {
       [void](Remove-AicmEmptyDirs $unit.FullName)
       try { if (@($unit.GetFileSystemInfos()).Count -eq 0) { $unit.Delete($false) } } catch { }
     }
@@ -103,10 +161,7 @@ function Invoke-AgeFilesRule($Rule, [string]$Root) {
   $result = [ordered]@{ files = $candidates.Count; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0 }
   foreach ($f in $candidates) { $result.bytes += $f.Length }
   if ($DryRun) { return $result }
-  foreach ($f in $candidates) {
-    $len = $f.Length
-    if (Remove-FileQuietly $f) { $result.removed++; $result.removedBytes += $len } else { $result.inUse++ }
-  }
+  Remove-AgeCandidates $candidates $result
   [void](Remove-AicmEmptyDirs $Root)
   return $result
 }
@@ -120,19 +175,13 @@ function Invoke-CapRule($Rule, [string]$Root) {
     $tooOld = ($Rule.Days -gt 0) -and ($f.LastWriteTime -lt $cutoff)
     $tooBig = ($Rule.Limit -gt 0) -and ($f.Length -gt $limitBytes)
     if (-not ($tooOld -or $tooBig)) { continue }
-    $group = @($f) + @(foreach ($suffix in '-wal', '-shm', '-journal') {
-      $side = Join-Path $f.DirectoryName ($f.Name + $suffix)
-      if (Test-Path -LiteralPath $side) { Get-Item -LiteralPath $side -Force }
-    })
-    foreach ($g in $group) { $result.files++; $result.bytes += $g.Length }
+    $group = @(Get-FileGroup $f)
+    foreach ($g in $group) { if ($g -is [System.IO.FileInfo]) { $result.files++; $result.bytes += $g.Length } }
     if ($DryRun) { continue }
-    # Remove the main file first: if the owning app holds it open, nothing else is touched.
-    if (-not (Remove-FileQuietly $f)) { $result.inUse += $group.Count; continue }
-    foreach ($g in $group) {
-      if ($g.FullName -eq $f.FullName) { $result.removed++; $result.removedBytes += $g.Length; continue }
-      $len = $g.Length
-      if (Remove-FileQuietly $g) { $result.removed++; $result.removedBytes += $len } else { $result.inUse++ }
-    }
+    if (Remove-FileGroup $group) {
+      $result.removed += $group.Count
+      foreach ($g in $group) { $result.removedBytes += $g.Length }
+    } else { $result.inUse += $group.Count }
   }
   return $result
 }
@@ -157,7 +206,7 @@ function Invoke-KeepLatestRule($Rule, [string]$Root) {
       $result.folders += $entry.Dir.Name
       if ($DryRun) { continue }
       try {
-        Remove-AicmTree $entry.Dir
+        Remove-CleanupTree $entry.Dir
         $result.removed++
         $result.removedBytes += $bytes
       } catch {
@@ -185,7 +234,7 @@ function Invoke-ArchivePurge($Result, [string]$ArchiveDir, [int]$Days, [bool]$Pu
     $Result.purge++
     $Result.purgeBytes += $bytes
     if ($PurgeDry) { continue }
-    try { Remove-AicmTree $d; $Result.purged++; $Result.purgedBytes += $bytes } catch { $Result.inUse++ }
+    try { Remove-CleanupTree $d; $Result.purged++; $Result.purgedBytes += $bytes } catch { $Result.inUse++ }
   }
 }
 

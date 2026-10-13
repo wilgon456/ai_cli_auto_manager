@@ -99,21 +99,40 @@ aicm_temp_usable() {
 # A rule may only touch the home folder (never the home folder itself) or the temp folder.
 # $2 = 1: the rule's path is written with {temp}; it is allowed only while TMPDIR looks right.
 aicm_path_allowed() {
-  local p="$1" from_temp="${2:-0}" home temp in_temp=1
+  local p="$1" from_temp="${2:-0}" home temp in_temp=1 anchor check real real_home real_anchor
   home="${HOME%/}"
   temp="$(aicm_temp_dir)"
   case "/$p/" in
     */../*|*/./*) return 1 ;;
   esac
   # No home folder (HOME unset or /) means no safe area at all.
-  [[ -n "$home" ]] || return 1
+  [[ -n "$home" && "$home" != / && "$p" == /* ]] || return 1
   # The home folder itself, or anything above it, never.
   [[ "$home/" == "$p/"* ]] && return 1
   if [[ "$p" == "$temp" || "$p" == "$temp/"* ]] && aicm_temp_usable; then in_temp=0; fi
-  [[ "$from_temp" == 1 ]] && return "$in_temp"
-  ((in_temp == 0)) && return 0
-  [[ "$p" == "$home/"* ]] && return 0
-  return 1
+  [[ "$from_temp" == 1 && "$in_temp" != 0 ]] && return 1
+  if ((in_temp == 0)); then anchor="$temp"
+  elif [[ "$p" == "$home/"* ]]; then anchor="$home"
+  else return 1; fi
+  # A link in any component below the trusted home/temp root can redirect find and rm outside it.
+  # Do not reject system aliases such as macOS /var -> /private/var above the trusted root.
+  check="$p"
+  while [[ "$check" != "$anchor" ]]; do
+    [[ -L "$check" ]] && return 1
+    [[ "$check" == / ]] && return 1
+    check="$(dirname "$check")"
+  done
+  real_home="$(cd -P -- "$home" 2>/dev/null && pwd -P)" || return 1
+  real_anchor="$(cd -P -- "$anchor" 2>/dev/null && pwd -P)" || return 1
+  if [[ -e "$p" ]]; then
+    real="$(cd -P -- "$p" 2>/dev/null && pwd -P)" || return 1
+  else
+    # Missing rule folders are harmless. Resolve the trusted anchor so system aliases such as
+    # /var and /private/var compare consistently even before the folder has been created.
+    real="$real_anchor${p#"$anchor"}"
+  fi
+  [[ "$real_home/" == "$real/"* ]] && return 1
+  [[ "$real" == "$real_anchor" || "$real" == "$real_anchor/"* ]]
 }
 
 aicm_display_path() {
@@ -693,9 +712,10 @@ aicm_npm_globals() {
 
 AICM_BREW_PREFIX_CACHE="unset"
 aicm_brew_prefix() {
+  local brew="${BREW:-brew}"
   if [[ "$AICM_BREW_PREFIX_CACHE" == unset ]]; then
     AICM_BREW_PREFIX_CACHE=""
-    command -v brew >/dev/null 2>&1 && AICM_BREW_PREFIX_CACHE="$(brew --prefix 2>/dev/null || true)"
+    command -v "$brew" >/dev/null 2>&1 && AICM_BREW_PREFIX_CACHE="$("$brew" --prefix 2>/dev/null || true)"
   fi
   printf '%s' "$AICM_BREW_PREFIX_CACHE"
 }
@@ -752,7 +772,7 @@ aicm_cli_coverage() {
       if [[ -n "${AICM_CLI_BREW[$i]}" ]] || [[ " claude codex opencode " == *" $id "* ]]; then echo yes
       else echo "no: add its Homebrew name to the catalog"; fi ;;
     standalone)
-      if aicm_is_builtin "$id" && [[ -n "$CLI_NPMCOPY" && " claude codex opencode kimi " == *" $id "* ]]; then
+      if aicm_is_builtin "$id" && [[ -n "$CLI_NPMCOPY" && "$id" == kimi ]]; then
         echo "no: the update refreshes the npm copy, not the one on PATH"
       elif [[ -n "${AICM_CLI_SELF[$i]}" ]]; then echo yes
       elif [[ "$id" == codex ]] && aicm_codex_standalone "$CLI_PATH"; then echo yes

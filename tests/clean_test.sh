@@ -15,6 +15,15 @@ export CODEX_HOME="$WORK/home/.codex" USERPROFILE="$WORK/home"
 export AICM_PROCESSES=0 AICM_WORKTREES=0
 unset XDG_CACHE_HOME
 mkdir -p "$HOME" "$TMPDIR" "$AICM_HOME" "$WORK/outside" "$WORK/fakebin"
+# The command rule never reaches the real uv; cap fixtures use a deterministic open-file checker.
+printf '#!/bin/sh\necho fake-cache-pruned\n' > "$WORK/fakebin/uv"
+cat > "$WORK/fakebin/lsof" <<EOF
+#!/bin/sh
+if [ -e "$WORK/lsof-error" ]; then echo check-failed >&2; exit 1; fi
+if [ -e "$WORK/lsof-open" ]; then echo 4242; exit 0; fi
+exit 1
+EOF
+chmod +x "$WORK/fakebin/uv" "$WORK/fakebin/lsof"
 
 fails=0
 pass() { echo "ok   - $1"; }
@@ -197,13 +206,19 @@ expect_exists "$HOME/.codex/generated_images/pic.png" "off rule keeps files"
 expect_gone "$HOME/.codex/logs_2.sqlite" "oversized trace DB removed"
 expect_gone "$HOME/.codex/logs_2.sqlite-wal" "trace DB sidecar removed"
 expect_exists "$HOME/.codex/logs_9.sqlite" "small fresh DB kept"
-expect_gone "$HOME/.cache/ms-playwright/chromium-1000" "oldest build removed"
 expect_exists "$HOME/.cache/ms-playwright/chromium-1100" "second newest build kept"
 expect_exists "$HOME/.cache/ms-playwright/chromium-1200" "newest build kept"
 expect_exists "$HOME/.cache/ms-playwright/ffmpeg" "unversioned folder kept"
 expect_exists "$WORK/outside/precious.txt" "link inside removed build not followed"
 expect_exists "$AICM_HOME/state/last-clean.json" "state file written"
 grep -q '"ok":false' "$AICM_HOME/state/last-clean.json" && pass "state records refused rules" || fail "state ok flag"
+
+if [[ "$LINKS" == true ]]; then
+  expect_exists "$HOME/.cache/ms-playwright/chromium-1000" "build with a link kept as a whole"
+  rm "$HOME/.cache/ms-playwright/chromium-1000/linked"
+  "$ROOT/bin/clean_ai_leftovers.sh" --rules playwright-browsers >/dev/null
+fi
+expect_gone "$HOME/.cache/ms-playwright/chromium-1000" "idle oldest build removed"
 
 echo "# without a codex command nothing of Codex is touched"
 make_file "$HOME/.codex/sessions/2026/07/01/rollout-2026-07-01T10-00-00-$U2.jsonl" 60
@@ -257,6 +272,33 @@ out="$("$ROOT/bin/clean_ai_leftovers.sh" --rules codex-tmp 2>&1)" && rc=0 || rc=
 expect_exists "$HOME/.codex/.tmp/clock-run/old.bin" "clock far ahead: nothing deleted"
 AICM_CLOCK_CHECK=0 "$ROOT/bin/clean_ai_leftovers.sh" --rules codex-tmp > /dev/null 2>&1 || true
 expect_gone "$HOME/.codex/.tmp/clock-run/old.bin" "AICM_CLOCK_CHECK=0 runs anyway"
+
+echo "# unknown rule id"
+echo "# a symlink in a parent folder never becomes a cleanup area"
+make_file "$WORK/outside/data/precious.txt" 40
+age_dirs "$WORK/outside/data" 40
+link_dir "$WORK/outside" "$HOME/alias"
+if [[ "$LINKS" == true ]]; then
+  printf 'ancestor | all | age | ~/alias/data | * | 1 | | on |\n' > "$WORK/ancestor.conf"
+  out="$("$ROOT/bin/clean_ai_leftovers.sh" --rules-file "$WORK/ancestor.conf" --local-rules-file "$WORK/none.conf" 2>&1)" && rc=0 || rc=$?
+  [[ "$rc" == 1 && "$out" == *refused* ]] && pass "symlink ancestor rule refused" || fail "symlink ancestor: $out"
+  expect_exists "$WORK/outside/data/precious.txt" "file outside home behind a symlink parent kept"
+fi
+
+echo "# cap rules keep the whole group when open or when the check fails"
+make_file "$HOME/.codex/logs_22.sqlite" 40 2097152
+make_file "$HOME/.codex/logs_22.sqlite-wal" 0
+touch "$WORK/lsof-open"
+out="$("$ROOT/bin/clean_ai_leftovers.sh" --rules codex-trace-db 2>&1)" || true
+expect_exists "$HOME/.codex/logs_22.sqlite" "open oversized DB kept"
+expect_exists "$HOME/.codex/logs_22.sqlite-wal" "open DB sidecar kept"
+rm -f "$WORK/lsof-open"
+touch "$WORK/lsof-error"
+"$ROOT/bin/clean_ai_leftovers.sh" --rules codex-trace-db >/dev/null 2>&1 || true
+expect_exists "$HOME/.codex/logs_22.sqlite" "DB kept when open-file check fails"
+rm -f "$WORK/lsof-error"
+"$ROOT/bin/clean_ai_leftovers.sh" --rules codex-trace-db >/dev/null 2>&1 || true
+expect_gone "$HOME/.codex/logs_22.sqlite" "idle DB can be cleaned after the checker recovers"
 
 echo "# unknown rule id"
 if "$ROOT/bin/clean_ai_leftovers.sh" --rules nope >/dev/null 2>&1; then fail "unknown id accepted"; else pass "unknown id rejected"; fi

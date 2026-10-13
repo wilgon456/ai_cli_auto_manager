@@ -11,6 +11,8 @@ $folderName = 'AICM Test ' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $taskPath = "\$folderName\"
 $wshKey = 'HKCU:\Software\AICM Test WSH ' + [guid]::NewGuid().ToString('N')
 $script:fails = 0
+. (Join-Path $PSScriptRoot 'test-env.ps1')
+$runtimePath = New-TestRuntimePath $work
 
 function Pass([string]$m) { Write-Host "ok   - $m" }
 function Fail([string]$m) { Write-Host "FAIL - $m"; $script:fails++ }
@@ -28,11 +30,12 @@ function Invoke-Lib([string]$Dir, [string]$Code) {
 function Invoke-Child([string[]]$PsArguments) {
   $exe = (Get-Process -Id $PID).Path
   $saved = @{}
-  $names = 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'AICM_TASK_PATH'
+  $names = 'HOME', 'CODEX_HOME', 'PATH', 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'AICM_TASK_PATH', 'AICM_PROCESSES', 'AICM_WORKTREES'
   foreach ($k in $names) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
   try {
     $env:USERPROFILE = $fakeHome; $env:TEMP = "$work\tmp"; $env:TMP = "$work\tmp"; $env:LOCALAPPDATA = "$fakeHome\AppData\Local"
     $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'; $env:AICM_TASK_PATH = $taskPath
+    $env:HOME = $fakeHome; $env:CODEX_HOME = "$fakeHome\.codex"; $env:PATH = $runtimePath
     $ErrorActionPreference = 'Continue'
     $output = & $exe -NoProfile -ExecutionPolicy Bypass @PsArguments 2>&1 | Out-String
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
@@ -98,6 +101,13 @@ try {
   if ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Arguments -eq $wantArgs) { Pass 'refresh puts a stale task back with the stored options' } else { Fail "refresh: $($r.Output)" }
   $r = Invoke-Aicm @('schedule', 'refresh')
   if ($r.Output -match 'already match' -and $r.Output -notmatch 'registered:') { Pass 'refresh with nothing to change changes nothing' } else { Fail "second refresh: $($r.Output)" }
+  $custom = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 47) -MultipleInstances Queue
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Settings $custom -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument 'stale arguments') | Out-Null
+  Disable-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' | Out-Null
+  $r = Invoke-Aicm @('schedule', 'refresh')
+  $i = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory'
+  if ($i.State -eq 'Disabled' -and [System.Xml.XmlConvert]::ToTimeSpan($i.Settings.ExecutionTimeLimit).TotalMinutes -eq 47 -and $i.Settings.MultipleInstances -eq 1) { Pass 'refresh keeps disabled state and custom task settings when action changes' } else { Fail "refresh settings : state=$($i.State), limit=$($i.Settings.ExecutionTimeLimit), instances=$($i.Settings.MultipleInstances) $($r.Output)" }
+  Enable-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' | Out-Null
   # A schedule.json written by 2.5.1 has no options: refresh reads them back from the tasks.
   $s = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
   $installedBefore = $s.installedAt
@@ -128,6 +138,19 @@ try {
   Rename-Item -LiteralPath $appDir -NewName 'app.old'
   $r = Invoke-Lib $root 'Sync-AicmAppCopy (Get-AicmRoot)'
   if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath "$appDir\bin\update_ai_clis.ps1") -and -not (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.old")) { Pass 'a copy left half-swapped is completed by the next sync' } else { Fail "recovery: $($r.ExitCode) $($r.Output)" }
+
+  # Explicit AICM_HOME aliases are management roots; stale app.old must not brick the next sync.
+  $managed = Join-Path $work 'managed-target'
+  $alias = Join-Path $work 'managed-alias'
+  New-Item -ItemType Directory -Path $managed | Out-Null
+  New-Item -ItemType Junction -Path $alias -Target $managed | Out-Null
+  try {
+    $r = Invoke-Lib $root "`$env:AICM_HOME = '$alias\.manager'; foreach (`$attempt in 1,2,3,4) { Sync-AicmAppCopy (Get-AicmRoot) }"
+    if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath "$managed\.manager\app\bin\aicm.ps1") -and -not (Test-Path -LiteralPath "$managed\.manager\app.old")) { Pass 'repeated app-copy sync through a selected home junction completes and removes stale copies' } else { Fail "home junction sync: $($r.Output)" }
+    Set-Content -LiteralPath "$managed\.manager\app\MARKER" -Value 'old'
+    $r = Invoke-Lib $root "`$env:AICM_HOME = '$alias\.manager'; function Copy-Item { throw 'disk full' }; Sync-AicmAppCopy (Get-AicmRoot)"
+    if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$managed\.manager\app\MARKER") -and -not (Test-Path -LiteralPath "$managed\.manager\app.new")) { Pass 'failed app-copy sync under a home junction keeps the previous copy' } else { Fail "home junction rollback: $($r.Output)" }
+  } finally { [IO.Directory]::Delete($alias, $false) }
 
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 1 -and $r.Output -match 'no update run') { Pass 'doctor flags missing update run' } else { Fail "doctor before runs: $($r.Output)" }
@@ -269,7 +292,7 @@ try {
     $svc.GetFolder('\').DeleteFolder($folderName, 0)
   } catch { }
   Remove-Item -LiteralPath $wshKey -Recurse -Force -ErrorAction SilentlyContinue
-  Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-TestWorkspace $work
 }
 
 Write-Host ''

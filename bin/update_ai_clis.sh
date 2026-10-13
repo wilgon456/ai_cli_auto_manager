@@ -540,6 +540,12 @@ active_install() { # id -> sets CLI_INSTALLED CLI_PATH CLI_METHOD CLI_NPMCOPY
   aicm_cli_install "$idx"
 }
 
+active_brew_install() { # catalog id, brew package
+  active_install "$1" || return 1
+  [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == brew ]] || return 1
+  is_brew_cask_installed "$2" || is_brew_formula_installed "$2"
+}
+
 shadow_warning() {
   active_install "$1" || return 0
   if [[ -n "$CLI_NPMCOPY" && "$CLI_METHOD" != npm ]]; then
@@ -553,9 +559,9 @@ update_claude_cli() {
   if active_install claude && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == standalone ]]; then
     command_with_timeout 300 "$CLI_PATH" update || return $?
     shadow_warning claude
-  elif is_brew_cask_installed claude-code || is_brew_formula_installed claude-code; then
+  elif active_brew_install claude claude-code; then
     update_brew_package claude-code
-  elif is_npm_global_installed "@anthropic-ai/claude-code"; then
+  elif active_install claude && [[ "$CLI_METHOD" == npm ]] && is_npm_global_installed "@anthropic-ai/claude-code"; then
     update_npm_package "@anthropic-ai/claude-code"
   elif command -v claude >/dev/null 2>&1; then
     command_with_timeout 300 claude update
@@ -570,12 +576,12 @@ update_opencode_cli() {
   if active_install opencode && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == standalone ]]; then
     command_with_timeout 300 "$CLI_PATH" upgrade || return $?
     shadow_warning opencode
-  elif is_brew_cask_installed opencode || is_brew_formula_installed opencode; then
+  elif active_brew_install opencode opencode; then
     update_brew_package opencode
-  elif is_npm_global_installed "@opencode/cli"; then
+  elif active_install opencode && [[ "$CLI_METHOD" == npm ]] && is_npm_global_installed "@opencode/cli"; then
     # OpenCode 2.x is published as @opencode/cli; opencode-ai is the 1.x line.
     update_npm_package "@opencode/cli"
-  elif is_npm_global_installed "opencode-ai"; then
+  elif active_install opencode && [[ "$CLI_METHOD" == npm ]] && is_npm_global_installed "opencode-ai"; then
     update_npm_package "opencode-ai"
   elif command -v opencode >/dev/null 2>&1; then
     command_with_timeout 300 opencode upgrade
@@ -720,7 +726,7 @@ target_enabled grok && version_of grok
 for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx]}"; done
 
 if command -v "$BREW" >/dev/null 2>&1; then
-  if { gpt_target_enabled && { is_brew_cask_installed codex || is_brew_formula_installed codex; }; } || { target_enabled opencode && { is_brew_cask_installed opencode || is_brew_formula_installed opencode; }; } || { target_enabled claude && { is_brew_cask_installed claude-code || is_brew_formula_installed claude-code; }; }; then
+  if { gpt_target_enabled && active_brew_install codex codex; } || { target_enabled opencode && active_brew_install opencode opencode; } || { target_enabled claude && active_brew_install claude claude-code; }; then
     run_step "brew update" aicm_timeout "$INSTALL_TIMEOUT_SECONDS" "$BREW" update
   else
     echo "pass: no target Homebrew-managed CLIs installed; skipping brew update"
@@ -731,43 +737,33 @@ fi
 
 # Codex: prefer Homebrew when it manages the active install.
 if gpt_target_enabled; then
-  if is_brew_cask_installed codex || is_brew_formula_installed codex; then
+  if active_brew_install codex codex; then
     run_step "gpt/codex via brew" update_brew_package codex
-  elif active_path_contains codex "/node_modules/" || is_npm_global_installed "@openai/codex"; then
+  elif active_install codex && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == npm ]]; then
     run_step "gpt/codex via npm" update_npm_package "@openai/codex"
   elif active_install codex && [[ "$CLI_INSTALLED" == true ]] && aicm_codex_standalone "$CLI_PATH"; then
     # The official installer (~/.codex/packages/standalone) updates itself; the desktop app's copy does not live there.
     run_step "gpt/codex standalone" update_codex_standalone "$CLI_PATH"
-  elif [[ "$INSTALL_MISSING" == "true" ]]; then
+  elif [[ "$INSTALL_MISSING" == "true" ]] && active_install codex && [[ "$CLI_INSTALLED" != true ]]; then
     run_step "gpt/codex via npm install" install_npm_package "@openai/codex"
   else
     pass_missing gpt "codex command not found and no brew/npm package"
   fi
 
-  # Keep a stale npm Codex install current only if it exists AND is not shadowing brew unexpectedly.
-  # This prevents future PATH flips from resurrecting an old Codex binary.
-  if is_npm_global_installed "@openai/codex"; then
-    if is_npm_global_package_writable "@openai/codex"; then
-      run_optional_step "codex npm shadow copy" update_npm_package "@openai/codex"
-    else
-      echo "pass: codex npm shadow copy is installed but inactive/not writable; skipping optional stale shadow update"
-      echo "      path: $(npm_global_package_path "@openai/codex" 2>/dev/null || echo "@openai/codex")"
-    fi
-  fi
   # The Codex desktop app can put its own copy on PATH and updates it itself; say so when npm's copy is hidden.
   shadow_warning codex
 
   # A quarantined cask build cannot start its code-mode host while Gatekeeper's first-open prompt waits
   # (lib/codex-host.sh). Checked on every run, so a version installed by hand is fixed too. It runs
   # before the recycle below, so the restarted servers find a host that starts.
-  if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 ]] && [[ "$(uname -s)" == Darwin ]] && is_brew_cask_installed codex; then
+  if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 ]] && [[ "$(uname -s)" == Darwin ]] && active_brew_install codex codex && is_brew_cask_installed codex; then
     run_step "codex cask quarantine" release_codex_cask_quarantine
   fi
 
   # A Homebrew upgrade deletes the old cask folder that a running `codex app-server` (Paseo keeps one)
   # still spawns its terminal host from (lib/codex-host.sh). Right after the upgrade: a later update
   # can hang.
-  if [[ "${AICM_CODEX_RECYCLE:-1}" != 0 ]] && { is_brew_cask_installed codex || is_brew_formula_installed codex; }; then
+  if [[ "${AICM_CODEX_RECYCLE:-1}" != 0 ]] && active_brew_install codex codex; then
     run_step "stale codex app-servers" recycle_stale_codex_app_servers
   fi
 fi

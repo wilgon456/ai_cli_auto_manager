@@ -15,6 +15,8 @@ $npmRoot = Join-Path $prefix 'node_modules'
 $solo = Join-Path $work 'solo'
 $fake = Join-Path $root 'tests\fixtures\npm-fake.js'
 $script:fails = 0
+. (Join-Path $PSScriptRoot 'test-env.ps1')
+$runtimePath = New-TestRuntimePath $work
 
 function Pass([string]$m) { Write-Host "ok   - $m" }
 function Fail([string]$m) { Write-Host "FAIL - $m"; $script:fails++ }
@@ -39,7 +41,7 @@ function New-NpmCli([string]$Command, [string]$Package, [string]$Version) {
 
 function Invoke-Script([string]$Script, [string[]]$Arguments, [hashtable]$Extra = @{}) {
   $exe = (Get-Process -Id $PID).Path
-  $names = @('USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'PATH', 'AICM_MIN_RELEASE_AGE_DAYS', 'AICM_VERIFY_SIGNATURES', 'AICM_ALLOW') + @($fakeEnv.Keys) + @($Extra.Keys)
+  $names = @('HOME', 'CODEX_HOME', 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'AICM_PROCESSES', 'AICM_WORKTREES', 'PATH', 'AICM_MIN_RELEASE_AGE_DAYS', 'AICM_VERIFY_SIGNATURES', 'AICM_ALLOW') + @($fakeEnv.Keys) + @($Extra.Keys)
   $saved = @{}
   foreach ($k in $names) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
   try {
@@ -48,7 +50,8 @@ function Invoke-Script([string]$Script, [string[]]$Arguments, [hashtable]$Extra 
     foreach ($k in 'AICM_MIN_RELEASE_AGE_DAYS', 'AICM_VERIFY_SIGNATURES', 'AICM_ALLOW') { [Environment]::SetEnvironmentVariable($k, $null) }
     foreach ($k in $fakeEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $fakeEnv[$k]) }
     foreach ($k in $Extra.Keys) { [Environment]::SetEnvironmentVariable($k, $Extra[$k]) }
-    $env:PATH = "$fakeBin;$prefix;$solo;$($saved['PATH'])"
+    $env:HOME = $fakeHome; $env:CODEX_HOME = "$fakeHome\.codex"
+    $env:PATH = "$fakeBin;$prefix;$solo;$runtimePath"
     $ErrorActionPreference = 'Continue'
     $output = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root $Script) @Arguments 2>&1 | Out-String -Width 400
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
@@ -119,8 +122,8 @@ try {
   if ($md -and $md.Contains('| Fake NPM | npm | 1.0.0 | 1.2.0 | behind | yes |')) { Pass 'markdown report' } else { Fail 'markdown report' }
   $state = Get-Content -LiteralPath "$aicmHome\state\inventory.json" -Raw | ConvertFrom-Json
   if (@($state.clis | Where-Object { $_.id -eq 'fakesolo' }).Count -eq 1) { Pass 'json state' } else { Fail 'json state' }
-  if ($r.Output -match 'Fake Shadow: PATH runs 3\.1\.0 at .*fakeshadow\.cmd, but the daily update refreshes the npm copy \(3\.0\.0\)\. fix: keep one copy') { Pass 'unreachable duplicate reported with a fix' } else { Fail 'duplicate report' }
-  if (([regex]::Matches($r.Output, 'notify:')).Count -eq 1 -and $r.Output -match 'notify: .*Fake Shadow: PATH runs') { Pass 'first run notifies only about the duplicate' } else { Fail 'first run notifications' }
+  if ($r.Output -match 'Fake Shadow : PATH runs 3\.1\.0 at .*fakeshadow\.cmd; an unused npm copy \(3\.0\.0\) is also installed\. fix : keep one copy') { Pass 'unreachable duplicate reported with a fix' } else { Fail 'duplicate report' }
+  if (([regex]::Matches($r.Output, 'notify:')).Count -eq 1 -and $r.Output -match 'notify: .*Fake Shadow : PATH runs') { Pass 'first run notifies only about the duplicate' } else { Fail 'first run notifications' }
   if (@($state.shadowProblems).Count -eq 1) { Pass 'duplicate kept in state for doctor' } else { Fail 'shadow state' }
 
   Write-Host '# offline'
@@ -320,13 +323,55 @@ try {
   $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
   if ($r.ExitCode -eq 0 -and $r.Output -notmatch 'disappeared') { Pass 'it is reported once, then forgotten (it may have been removed on purpose)' } else { Fail "missing CLI repeated: $($r.Output)" }
 
+  Write-Host '# builtin PATH ownership and inventory coverage agree with update behavior'
+  $reg = Get-Content -LiteralPath "$work\registry.json" -Raw | ConvertFrom-Json
+  foreach ($package in '@openai/codex', '@anthropic-ai/claude-code', 'opencode-ai', '@moonshot-ai/kimi-code') {
+    $reg | Add-Member -NotePropertyName $package -NotePropertyValue ([pscustomobject]@{ latest = '1.1.0'; versions = [pscustomobject]@{
+      '1.0.0' = [pscustomobject]@{ daysAgo = 30 }; '1.1.0' = [pscustomobject]@{ daysAgo = 10 } } })
+  }
+  $reg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$work\registry.json" -Encoding ASCII
+  foreach ($id in 'codex', 'claude', 'opencode', 'kimi') {
+    $package = @{ codex = '@openai/codex'; claude = '@anthropic-ai/claude-code'; opencode = 'opencode-ai'; kimi = '@moonshot-ai/kimi-code' }[$id]
+    Invoke-FakeNpm @('install', '-g', "$package@1.0.0")
+    if ($LASTEXITCODE -ne 0) { throw "fake builtin setup failed : $package" }
+    @('@echo off', 'if "%1"=="--version" (echo 2.0.0 & exit /b 0)', ('echo {0} %*>>"{1}\self-calls.log"' -f $id, $work), 'exit /b 0') |
+      Set-Content -LiteralPath "$solo\$id.cmd" -Encoding ASCII
+  }
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $r = Invoke-Script $upd @('-Targets', 'codex,claude,opencode,kimi')
+  if ($r.ExitCode -eq 0 -and $r.Output -match 'hidden npm copies are skipped') { Pass 'separate Codex and Kimi PATH installs are skipped' } else { Fail "builtin shadow update : $($r.Output)" }
+  if (-not ((Get-Calls) -match '^(install|view|pack|audit).*(@openai/codex|@moonshot-ai/kimi-code|@anthropic-ai/claude-code|opencode-ai)')) { Pass 'no hidden builtin npm copy is updated or staged' } else { Fail 'hidden builtin npm copy touched' }
+  $calls = @(Get-Content -LiteralPath "$work\self-calls.log")
+  if ($calls -contains 'claude update' -and $calls -contains 'opencode upgrade' -and -not ($calls -match '^(codex|kimi) ')) { Pass 'Claude and OpenCode use their active self-updaters' } else { Fail "active self-update : $calls" }
+  $r = Invoke-Script 'bin\inventory_ai_clis.ps1' @('-Offline')
+  $state = Get-Content -LiteralPath "$aicmHome\state\inventory.json" -Raw | ConvertFrom-Json
+  foreach ($id in 'codex', 'claude', 'opencode', 'kimi') {
+    $row = @($state.clis | Where-Object { $_.id -eq $id })[0]
+    $expected = if ($id -in @('claude', 'opencode')) { 'yes' } else { 'no : ' }
+    if ($row.method -eq 'standalone' -and $row.autoUpdate.StartsWith($expected)) { Pass "$id inventory reflects active update coverage" } else { Fail "$id coverage : $($row.autoUpdate)" }
+  }
+  if ($r.Output -notmatch 'daily update refreshes the npm copy') { Pass 'duplicate guidance does not promise updates to unused copies' } else { Fail 'stale duplicate guidance' }
+  foreach ($id in 'codex', 'claude', 'opencode', 'kimi') {
+    $entry = @(Read-AicmCatalog | Where-Object { $_.Id -eq $id })[0]
+    $coverage = Get-AicmUpdateCoverage $entry ([pscustomobject]@{ Method = 'winget'; NpmCopy = '1.0.0' })
+    $expected = if ($id -in @('claude', 'opencode')) { 'yes' } else { 'no : ' }
+    if ($coverage.StartsWith($expected)) { Pass "$id winget PATH coverage matches dedicated updater" } else { Fail "$id winget coverage : $coverage" }
+  }
+  # A previous managed npm install must not be restored over a separate active copy.
+  $pkgDir = Join-Path $npmRoot '@openai\codex'
+  Rename-Item -LiteralPath $pkgDir -NewName '.codex-XyZw9876'
+  '{"@openai/codex":"1.0.0"}' | Set-Content -LiteralPath "$aicmHome\state\update-npm.json" -Encoding ASCII
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $r = Invoke-Script $upd @('-Targets', 'codex')
+  if ($r.ExitCode -eq 0 -and $r.Output -match 'unused npm copy @openai/codex is not restored' -and -not ((Get-Calls) -match '^install -g @openai/codex')) { Pass 'recovery also leaves hidden Codex npm copy alone' } else { Fail "shadow recovery : $($r.Output)" }
+
   Write-Host '# bad catalog'
   'Bad Id | x | x |  |  |  |  |' | Set-Content -LiteralPath "$work\bad.conf" -Encoding UTF8
   $r = Invoke-Script 'bin\inventory_ai_clis.ps1' @('-CatalogFile', "$work\bad.conf", '-LocalCatalogFile', "$work\none.conf")
   if ($r.ExitCode -ne 0) { Pass 'bad catalog rejected' } else { Fail 'bad catalog accepted' }
 } finally {
   foreach ($k in $fakeEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $null) }
-  Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-TestWorkspace $work
 }
 
 Write-Host ''

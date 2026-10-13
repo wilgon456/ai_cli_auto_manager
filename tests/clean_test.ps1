@@ -14,6 +14,8 @@ $fakeBin = Join-Path $work 'fakebin'
 $outside = Join-Path $work 'outside'
 $today = Get-Date -Format 'yyyyMMdd'
 $script:fails = 0
+. (Join-Path $PSScriptRoot 'test-env.ps1')
+$runtimePath = New-TestRuntimePath $work
 
 function Pass([string]$m) { Write-Host "ok   - $m" }
 function Fail([string]$m) { Write-Host "FAIL - $m"; $script:fails++ }
@@ -36,13 +38,14 @@ function Set-DirAge([string]$Path, [int]$DaysOld) {
 function Invoke-Clean([string[]]$Arguments, [switch]$NoFakeCodex, [hashtable]$Env = @{}) {
   $exe = (Get-Process -Id $PID).Path
   $saved = @{}
-  foreach ($k in 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'CODEX_HOME', 'PATH') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
+  foreach ($k in 'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'LOCALAPPDATA', 'AICM_HOME', 'AICM_NOTIFY', 'CODEX_HOME', 'PATH', 'AICM_PROCESSES', 'AICM_WORKTREES') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
   try {
     $env:USERPROFILE = $fakeHome; $env:TEMP = $fakeTemp; $env:TMP = $fakeTemp
     $env:LOCALAPPDATA = $fakeLocal; $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'
     # If a real codex were ever reached, it would only see the throwaway home.
-    $env:CODEX_HOME = $codexHome
-    if (-not $NoFakeCodex) { $env:PATH = "$fakeBin;$($saved['PATH'])" }
+    $env:CODEX_HOME = $codexHome; $env:HOME = $fakeHome
+    $env:PATH = $runtimePath
+    if (-not $NoFakeCodex) { $env:PATH = "$fakeBin;$runtimePath" }
     foreach ($k in $Env.Keys) { if (-not $saved.ContainsKey($k)) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }; [Environment]::SetEnvironmentVariable($k, $Env[$k]) }
     $ErrorActionPreference = 'Continue'
     $output = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'bin\clean_ai_leftovers.ps1') @Arguments 2>&1 | Out-String -Width 300
@@ -63,6 +66,7 @@ $pythonPath = if ($python) { (Get-Command $python -CommandType Application | Sel
 
 try {
   New-Item -ItemType Directory -Path $fakeHome, $fakeTemp, $fakeLocal, $aicmHome, $outside, $fakeBin -Force | Out-Null
+  '@echo fake-cache-pruned' | Set-Content -LiteralPath "$fakeBin\uv.cmd" -Encoding ASCII
 
   # Fake codex (codex.ps1 and codex.cmd, like an npm install): records calls; archive moves the rollout
   # to archived_sessions, delete removes it. Ids starting with "ffffffff" fail, like unknown ids do.
@@ -222,7 +226,7 @@ exit 0
   Expect-Exists "$fakeTemp\claude\new\diff.txt" 'fresh claude temp kept'
   Expect-Gone "$fakeTemp\stale.tmp" 'stale temp file removed'
   Expect-Exists "$fakeTemp\fresh.tmp" 'fresh temp file kept'
-  Expect-Gone "$fakeLocal\ms-playwright\chromium-1000" 'oldest build removed'
+  Expect-Exists "$fakeLocal\ms-playwright\chromium-1000" 'build containing a junction kept as a whole'
   Expect-Exists "$fakeLocal\ms-playwright\chromium-1100" 'second newest build kept'
   Expect-Exists "$fakeLocal\ms-playwright\chromium-1200" 'newest build kept'
   Expect-Exists "$fakeLocal\ms-playwright\ffmpeg" 'unversioned folder kept'
@@ -230,6 +234,10 @@ exit 0
   Expect-Exists "$aicmHome\state\last-clean.json" 'state file written'
   $state = Get-Content -LiteralPath "$aicmHome\state\last-clean.json" -Raw | ConvertFrom-Json
   if (-not $state.ok) { Pass 'state records refused rules' } else { Fail 'state ok flag' }
+
+  [IO.Directory]::Delete("$fakeLocal\ms-playwright\chromium-1000\linked", $false)
+  $null = Invoke-Clean @('-Rules', 'playwright-browsers')
+  Expect-Gone "$fakeLocal\ms-playwright\chromium-1000" 'idle oldest build removed'
 
   Write-Host '# file in use is kept, not an error'
   New-TestFile "$codexHome\.tmp\busy.bin" 40
@@ -240,13 +248,128 @@ exit 0
 
   Write-Host '# without a codex command nothing of Codex is touched'
   New-TestFile "$codexHome\sessions\2026\07\01\rollout-2026-07-01T10-00-00-$U2.jsonl" 60
-  # Only where no real codex exists: never let a test reach the real Codex.
-  if (Get-Command codex -ErrorAction SilentlyContinue) {
-    Write-Host 'skip - a real codex is installed on this machine'
-  } else {
+  # The isolated runtime PATH contains no real Codex, even on an installed machine.
+  & {
     $r = Invoke-Clean @('-Rules', 'codex-sessions') -NoFakeCodex
     if ($r.Output -match 'codex command not found, Codex sessions were not cleaned' -and $r.ExitCode -eq 1) { Pass 'missing codex command reported as a problem' } else { Fail 'missing codex' }
     Expect-Exists "$codexHome\sessions\2026\07\01\rollout-2026-07-01T10-00-00-$U2.jsonl" 'codex files kept without the codex command'
+  }
+
+  Write-Host '# parent junctions and symlinks cannot escape through a normal child folder'
+  New-TestFile "$outside\child\old.bin" 90
+  New-Item -ItemType Junction -Path "$fakeHome\parent-link" -Target $outside | Out-Null
+  'parent-link | all | age-files | ~/parent-link/child | * | 1 | | on |' |
+    Set-Content -LiteralPath "$work\parent.conf" -Encoding ASCII
+  $r = Invoke-Clean @('-Rules', 'parent-link', '-LocalRulesFile', "$work\parent.conf")
+  Expect-Exists "$outside\child\old.bin" 'normal child under a junction never cleaned'
+  if ($r.Output -match 'refused') { Pass 'parent junction refused' } else { Fail "parent junction : $($r.Output)" }
+  try { New-Item -ItemType SymbolicLink -Path "$fakeHome\parent-symlink" -Target $outside -ErrorAction Stop | Out-Null } catch { Write-Host 'skip - directory symlink creation is unavailable' }
+  if (Test-Path -LiteralPath "$fakeHome\parent-symlink") {
+    'parent-link | all | age | ~/parent-symlink/child | * | 1 | | on |' |
+      Set-Content -LiteralPath "$work\parent.conf" -Encoding ASCII
+    $r = Invoke-Clean @('-Rules', 'parent-link', '-LocalRulesFile', "$work\parent.conf")
+    Expect-Exists "$outside\child\old.bin" 'normal child under a symlink never cleaned'
+    if ($r.Output -match 'refused') { Pass 'parent symlink refused' } else { Fail 'parent symlink not refused' }
+  }
+
+  Write-Host '# SQLite is one unit even when only a sidecar is in use or delete sharing is allowed'
+  foreach ($suffix in '', '-wal', '-shm', '-journal') {
+    foreach ($share in [System.IO.FileShare]::None, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)) {
+      $db = "$codexHome\logs_77.sqlite"
+      foreach ($part in '', '-wal', '-shm', '-journal') { New-TestFile ($db + $part) 40 16 }
+      $lock = [System.IO.File]::Open(($db + $suffix), 'Open', 'Read', $share)
+      try { $r = Invoke-Clean @('-Rules', 'codex-trace-db') } finally { $lock.Dispose() }
+      foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Exists ($db + $part) "SQLite group preserved for busy '$suffix' ($share), member '$part'" }
+      if ($r.ExitCode -eq 0 -and $r.Output -match 'in use') { Pass 'busy group reported without failing cleanup' } else { Fail "busy SQLite : $($r.Output)" }
+      $r = Invoke-Clean @('-Rules', 'codex-trace-db')
+      foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Gone ($db + $part) "released SQLite member '$part' removed" }
+    }
+  }
+
+  $db = "$codexHome\logs_78.sqlite"
+  foreach ($part in '', '-wal', '-shm', '-journal') { New-TestFile ($db + $part) 40 16 }
+  'sqlite-age | all | age-files | {codex} | logs_78.sqlite* | 1 | | on |' |
+    Set-Content -LiteralPath "$work\sqlite-age.conf" -Encoding ASCII
+  $lock = [System.IO.File]::Open(($db + '-wal'), 'Open', 'Read', ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+  try { $r = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf") } finally { $lock.Dispose() }
+  foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Exists ($db + $part) "age-files rule preserves SQLite family member '$part'" }
+  $r = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf")
+  foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Gone ($db + $part) "age-files rule removes released member '$part'" }
+
+  # An undeletable member must keep the entire family before any deletion mark.
+  $db = "$codexHome\logs_79.sqlite"
+  foreach ($part in '', '-wal', '-shm', '-journal') { New-TestFile ($db + $part) 40 16 }
+  (Get-Item -LiteralPath ($db + '-wal')).IsReadOnly = $true
+  try { $r = Invoke-Clean @('-Rules', 'codex-trace-db') } finally { (Get-Item -LiteralPath ($db + '-wal')).IsReadOnly = $false }
+  foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Exists ($db + $part) "readonly group preserves member '$part'" }
+  $null = Invoke-Clean @('-Rules', 'codex-trace-db')
+
+  Write-Host '# recursive cleanup preserves protected and busy units before deleting anything'
+  foreach ($kind in 'keep-latest', 'archive') {
+    foreach ($protected in 'auth.json', 'memory\notes.md', 'secret.pem') {
+      $folder = if ($kind -eq 'keep-latest') { "$fakeLocal\ms-playwright\secure-1000" } else { "$aicmHome\archive\claude-transcripts\20200103" }
+      if ($kind -eq 'keep-latest') { foreach ($b in 2000, 3000) { New-TestFile "$fakeLocal\ms-playwright\secure-$b\cache.bin" 40 } }
+      New-TestFile "$folder\first.bin" 40
+      New-TestFile "$folder\$protected" 40
+      $ruleId = if ($kind -eq 'keep-latest') { 'playwright-browsers' } else { 'claude-transcripts' }
+      $r = Invoke-Clean @('-Rules', $ruleId)
+      Expect-Exists "$folder\$protected" "$kind keeps protected $protected"
+      Expect-Exists "$folder\first.bin" "$kind keeps the rest of a protected unit"
+      Remove-Item -LiteralPath "$folder\$protected" -Force
+      if ($protected -like 'memory*') { [IO.Directory]::Delete("$folder\memory", $false) }
+      $null = Invoke-Clean @('-Rules', $ruleId)
+      Expect-Gone $folder "$kind removes unit after protection is removed"
+    }
+    $folder = if ($kind -eq 'keep-latest') { "$fakeLocal\ms-playwright\busy-1000" } else { "$aicmHome\archive\claude-transcripts\20200104" }
+    if ($kind -eq 'keep-latest') { foreach ($b in 2000, 3000) { New-TestFile "$fakeLocal\ms-playwright\busy-$b\cache.bin" 40 } }
+    New-TestFile "$folder\first.bin" 40
+    New-TestFile "$folder\busy.bin" 40
+    $lock = [IO.File]::Open("$folder\busy.bin", 'Open', 'Read', ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $ruleId = if ($kind -eq 'keep-latest') { 'playwright-browsers' } else { 'claude-transcripts' }
+    try { $r = Invoke-Clean @('-Rules', $ruleId) } finally { $lock.Dispose() }
+    Expect-Exists "$folder\busy.bin" "$kind keeps a file open with delete sharing"
+    Expect-Exists "$folder\first.bin" "$kind does not partially delete a busy unit"
+    $null = Invoke-Clean @('-Rules', $ruleId)
+    Expect-Gone $folder "$kind removes a released unit"
+  }
+
+  Write-Host '# age rules delete complete eligible SQLite families or keep every member'
+  foreach ($kind in 'age', 'age-files') {
+    $db = "$codexHome\logs_80.sqlite"
+    foreach ($part in '', '-wal', '-shm', '-journal') { New-TestFile ($db + $part) 40 16 }
+    "sqlite-age | all | $kind | {codex} | logs_80.sqlite* | 1 | | on |" |
+      Set-Content -LiteralPath "$work\sqlite-age.conf" -Encoding ASCII
+    (Get-Item -LiteralPath ($db + '-wal')).IsReadOnly = $true
+    try { $null = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf") }
+    finally { (Get-Item -LiteralPath ($db + '-wal')).IsReadOnly = $false }
+    foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Exists ($db + $part) "$kind keeps member '$part' when WAL is readonly" }
+    (Get-Item -LiteralPath ($db + '-wal')).LastWriteTime = Get-Date
+    $null = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf")
+    Expect-Exists $db "$kind keeps an old DB with a fresh WAL"
+    (Get-Item -LiteralPath ($db + '-wal')).LastWriteTime = (Get-Date).AddDays(-40)
+    "sqlite-age | all | $kind | {codex} | logs_80.sqlite | 1 | | on |" |
+      Set-Content -LiteralPath "$work\sqlite-age.conf" -Encoding ASCII
+    $null = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf")
+    Expect-Exists $db "$kind keeps a DB when its sidecars are excluded by the pattern"
+    "sqlite-age | all | $kind | {codex} | logs_80.sqlite* | 1 | | on |" |
+      Set-Content -LiteralPath "$work\sqlite-age.conf" -Encoding ASCII
+    $null = Invoke-Clean @('-Rules', 'sqlite-age', '-LocalRulesFile', "$work\sqlite-age.conf")
+    foreach ($part in '', '-wal', '-shm', '-journal') { Expect-Gone ($db + $part) "$kind removes eligible idle member '$part' together" }
+  }
+
+  Write-Host '# an unexpected SQLite sidecar keeps the database and the external target'
+  foreach ($shape in 'directory', 'junction') {
+    $db = "$codexHome\logs_81.sqlite"
+    New-TestFile $db 40
+    if ($shape -eq 'junction') { New-Item -ItemType Junction -Path ($db + '-wal') -Target $outside | Out-Null }
+    else { New-Item -ItemType Directory -Path ($db + '-wal') | Out-Null }
+    try {
+      $null = Invoke-Clean @('-Rules', 'codex-trace-db')
+      Expect-Exists $db "cap keeps DB with a $shape sidecar"
+      Expect-Exists "$outside\precious.txt" "cap preserves outside target for a $shape sidecar"
+    } finally { [IO.Directory]::Delete(($db + '-wal'), $false) }
+    $null = Invoke-Clean @('-Rules', 'codex-trace-db')
+    Expect-Gone $db "cap removes DB once $shape sidecar is gone"
   }
 
   Write-Host '# defaults: Codex sessions deleted after 30 days, Claude transcripts left to Claude, archive remnants purged'
@@ -293,6 +416,30 @@ exit 0
   $null = Invoke-Clean @('-Rules', 'codex-tmp') -Env @{ AICM_CLOCK_CHECK = '0' }
   Expect-Gone "$codexHome\.tmp\clock-run\old.bin" 'AICM_CLOCK_CHECK=0 runs anyway'
 
+  Write-Host '# a junction in a parent folder never becomes a cleanup area'
+  New-TestFile "$outside\data\precious.txt" 40
+  Set-DirAge "$outside\data" 40
+  New-Item -ItemType Junction -Path "$fakeHome\alias" -Target $outside | Out-Null
+  'ancestor | all | age | ~/alias/data | * | 1 | | on |' | Set-Content -LiteralPath "$work\ancestor.conf" -Encoding UTF8
+  $r = Invoke-Clean @('-Rules', 'ancestor', '-LocalRulesFile', "$work\ancestor.conf")
+  if ($r.ExitCode -eq 1 -and $r.Output -match 'refused') { Pass 'junction ancestor rule refused' } else { Fail "junction ancestor: $($r.Output)" }
+  Expect-Exists "$outside\data\precious.txt" 'file outside home behind a junction parent kept'
+
+  Write-Host '# cap checks all members before deleting anything, even when deletion sharing is allowed'
+  New-TestFile "$codexHome\logs_22.sqlite" 40 2097152
+  New-TestFile "$codexHome\logs_22.sqlite-wal" 0
+  $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+  $open = [System.IO.File]::Open("$codexHome\logs_22.sqlite-wal", [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::ReadWrite, $share)
+  try {
+    $null = Invoke-Clean @('-Rules', 'codex-trace-db')
+    Expect-Exists "$codexHome\logs_22.sqlite" 'DB kept when only its WAL is open'
+    Expect-Exists "$codexHome\logs_22.sqlite-wal" 'open WAL kept even when deletion sharing is allowed'
+  } finally { $open.Dispose() }
+  $null = Invoke-Clean @('-Rules', 'codex-trace-db')
+  Expect-Gone "$codexHome\logs_22.sqlite" 'idle DB can be cleaned after its WAL closes'
+  Expect-Gone "$codexHome\logs_22.sqlite-wal" 'idle WAL cleaned with its DB'
+
   Write-Host '# unknown rule id'
   $r = Invoke-Clean @('-Rules', 'nope')
   if ($r.ExitCode -eq 2) { Pass 'unknown id rejected' } else { Fail "unknown id exit $($r.ExitCode)" }
@@ -306,10 +453,10 @@ exit 0
   if ($r.ExitCode -ne 0) { Pass 'archive rule needs a delete-after limit' } else { Fail 'archive rule without limit accepted' }
 } finally {
   # Unlink junctions before removing the work folder so their targets are never walked.
-  foreach ($j in "$codexHome\.tmp\linked", "$fakeLocal\ms-playwright\chromium-1000\linked") {
+  foreach ($j in "$codexHome\.tmp\linked", "$fakeLocal\ms-playwright\chromium-1000\linked", "$fakeHome\alias", "$fakeHome\parent-link", "$fakeHome\parent-symlink") {
     if (Test-Path -LiteralPath $j) { [System.IO.Directory]::Delete($j, $false) }
   }
-  Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-TestWorkspace $work
 }
 
 Write-Host ''
