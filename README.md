@@ -1,17 +1,18 @@
 <div align="center">
 
+![AI CLI Auto Manager](docs/readme-banner.svg)
+
 # AI CLI Auto Manager
+
+Inventory your AI coding CLIs, update conservatively and keep scheduled maintenance visible.
 
 **English** · [한국어](README.ko.md)
 
-**Finds the AI coding CLIs installed on your machine every week, updates them safely every night,<br>
-and clears the old sessions, temp files and caches they leave behind.**
+![project: automation](https://img.shields.io/badge/project-automation-4ade80?style=flat-square) ![stack: Shell / PowerShell](https://img.shields.io/badge/stack-Shell%20%2F%20PowerShell-4ade80?style=flat-square) [![License](https://img.shields.io/badge/license-MIT-4ade80?style=flat-square)](LICENSE)
 
-[![ci](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml/badge.svg)](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml)
-[![macOS](https://img.shields.io/badge/macOS-launchd-000000?logo=apple&logoColor=white)](#scheduling)
-[![Windows](https://img.shields.io/badge/Windows-Task_Scheduler-0078D4?logo=windows11&logoColor=white)](#scheduling)
-[![Linux](https://img.shields.io/badge/Linux-cron-FCC624?logo=linux&logoColor=black)](#scheduling)
-[![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
+[Quick start](#quick-start) · [Commands](#commands) · [Scheduling](#scheduling)
+
+[![CI](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml/badge.svg)](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml)
 
 </div>
 

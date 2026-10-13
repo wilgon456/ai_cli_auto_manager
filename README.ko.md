@@ -1,17 +1,18 @@
 <div align="center">
 
+![AI CLI Auto Manager](docs/readme-banner.svg)
+
 # AI CLI Auto Manager
+
+AI 코딩 CLI 목록을 점검하고, 보수적으로 업데이트하고, 예약 정리를 관리합니다.
 
 [English](README.md) · **한국어**
 
-**이 컴퓨터에 깔린 AI 코딩 CLI를 매주 찾아 목록으로 정리하고, 매일 새벽 안전하게 최신으로 올리고,<br>
-그 도구들이 쌓아 두는 오래된 세션·임시 파일·캐시를 매주 치웁니다.**
+![project: automation](https://img.shields.io/badge/project-automation-4ade80?style=flat-square) ![stack: Shell / PowerShell](https://img.shields.io/badge/stack-Shell%20%2F%20PowerShell-4ade80?style=flat-square) [![License](https://img.shields.io/badge/license-MIT-4ade80?style=flat-square)](LICENSE)
 
-[![ci](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml/badge.svg)](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml)
-[![macOS](https://img.shields.io/badge/macOS-launchd-000000?logo=apple&logoColor=white)](#예약-실행)
-[![Windows](https://img.shields.io/badge/Windows-Task_Scheduler-0078D4?logo=windows11&logoColor=white)](#예약-실행)
-[![Linux](https://img.shields.io/badge/Linux-cron-FCC624?logo=linux&logoColor=black)](#예약-실행)
-[![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
+[빠른 시작](#빠른-시작) · [명령](#명령) · [예약 실행](#예약-실행)
+
+[![CI](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml/badge.svg)](https://github.com/wilgon456/ai_cli_auto_manager/actions/workflows/ci.yml)
 
 </div>
 
