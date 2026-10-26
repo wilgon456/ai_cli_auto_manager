@@ -20,6 +20,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aicm-common.sh
 . "$SCRIPT_DIR/../lib/aicm-common.sh"
+aicm_contain_script "$0" "$@"
 # shellcheck source=lib/codex-host.sh
 . "$SCRIPT_DIR/../lib/codex-host.sh"
 
@@ -813,7 +814,7 @@ for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx
 # version actually changed (the job retries during the day). Failure is only a warning.
 POST_UPDATE_HOOK="$AICM_HOME/hooks/post-update.sh"
 if [[ -x "$POST_UPDATE_HOOK" ]]; then
-  if [[ "$versions_before" != "$VERSION_TEXT" ]]; then run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
+  if [[ "$versions_before" != "$VERSION_TEXT" ]]; then AI_CLI_MANAGER_SESSION='' run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
   else echo; echo "post-update hook skipped: no CLI version changed"; fi
 fi
 

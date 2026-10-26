@@ -476,7 +476,7 @@ aicm_json_field() { # file key
 aicm_scheduled_jobs() {
   local file="$AICM_HOME/state/schedule.json"
   [[ -f "$file" ]] || return 0
-  sed -n 's/.*"jobs":\[\([^]]*\)\].*/\1/p' "$file" | tr ',' '\n' | tr -d '" ' | grep -E '^(update|clean|inventory)$' || true
+  sed -n 's/.*"jobs":\[\([^]]*\)\].*/\1/p' "$file" | tr ',' '\n' | tr -d '" ' | grep -E '^(update|clean|inventory|maintenance)$' || true
 }
 
 aicm_job_exists() {
@@ -531,7 +531,7 @@ aicm_schedule_problems() {
     [[ "$job" == "$skip" ]] && continue
     if ! aicm_job_exists "$job"; then echo "scheduled job '$job' is missing; run: aicm schedule install"; continue; fi
     [[ "$nostale" == nostale ]] && continue
-    case "$job" in update) state="last-update"; limit=3 ;; inventory) state="inventory"; limit=9 ;; *) state="last-clean"; limit=9 ;; esac
+    case "$job" in update) state="last-update"; limit=3 ;; inventory) state="inventory"; limit=9 ;; maintenance) state="last-maintenance"; limit=1 ;; *) state="last-clean"; limit=9 ;; esac
     # schedule.json older than the limit and the job's state missing or older than the limit.
     if [[ -n "$(find "$file" -mmin +"$((limit * 1440))" 2>/dev/null)" ]] &&
        { [[ ! -f "$AICM_HOME/state/$state.json" ]] || [[ -n "$(find "$AICM_HOME/state/$state.json" -mmin +"$((limit * 1440))" 2>/dev/null)" ]]; }; then
@@ -572,7 +572,9 @@ exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
 AICM_TIMEOUT_GNU=""
 aicm_timeout() {
   local secs="$1"; shift
-  if [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]] && command -v timeout >/dev/null 2>&1; then
+  if command -v node >/dev/null 2>&1 && [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]]; then
+    node "$AICM_ROOT/lib/supervise.js" --timeout "$secs" -- "$@"
+  elif [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]] && command -v timeout >/dev/null 2>&1; then
     # -k: KILL 10 seconds after TERM when the command ignores TERM (GNU coreutils only).
     if [[ -z "$AICM_TIMEOUT_GNU" ]]; then
       if timeout --version 2>/dev/null | grep -q GNU; then AICM_TIMEOUT_GNU=yes; else AICM_TIMEOUT_GNU=no; fi
@@ -981,4 +983,12 @@ aicm_node_module() { # module args...
     [[ "$line" == "attention: "* ]] && AICM_NODE_ATTENTION+=("${line#attention: }")
   done <<< "$out"
   return 0
+}
+
+# Place the whole manager invocation in a guarded session; direct CLI calls inherit its marker.
+# Version/help/scheduler commands do not launch AI CLIs and need no boundary.
+aicm_contain_script() {
+  [[ "${AICM_CONTAINED:-}" == 1 && "${AI_CLI_MANAGER_SESSION:-}" =~ ^[a-f0-9-]{36}$ ]] && return 0
+  command -v node >/dev/null 2>&1 || { echo "AI CLI process containment needs Node.js" >&2; exit 1; }
+  exec node "$AICM_ROOT/lib/supervise.js" -- /bin/bash "$@"
 }

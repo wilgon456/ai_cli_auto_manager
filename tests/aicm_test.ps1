@@ -77,7 +77,9 @@ try {
   $update = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -ErrorAction SilentlyContinue
   $inventory = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue
   $clean = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -ErrorAction SilentlyContinue
-  if ($update -and $inventory -and $clean) { Pass 'three tasks registered' } else { Fail "tasks missing: $($r.Output)" }
+  $maintenance = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Maintenance' -ErrorAction SilentlyContinue
+  if ($maintenance -and $maintenance.Triggers[0].Repetition.Interval -eq 'PT1H' -and $maintenance.Actions[0].Arguments -match 'maintenance -DryRun') { Pass 'hourly maintenance defaults to dry-run' } else { Fail 'maintenance task' }
+  if ($update -and $inventory -and $clean -and $maintenance) { Pass 'four tasks registered' } else { Fail "tasks missing: $($r.Output)" }
   if ($inventory -and $inventory.Triggers[0].DaysOfWeek -eq 8 -and ([datetime]$inventory.Triggers[0].StartBoundary).ToString('HH:mm') -eq '11:40' -and $inventory.Actions[0].Arguments -match 'inventory_ai_clis\.ps1') { Pass 'inventory trigger (Wednesday) and arguments' } else { Fail 'inventory task' }
   if ($update -and $update.Actions[0].Arguments -match '-Targets "codex,claude"' -and $update.Actions[0].Arguments -match 'update_ai_clis\.ps1') { Pass 'update task arguments' } else { Fail 'update task arguments' }
   if ($update -and ([datetime]$update.Triggers[0].StartBoundary).ToString('HH:mm') -eq '06:15') { Pass 'update time' } else { Fail 'update time' }
@@ -168,6 +170,7 @@ try {
   if ($r.ExitCode -eq 1 -and $r.Output -match 'no inventory run') { Pass 'doctor flags missing inventory run' } else { Fail "doctor without inventory: $($r.Output)" }
   $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
   "{`"finishedAt`":`"$stamp`",`"version`":`"x`",`"ok`":true,`"clis`":[]}" | Set-Content -LiteralPath "$aicmHome\state\inventory.json" -Encoding UTF8
+  @{ finishedAt = (Get-Date).ToUniversalTime().ToString('o'); ok = $true } | ConvertTo-Json | Set-Content -LiteralPath "$aicmHome\state\last-maintenance.json" -Encoding UTF8
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 0) { Pass 'doctor healthy after runs' } else { Fail "doctor after runs: $($r.Output)" }
 
@@ -236,8 +239,9 @@ try {
   if (Get-Command node -ErrorAction SilentlyContinue) {
     $r = Invoke-Aicm @('config')
     if ($r.Output -match 'MCP servers per CLI') { Pass 'aicm config runs the node module' } else { Fail "aicm config: $($r.Output)" }
-    $r = Invoke-Aicm @('processes')
-    if ($r.Output -match 'left-behind agent processes') { Pass 'aicm processes runs the node module' } else { Fail "aicm processes: $($r.Output)" }
+    $r = Invoke-Aicm @('processes', '-Json')
+    $report = $r.Output | ConvertFrom-Json
+    if ($r.ExitCode -eq 0 -and $report.ok -and $report.dryRun) { Pass 'aicm processes uses safe maintenance' } else { Fail "aicm processes: $($r.Output)" }
   }
   $null = Invoke-Aicm @('schedule', 'install', '-KeepLegacyTask')
   $null = Invoke-Aicm @('uninstall')
@@ -280,7 +284,7 @@ try {
     $i = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue
     $c = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -ErrorAction SilentlyContinue
     $s = Get-Content -LiteralPath "$aicmHome\state\schedule.json" -Raw | ConvertFrom-Json
-    if ($u -and $i -and $c -and ([datetime]$u.Triggers[0].StartBoundary).ToString('HH:mm') -eq '04:45' -and $i.Triggers[0].DaysOfWeek -eq 8 -and ([datetime]$i.Triggers[0].StartBoundary).ToString('HH:mm') -eq '11:40' -and @($s.jobs).Count -eq 3 -and $s.options.inventoryDay -eq 'Wednesday' -and $s.options.updateAt -eq '04:45') {
+    if ($u -and $i -and $c -and ([datetime]$u.Triggers[0].StartBoundary).ToString('HH:mm') -eq '04:45' -and $i.Triggers[0].DaysOfWeek -eq 8 -and ([datetime]$i.Triggers[0].StartBoundary).ToString('HH:mm') -eq '11:40' -and @($s.jobs).Count -eq 4 -and $s.options.inventoryDay -eq 'Wednesday' -and $s.options.updateAt -eq '04:45') {
       Pass 'legacy installer keeps Inventory and Clean as they were'
     } else { Fail "legacy installer with all jobs: $($r.Output)" }
   }

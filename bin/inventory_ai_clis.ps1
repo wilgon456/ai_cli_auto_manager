@@ -24,6 +24,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-common.ps1')
+Initialize-AicmProcessContainment
 
 if (-not $LogDir) { $LogDir = Join-Path (Get-AicmHome) 'logs' }
 Initialize-AicmDirectory $LogDir

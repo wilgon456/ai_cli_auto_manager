@@ -24,6 +24,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-common.ps1')
+Initialize-AicmProcessContainment
 if ($MinReleaseAgeDays -lt 0) { $MinReleaseAgeDays = Get-AicmMinReleaseAgeDays }
 
 function Get-Timestamp {
@@ -604,12 +605,14 @@ try {
     if (-not $DryRun -and $versionsChanged -and (Test-Path -LiteralPath $hook)) {
       Write-Host ""
       Write-Host "== post-update hook =="
+      $hookSession = $env:AI_CLI_MANAGER_SESSION
       try {
+        $env:AI_CLI_MANAGER_SESSION = $null # intentional daemon hooks are not orphan-cleanup targets
         & $hook
         Write-Host "ok: post-update hook"
       } catch {
         Write-Host "warn: post-update hook failed: $($_.Exception.Message)"
-      }
+      } finally { $env:AI_CLI_MANAGER_SESSION = $hookSession }
     }
 
     Write-Host ""
