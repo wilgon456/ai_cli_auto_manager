@@ -610,7 +610,7 @@ function Get-AicmTaskProblems($Task, [string]$Job) {
   $code = [int64]$info.LastTaskResult
   if ($code -in @(0, 0x41301, 0x41303, 0x41325)) { return }
   if ($code -eq 1) {
-    $stateName = @{ Update = 'last-update'; Inventory = 'inventory'; Clean = 'last-clean' }[$Job]
+    $stateName = @{ Update = 'last-update'; Inventory = 'inventory'; Clean = 'last-clean'; Maintenance = 'last-maintenance' }[$Job]
     $state = if ($stateName) { Read-AicmState $stateName } else { $null }
     try { if ($state -and [datetime]::Parse($state.finishedAt) -ge $info.LastRunTime.AddMinutes(-1)) { return } } catch { }
   }
@@ -625,7 +625,7 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
   $problems = New-Object System.Collections.Generic.List[string]
   $sched = Read-AicmState 'schedule'
   if (-not $sched) { return $problems }
-  $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9) }
+  $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9); Maintenance = @('last-maintenance', 1) }
   $installedDays = 0
   try { $installedDays = ((Get-Date).ToUniversalTime() - [datetime]::Parse($sched.installedAt).ToUniversalTime()).TotalDays } catch { }
   $launcher = if ($sched.PSObject.Properties['launcher']) { [string]$sched.launcher } else { 'wscript' }
@@ -690,7 +690,9 @@ function Stop-AicmProcessTree([System.Diagnostics.Process]$Process) {
   $ErrorActionPreference = 'Continue'
   $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
   if ($env:SystemRoot -and (Test-Path -LiteralPath $taskkill)) {
-    try { & $taskkill /T /F /PID $Process.Id 2>&1 | Out-Null } catch { }
+    try { & $taskkill /T /PID $Process.Id 2>&1 | Out-Null } catch { }
+    try { [void]$Process.WaitForExit(1000) } catch { }
+    try { if (-not $Process.HasExited) { & $taskkill /T /F /PID $Process.Id 2>&1 | Out-Null } } catch { }
   }
   try { if (-not $Process.HasExited) { $Process.Kill() } } catch { }
   try { [void]$Process.WaitForExit(5000) } catch { }
@@ -699,6 +701,7 @@ function Stop-AicmProcessTree([System.Diagnostics.Process]$Process) {
 # Runs a command with a time limit. Returns .ExitCode (124 on timeout), .StdOut, .StdErr and .Output
 # (both streams together, for display). Parse .StdOut only: npm prints warnings on stderr.
 function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds) {
+  Initialize-AicmProcessContainment
   $exe = Resolve-AicmExecutable $Name
   if (-not $exe) { throw "command not found: $Name" }
   if ($exe -like '*.ps1') {
@@ -710,7 +713,13 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
   try {
     $startArgs = @{ FilePath = $exe; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $stdoutFile; RedirectStandardError = $stderrFile }
     if (@($Arguments).Count -gt 0) { $startArgs.ArgumentList = (Join-AicmProcessArguments $Arguments) }
-    $process = Start-Process @startArgs
+    $savedSession = $env:AI_CLI_MANAGER_SESSION
+    $childSession = [guid]::NewGuid().ToString()
+    try {
+      $env:AI_CLI_MANAGER_SESSION = $childSession
+      $process = Start-Process @startArgs
+    } finally { $env:AI_CLI_MANAGER_SESSION = $savedSession }
+    Write-AicmSessionRecord $process $childSession
     # Touch the handle now; otherwise ExitCode stays empty after a timed WaitForExit.
     $null = $process.Handle
     $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
@@ -1129,4 +1138,25 @@ function Invoke-AicmNodeModule([string]$Module, [string[]]$Arguments = @(), [int
   $attention = @($lines | Where-Object { $_ -like 'attention: *' } | ForEach-Object { $_.Substring(11) })
   if ($r.ExitCode -ne 0) { $attention += "${Module} failed with exit code $($r.ExitCode)" }
   return [pscustomobject]@{ Lines = @($lines | Where-Object { $_ -notlike 'attention: *' }); Attention = $attention }
+}
+
+# A Job handle belongs to this PowerShell process, never to its children.
+function Initialize-AicmProcessContainment {
+  if (-not ('Aicm.ProcessJob' -as [type])) { Add-Type -Path (Join-Path (Get-AicmRoot) 'lib\aicm-job.cs') }
+  [Aicm.ProcessJob]::Initialize()
+  if (-not $env:AI_CLI_MANAGER_SESSION) {
+    $env:AI_CLI_MANAGER_SESSION = [guid]::NewGuid().ToString()
+    Write-AicmSessionRecord (Get-Process -Id $PID) $env:AI_CLI_MANAGER_SESSION
+  }
+}
+
+function Write-AicmSessionRecord([System.Diagnostics.Process]$Process, [string]$Session) {
+  try {
+    $owner = Get-Process -Id $PID
+    $dir = Join-Path (Get-AicmHome) 'state\sessions'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $record = @{ session = $Session; pid = $Process.Id; created = $Process.StartTime.ToUniversalTime().ToString('o')
+      ownerPid = $PID; ownerCreated = $owner.StartTime.ToUniversalTime().ToString('o'); platform = 'win32' }
+    $record | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $dir "$Session.json") -Encoding UTF8
+  } catch { } # A fast command may already have exited; its Job still guarantees containment.
 }

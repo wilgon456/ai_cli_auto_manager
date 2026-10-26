@@ -24,6 +24,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-common.ps1')
+Initialize-AicmProcessContainment
 if ($MinReleaseAgeDays -lt 0) { $MinReleaseAgeDays = Get-AicmMinReleaseAgeDays }
 
 function Get-Timestamp {

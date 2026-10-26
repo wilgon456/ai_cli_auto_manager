@@ -20,6 +20,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aicm-common.sh
 . "$SCRIPT_DIR/../lib/aicm-common.sh"
+aicm_contain_script "$0" "$@"
 # shellcheck source=lib/codex-host.sh
 . "$SCRIPT_DIR/../lib/codex-host.sh"
 

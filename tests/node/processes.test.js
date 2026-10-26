@@ -137,37 +137,10 @@ test('never touches its own process tree', () => {
   assert.strictEqual(findOrphans(list, { platform: 'win32', minAgeHours: 2, selfPid: 11 }).length, 0);
 });
 
-test('CLI: report, announce once, --kill only records on injected lists', () => {
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'aicm-proc-'));
-  try {
-    const listFile = path.join(work, 'list.json');
-    const killLog = path.join(work, 'kills.log');
-    fs.writeFileSync(listFile, JSON.stringify(winList));
-    const env = { ...process.env, AICM_HOME: path.join(work, 'aicm'), AICM_PROCESS_LIST: listFile, AICM_KILL_LOG: killLog, AICM_PLATFORM: 'win32' };
-    const run = (args) => spawnSync(process.execPath, [MODULE, ...args], { encoding: 'utf8', env }).stdout;
-    const first = run([]);
-    assert.match(first, /left running +mcp +pid 300 node\.exe, 26h, 260 MB with 1 children/);
-    assert.match(first, /2 left-behind agent processes \(300 MB\)/);
-    assert.match(first, /attention: mcp node\.exe \(pid 300\)/);
-    assert.ok(!fs.existsSync(killLog), 'report mode kills nothing');
-    assert.doesNotMatch(run([]), /attention:/, 'announced once');
-    const killed = run(['--kill']);
-    assert.match(killed, /ended +mcp +pid 300/);
-    assert.match(fs.readFileSync(killLog, 'utf8'), /kill 300 tree=301/);
-  } finally { fs.rmSync(work, { recursive: true, force: true }); }
-});
-
-test('CLI: attention stays quiet as the process ages; a reused pid is announced again', () => {
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'aicm-proc-'));
-  try {
-    const listFile = path.join(work, 'list.json');
-    const env = { ...process.env, AICM_HOME: path.join(work, 'aicm'), AICM_PROCESS_LIST: listFile, AICM_KILL_LOG: path.join(work, 'kills.log'), AICM_PLATFORM: 'win32' };
-    const run = (list) => { fs.writeFileSync(listFile, JSON.stringify(list)); return spawnSync(process.execPath, [MODULE], { encoding: 'utf8', env }).stdout; };
-    const orphan = (ageSec, created) => [{ pid: 300, ppid: 999, name: 'node.exe', cmd: 'node chrome-devtools-mcp', ageSec, created, mb: 60 }];
-    const first = run(orphan(26 * H, '2026-10-06T08:00:00.0000000Z'));
-    assert.match(first, /attention: mcp node\.exe \(pid 300, started 2026-10-06T08:00:00\.0000000Z\) left running after its session ended/);
-    assert.doesNotMatch(first, /attention: .*\d+h/, 'no hours in the attention text');
-    assert.doesNotMatch(run(orphan(27 * H, '2026-10-06T08:00:00.0000000Z')), /attention:/, 'an hour older is the same item');
-    assert.match(run(orphan(3 * H, '2026-10-07T07:00:00.0000000Z')), /attention: mcp node\.exe \(pid 300, started 2026-10-07/, 'reused pid is a new item');
-  } finally { fs.rmSync(work, { recursive: true, force: true }); }
+test('CLI help routes to safe maintenance and invalid options fail', () => {
+  const help = spawnSync(process.execPath, [MODULE, '--help'], { encoding: 'utf8' });
+  assert.strictEqual(help.status, 0);
+  assert.match(help.stdout, /maintenance.*--dry-run.*--apply/);
+  const bad = spawnSync(process.execPath, [MODULE, '--bogus'], { encoding: 'utf8' });
+  assert.strictEqual(bad.status, 2);
 });

@@ -29,6 +29,45 @@ namespace Aicm {
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
 
+        // Rename using the exclusively held source handle; never copy-and-delete across volumes.
+        [DllImport("kernel32.dll", EntryPoint = "SetFileInformationByHandle", SetLastError = true)]
+        static extern bool RenameByHandle(SafeFileHandle handle, int kind, IntPtr info, uint size);
+
+        public static bool TryMove(string source, string destination) {
+            var handles = new List<SafeFileHandle>();
+            IntPtr buffer = IntPtr.Zero;
+            try {
+                foreach (var item in new [] { source, destination }) {
+                    for (var parent = Path.GetDirectoryName(Path.GetFullPath(item));
+                         parent != null; parent = Path.GetDirectoryName(parent)) {
+                        var directory = CreateFile(parent, 0x80, 3, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+                        handles.Add(directory);
+                        FileInfo info;
+                        if (directory.IsInvalid || !GetFileInformationByHandle(directory, out info) ||
+                            (info.Attributes & 0x400) != 0) return false;
+                    }
+                }
+                var handle = CreateFile(source, 0x80010000, 0, IntPtr.Zero, 3, 0x00200080, IntPtr.Zero);
+                handles.Add(handle);
+                FileInfo fileInfo;
+                if (handle.IsInvalid || !GetFileInformationByHandle(handle, out fileInfo) ||
+                    (fileInfo.Attributes & (0x400 | 0x10 | 1)) != 0 || fileInfo.Links != 1) return false;
+                byte[] name = System.Text.Encoding.Unicode.GetBytes(Path.GetFullPath(destination));
+                int rootOffset = IntPtr.Size == 8 ? 8 : 4;
+                int lengthOffset = rootOffset + IntPtr.Size;
+                int nameOffset = lengthOffset + 4;
+                int size = nameOffset + name.Length;
+                buffer = Marshal.AllocHGlobal(size);
+                for (int i = 0; i < size; i++) Marshal.WriteByte(buffer, i, 0);
+                Marshal.WriteInt32(buffer, lengthOffset, name.Length);
+                Marshal.Copy(name, 0, new IntPtr(buffer.ToInt64() + nameOffset), name.Length);
+                return RenameByHandle(handle, 3, buffer, (uint)size);
+            } finally {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                foreach (var handle in handles) handle.Dispose();
+            }
+        }
+
         public static bool TryDelete(string[] paths, string[] checks) {
             var handles = new List<SafeFileHandle>();
             var byPath = new Dictionary<string, SafeFileHandle>(StringComparer.OrdinalIgnoreCase);

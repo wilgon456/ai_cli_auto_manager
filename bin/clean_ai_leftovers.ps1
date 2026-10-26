@@ -26,6 +26,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-common.ps1')
+Initialize-AicmProcessContainment
 
 if (-not $RulesFile) { $RulesFile = Join-Path (Get-AicmRoot) 'rules\clean-rules.conf' }
 if (-not $LocalRulesFile) { $LocalRulesFile = Join-Path (Get-AicmHome) 'clean-rules.local.conf' }

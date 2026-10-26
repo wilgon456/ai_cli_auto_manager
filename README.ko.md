@@ -333,3 +333,19 @@ CI는 Ubuntu, macOS(기본 내장된 bash 3.2), Windows PowerShell 5.1과 PowerS
 ## License
 
 MIT License. 자세한 내용은 [LICENSE](LICENSE)를 보세요.
+
+
+## 자동 유지 관리
+
+`aicm maintenance`는 관리자 소유의 고아 프로세스와 캐시·임시 파일을 점검합니다.
+기본값은 dry-run이며 `--apply`(Windows: `-Apply`)를 지정해야 처리합니다.
+파일은 격리 폴더로 옮기고 7일 뒤 다음 apply 실행 때 삭제합니다.
+태그 없는 node/python/bun 고아 프로세스는 6시간 이상 실행 중이고 수신 포트가 있어도 알림만 남깁니다.
+
+`aicm schedule install`은 매시간 dry-run 점검도 등록합니다.
+자동 처리는 `--maintenance-apply`(Windows: `-MaintenanceApply`),
+등록 제외는 `--no-maintenance`(Windows: `-NoMaintenance`)로 선택합니다.
+`aicm run -- claude`(Windows: `aicm.ps1 run -Cli claude`)는 태그와 프로세스 수명 관리를 적용해 실행합니다.
+Unix 실행에는 Node.js가 필요합니다. 기존 `processes --kill`도 소유권 검증을 적용하며,
+`AICM_KILL_ORPHANS=1`의 이름 기반 종료는 더 이상 지원하지 않습니다.
+설정·복구·제약 사항은 [자동 유지 관리 문서](docs/automatic-maintenance.md)를 참고하세요.
