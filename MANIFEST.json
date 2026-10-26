@@ -15,7 +15,7 @@
   "bin/inventory_ai_clis.ps1": "7f57b5272f04c4f9c94a35b83c4973c29a7423aefe2b5f0e63375a2c6fb3fa5b",
   "bin/inventory_ai_clis.sh": "f5694ec5efb817844a66e1618153ea74d2ee33bdc8cbe7b3503ad3b156a7cca2",
   "bin/update_ai_clis.ps1": "78e5d88f66e079cea38be29b18cae94a19eafff68fd11c22696249ccf955fbe7",
-  "bin/update_ai_clis.sh": "8610b58fca1ecbd8d6cbf2959abd677497dc7f7ee0d57a24ec5103fa9afbb265",
+  "bin/update_ai_clis.sh": "cb0dfcfc75527bbd80a252bfab0515d143a842578ccc4199e7b494af70218e94",
   "docs/automatic-maintenance.md": "6f88dcd72886da7f6e6723ad1f7828a28bf5278386ebeabfdbb1b6c8caa2adbf",
   "docs/readme-banner.svg": "06c6618ac768be8d43d1a5d974079d6d464dcd88950aa5cfe7541a1f1adf4201",
   "lib/aicm-common.ps1": "6f86ae2432730d484e406ded8f5f0d542f172f0204b350ef0b9041a5380dad3c",
