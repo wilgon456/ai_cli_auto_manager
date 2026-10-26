@@ -171,3 +171,18 @@ test('CLI emits one JSON document and reads a PowerShell BOM inventory for versi
     assert.equal(fs.existsSync(path.join(c.aicmHome, 'state', 'maintenance.lock')), false);
   } finally { fs.rmSync(c.root, { recursive: true, force: true }); }
 });
+
+test('injected CLI process snapshots can never authorize real mutations', () => {
+  const c = fixture();
+  try {
+    const list = path.join(c.root, 'processes.json');
+    fs.writeFileSync(list, JSON.stringify([proc({ session: SESSION })]));
+    const cli = path.resolve(__dirname, '../../lib/auto-maintenance.js');
+    const r = spawnSync(process.execPath, [cli, '--processes-only', '--apply', '--json'], { encoding: 'utf8', env: { ...process.env, HOME: c.home, USERPROFILE: c.home, AICM_HOME: c.aicmHome, AICM_PROCESS_LIST: list } });
+    assert.equal(r.status, 0, r.stderr);
+    const result = JSON.parse(r.stdout);
+    assert.equal(result.dryRun, true);
+    assert.ok(result.actions.some((a) => a.action === 'would-end'));
+    assert.equal(result.actions.some((a) => a.action === 'end'), false);
+  } finally { fs.rmSync(c.root, { recursive: true, force: true }); }
+});

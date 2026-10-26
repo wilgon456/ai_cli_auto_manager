@@ -605,12 +605,14 @@ try {
     if (-not $DryRun -and $versionsChanged -and (Test-Path -LiteralPath $hook)) {
       Write-Host ""
       Write-Host "== post-update hook =="
+      $hookSession = $env:AI_CLI_MANAGER_SESSION
       try {
+        $env:AI_CLI_MANAGER_SESSION = $null # intentional daemon hooks are not orphan-cleanup targets
         & $hook
         Write-Host "ok: post-update hook"
       } catch {
         Write-Host "warn: post-update hook failed: $($_.Exception.Message)"
-      }
+      } finally { $env:AI_CLI_MANAGER_SESSION = $hookSession }
     }
 
     Write-Host ""

@@ -358,8 +358,9 @@ function Invoke-CommandRule($Rule) {
   if (-not $cmd) { return [ordered]@{ status = 'not installed' } }
   $argList = @($Rule.Pattern -split '\s+' | Where-Object { $_ })
   if ($DryRun) { return [ordered]@{ status = "would run: $($Rule.Path) $($argList -join ' ')" } }
-  $output = & $cmd.Source @argList 2>&1
-  $rc = $LASTEXITCODE
+  $run = Invoke-AicmWithTimeout $cmd.Source $argList 900
+  $output = @($run.Output -split "`r?`n")
+  $rc = $run.ExitCode
   $lastLine = @($output | ForEach-Object { "$_" } | Where-Object { $_.Trim() } | Select-Object -Last 1)
   if ($rc -ne 0) { throw "$($Rule.Path) $($argList -join ' ') exited with $rc" }
   $detail = if ($lastLine) { $lastLine[0].Trim() } else { 'done' }

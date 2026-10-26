@@ -710,20 +710,21 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
   }
   $stdoutFile = [System.IO.Path]::GetTempFileName()
   $stderrFile = [System.IO.Path]::GetTempFileName()
+  $contained = $null
   try {
-    $startArgs = @{ FilePath = $exe; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $stdoutFile; RedirectStandardError = $stderrFile }
-    if (@($Arguments).Count -gt 0) { $startArgs.ArgumentList = (Join-AicmProcessArguments $Arguments) }
     $savedSession = $env:AI_CLI_MANAGER_SESSION
     $childSession = [guid]::NewGuid().ToString()
     try {
       $env:AI_CLI_MANAGER_SESSION = $childSession
-      $process = Start-Process @startArgs
+      $contained = [Aicm.ProcessJob]::Start($exe, (Join-AicmProcessArguments $Arguments), $stdoutFile, $stderrFile)
+      $process = $contained.Process
     } finally { $env:AI_CLI_MANAGER_SESSION = $savedSession }
     Write-AicmSessionRecord $process $childSession
     # Touch the handle now; otherwise ExitCode stays empty after a timed WaitForExit.
     $null = $process.Handle
     $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
     if ($timedOut) { Stop-AicmProcessTree $process } else { $process.WaitForExit() }
+    $contained.Dispose() # command ended: no grandchildren may retain its output files or live on
     # An empty file gives no value at all, which stays $null even through [string]; callers get ''.
     $stdout = Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
     if ($null -eq $stdout) { $stdout = '' }
@@ -735,6 +736,7 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
     }
     return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
   } finally {
+    if ($contained) { $contained.Dispose(); $contained.Process.Dispose() }
     Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
   }
 }
@@ -1141,9 +1143,9 @@ function Invoke-AicmNodeModule([string]$Module, [string[]]$Arguments = @(), [int
 }
 
 # A Job handle belongs to this PowerShell process, never to its children.
-function Initialize-AicmProcessContainment {
+function Initialize-AicmProcessContainment([switch]$WholeProcess) {
   if (-not ('Aicm.ProcessJob' -as [type])) { Add-Type -Path (Join-Path (Get-AicmRoot) 'lib\aicm-job.cs') }
-  [Aicm.ProcessJob]::Initialize()
+  if ($WholeProcess) { [Aicm.ProcessJob]::Initialize() }
   if (-not $env:AI_CLI_MANAGER_SESSION) {
     $env:AI_CLI_MANAGER_SESSION = [guid]::NewGuid().ToString()
     Write-AicmSessionRecord (Get-Process -Id $PID) $env:AI_CLI_MANAGER_SESSION

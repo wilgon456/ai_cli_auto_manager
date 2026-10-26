@@ -239,8 +239,9 @@ try {
   if (Get-Command node -ErrorAction SilentlyContinue) {
     $r = Invoke-Aicm @('config')
     if ($r.Output -match 'MCP servers per CLI') { Pass 'aicm config runs the node module' } else { Fail "aicm config: $($r.Output)" }
-    $r = Invoke-Aicm @('processes')
-    if ($r.Output -match 'left-behind agent processes') { Pass 'aicm processes runs the node module' } else { Fail "aicm processes: $($r.Output)" }
+    $r = Invoke-Aicm @('processes', '-Json')
+    $report = $r.Output | ConvertFrom-Json
+    if ($r.ExitCode -eq 0 -and $report.ok -and $report.dryRun) { Pass 'aicm processes uses safe maintenance' } else { Fail "aicm processes: $($r.Output)" }
   }
   $null = Invoke-Aicm @('schedule', 'install', '-KeepLegacyTask')
   $null = Invoke-Aicm @('uninstall')

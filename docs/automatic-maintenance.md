@@ -46,12 +46,15 @@ the command group. Node.js is required for these Unix entry points; an uncontain
 used when Node is missing. If the guardian itself is forcibly killed, the hourly scanner can recover
 tagged leftovers; no userspace Unix guardian can run cleanup after its own `SIGKILL`.
 
-On Windows the manager joins a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before launching
-commands. Its only Job handle is non-inheritable and remains open for the manager's entire lifetime.
-The OS closes it on a crash or exit and ends all descendants, even if an intermediate parent already
-exited. Failure to create or join the job refuses an uncontained launch. Timeout cleanup first requests
-tree termination, waits, then forces survivors; a manager crash closes the Job immediately. The shared
-PowerShell command wrapper also tags and records individual launches.
+On Windows each CLI command has its own Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+The manager creates the command suspended, assigns its Job before user code can run, captures the
+process handle, and then resumes it. Its only Job handle is non-inheritable and owned by the manager.
+Closing it on command completion, manager exit or crash ends all descendants, even if an intermediate
+parent already exited. Failed assignment refuses an uncontained launch. Timeout cleanup first requests
+tree termination, waits, then forces survivors. Explicit `run` sessions contain the launcher too.
+Post-update hooks remain outside these command Jobs and clear the manager session marker, so deliberately restarted daemons such as Paseo
+can continue running after the update finishes. The shared PowerShell command wrapper tags and
+records individual launches.
 
 The scanner automatically ends a tree/group **only with explicit apply** and verified manager ownership:
 

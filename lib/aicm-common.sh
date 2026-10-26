@@ -988,7 +988,7 @@ aicm_node_module() { # module args...
 # Place the whole manager invocation in a guarded session; direct CLI calls inherit its marker.
 # Version/help/scheduler commands do not launch AI CLIs and need no boundary.
 aicm_contain_script() {
-  [[ "${AICM_CONTAINED:-}" == 1 ]] && return 0
+  [[ "${AICM_CONTAINED:-}" == 1 && "${AI_CLI_MANAGER_SESSION:-}" =~ ^[a-f0-9-]{36}$ ]] && return 0
   command -v node >/dev/null 2>&1 || { echo "AI CLI process containment needs Node.js" >&2; exit 1; }
   exec node "$AICM_ROOT/lib/supervise.js" -- /bin/bash "$@"
 }
