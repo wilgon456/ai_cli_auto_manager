@@ -24,9 +24,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-common.ps1')
-Initialize-AicmProcessContainment
 
 if (-not $LogDir) { $LogDir = Join-Path (Get-AicmHome) 'logs' }
+# Claims (marks) the home; a folder this tool did not create is refused before anything is written.
+try { Confirm-AicmHome } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+Initialize-AicmProcessContainment -OwnSession
 Initialize-AicmDirectory $LogDir
 $transcript = Join-Path $LogDir ("inventory-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 Start-Transcript -Path $transcript -Force | Out-Null
@@ -36,6 +38,7 @@ try {
   Write-Host "[$(Get-AicmTimestamp)] AI CLI inventory started (version=$(Get-AicmVersion), offline=$Offline)"
   $catalog = @(Read-AicmCatalog $CatalogFile $LocalCatalogFile)
   $npm = Get-AicmNpmInfo
+  if ($npm.PrefixProblem) { Write-Host "warn: $($npm.PrefixProblem); CLIs on PATH are shown with an unknown owner and the daily update skips them" }
   $rows = New-Object System.Collections.Generic.List[object]
 
   foreach ($entry in $catalog) {
@@ -50,18 +53,19 @@ try {
         if ($r.ExitCode -eq 0) { $version = Get-AicmSemver $r.Output }
       } catch { }
     }
-    if (-not $version -and $install.Method -eq 'npm' -and $npm.Packages.ContainsKey($entry.Npm)) { $version = $npm.Packages[$entry.Npm] }
+    $npmPkg = if ($install.NpmPackage) { $install.NpmPackage } else { $entry.Npm }
+    if (-not $version -and $install.Method -eq 'npm' -and $npmPkg -and $npm.Packages.ContainsKey($npmPkg)) { $version = $npm.Packages[$npmPkg] }
 
     $latest = ''
-    if (-not $Offline -and $entry.Npm -and $npm.Available) {
-      $r = Invoke-AicmWithTimeout 'npm' @('view', $entry.Npm, 'version') 30
+    if (-not $Offline -and $npmPkg -and $npm.Available) {
+      $r = Invoke-AicmWithTimeout 'npm' @('view', $npmPkg, 'version') 30
       if ($r.ExitCode -eq 0) { $latest = Get-AicmSemver $r.Output }
     }
     $state = if (-not $version) { 'unknown' } elseif (-not $latest) { 'installed' } elseif ((Compare-AicmVersion $version $latest) -lt 0) { 'behind' } else { 'current' }
     # A newer release that is still inside the waiting period is expected, not a problem.
     if ($state -eq 'behind' -and $install.Method -eq 'npm') {
       try {
-        $target = Get-AicmNpmTarget $entry.Npm (Get-AicmMinReleaseAgeDays)
+        $target = Get-AicmNpmTarget $npmPkg (Get-AicmMinReleaseAgeDays)
         if (-not $target -or (Compare-AicmVersion $version $target) -ge 0) { $state = 'held' }
       } catch { }
     }
@@ -73,7 +77,7 @@ try {
   }
 
   $known = @{}
-  foreach ($entry in $catalog) { if ($entry.Npm) { $known[$entry.Npm] = $true } }
+  foreach ($entry in $catalog) { foreach ($n in @(Get-AicmNpmNames $entry)) { if ($n) { $known[$n] = $true } } }
   $otherNpm = @($npm.Packages.Keys | Where-Object { -not $known.ContainsKey($_) -and @('npm', 'corepack', 'pnpm', 'yarn') -notcontains $_ } | Sort-Object | ForEach-Object { "$_ $($npm.Packages[$_])" })
 
   Write-Host ''

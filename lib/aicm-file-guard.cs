@@ -69,6 +69,11 @@ namespace Aicm {
         }
 
         public static bool TryDelete(string[] paths, string[] checks) {
+            return TryDelete(paths, checks, false);
+        }
+
+        // singleLink: also refuse a file with more than one hard link (removing one name frees nothing).
+        public static bool TryDelete(string[] paths, string[] checks, bool singleLink) {
             var handles = new List<SafeFileHandle>();
             var byPath = new Dictionary<string, SafeFileHandle>(StringComparer.OrdinalIgnoreCase);
             var marked = new List<SafeFileHandle>();
@@ -95,6 +100,7 @@ namespace Aicm {
                     // Reject reparse points, directories and readonly files BEFORE marking any member.
                     if (handle.IsInvalid || !GetFileInformationByHandle(handle, out fileInfo) ||
                         (fileInfo.Attributes & (0x400 | 0x10 | 1)) != 0) return false;
+                    if (singleLink && fileInfo.Links != 1) return false;
                     byPath.Add(path, handle);
                 }
                 var info = new Disposition { DeleteFile = true };

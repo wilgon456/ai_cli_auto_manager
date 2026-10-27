@@ -11,7 +11,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aicm-common.sh
 . "$SCRIPT_DIR/../lib/aicm-common.sh"
-aicm_contain_script "$0" "$@"
+ORIG_ARGS=("$@")
 
 OFFLINE=false
 CATALOG_FILE="$AICM_ROOT/rules/ai-clis.conf"
@@ -30,6 +30,9 @@ while (($#)); do
   shift
 done
 
+# Claims (marks) the home after the arguments are valid; a folder this tool did not create is refused.
+aicm_claim_home || exit 1
+aicm_contain_script "$0" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
 mkdir -p "$LOG_DIR" "$AICM_HOME/state"
 LOG_FILE="$LOG_DIR/inventory-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -49,7 +52,7 @@ for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
   aicm_cli_install "$i"
   [[ "$CLI_INSTALLED" == true ]] || continue
   count=$((count + 1))
-  id="${AICM_CLI_ID[$i]}"; name="${AICM_CLI_NAME[$i]}"; npm_pkg="${AICM_CLI_NPM[$i]}"
+  id="${AICM_CLI_ID[$i]}"; name="${AICM_CLI_NAME[$i]}"; npm_pkg="${CLI_NPMPKG:-${AICM_CLI_NPM[$i]}}"
   version=""
   if [[ -x "$CLI_PATH" ]]; then
     version="$(aicm_timeout 15 "$CLI_PATH" --version 2>&1 | aicm_semver || true)"
@@ -82,9 +85,11 @@ for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
   md_rows+="| $name | $CLI_METHOD | $version | $latest | $state | $coverage | $CLI_PATH${CLI_NPMCOPY:+ (stale npm copy $CLI_NPMCOPY also installed)} |"$'\n'
 done
 
-# Global npm packages that are not in the catalog.
+# Global npm packages that are not in the catalog (aliases count as known, not "other").
 known=" "
-for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do [[ -n "${AICM_CLI_NPM[$i]}" ]] && known+="${AICM_CLI_NPM[$i]} "; done
+for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
+  while IFS= read -r pkg; do [[ -n "$pkg" ]] && known+="$pkg "; done < <(aicm_cli_npm_names "$i")
+done
 other_npm=""
 while read -r pkg ver; do
   [[ -z "$pkg" || "$known" == *" $pkg "* || " npm corepack pnpm yarn " == *" $pkg "* ]] && continue

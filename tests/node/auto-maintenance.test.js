@@ -16,6 +16,7 @@ function fixture() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'aicm-maintenance-')));
   const home = path.join(root, 'home'), aicmHome = path.join(home, '.ai-cli-auto-manager');
   fs.mkdirSync(aicmHome, { recursive: true });
+  fs.writeFileSync(path.join(aicmHome, '.aicm-home'), 'AI CLI Auto Manager home (logs, state, archive, installed copy)\n');
   return { root, home, aicmHome, temp: root };
 }
 const empty = { snapshot: () => ({ uid: 1000, procs: [] }) };
@@ -185,4 +186,28 @@ test('injected CLI process snapshots can never authorize real mutations', () => 
     assert.ok(result.actions.some((a) => a.action === 'would-end'));
     assert.equal(result.actions.some((a) => a.action === 'end'), false);
   } finally { fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+
+test('direct automatic maintenance refuses an unmanaged home before writing audit or session state', () => {
+  const c = fixture();
+  try {
+    fs.unlinkSync(path.join(c.aicmHome, '.aicm-home'));
+    fs.writeFileSync(path.join(c.aicmHome, 'personal.txt'), 'keep');
+    const cli = path.resolve(__dirname, '../../lib/auto-maintenance.js');
+    const r = spawnSync(process.execPath, [cli, '--files-only', '--dry-run', '--json'], { encoding: 'utf8', env: { ...process.env, HOME: c.home, USERPROFILE: c.home, AICM_HOME: c.aicmHome } });
+    assert.notEqual(r.status, 0);
+    assert.deepEqual(fs.readdirSync(c.aicmHome), ['personal.txt']);
+  } finally { fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+
+test('automatic maintenance shares the archive/restore/cleanup lease and preserves a live owner', async () => {
+  const c = fixture();
+  const maintenance = require('../../lib/maintenance');
+  const lease = maintenance.acquireLock(c.aicmHome, { contextHome: c.aicmHome });
+  try {
+    await assert.rejects(run(c, { files: false, processes: false }, empty), /already running/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(lease.dir, 'owner.json'), 'utf8')).pid, process.pid);
+  } finally { lease.release(); fs.rmSync(c.root, { recursive: true, force: true }); }
 });

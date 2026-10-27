@@ -4,29 +4,40 @@
 .DESCRIPTION
   aicm.ps1 update    [-DryRun] [-Targets codex,claude] [-InstallMissing]
   aicm.ps1 inventory [-Offline]   list installed AI CLIs, their versions and update coverage
-  aicm.ps1 clean     [-DryRun] [-Rules id,id]
+  aicm.ps1 clean     [-DryRun] [-Rules id,id] [-Category list] [-Json] [-Explain]
+  aicm.ps1 archive list [-Json] [-Limit N] [-Offset N]   newest first
+  aicm.ps1 archive gc [-DryRun] [-Json]   drop index records of expired or long-restored archives
+  aicm.ps1 restore ID [-DryRun] [-Json]
+  aicm.ps1 history   [-Limit N] [-Json]
   aicm.ps1 worktrees [-Apply] [-Days 14]   worktrees and branches agents left behind (report unless -Apply)
   aicm.ps1 config    MCP servers and skills compared across the installed CLIs
   aicm.ps1 processes [-Kill]   agent processes left running after their session ended
+  aicm.ps1 optimize  [-DryRun | -Apply] [-Tasks npm-verify,uv-prune,pnpm-prune] [-Json]
+                     preview by default; -Apply runs npm cache verify, uv cache prune, pnpm store prune (needs Node.js)
   aicm.ps1 status    disk use per cleanup rule, schedules, last runs
-  aicm.ps1 doctor    exit 1 when a schedule is missing or a run is overdue or failed
+  aicm.ps1 doctor    exit 1 when a schedule is missing, a run is overdue or failed, or a setting is invalid
+  aicm.ps1 uninstall [-Purge] [-DryRun]
   aicm.ps1 schedule  install | remove | show | refresh   [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]
-                                               [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply]
+                                               [-CleanDay Monday] [-CleanAt 12:30] [-CleanCategory list] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply]
   aicm.ps1 version
 #>
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('update', 'inventory', 'clean', 'worktrees', 'config', 'processes', 'maintenance', 'run', 'status', 'doctor', 'schedule', 'uninstall', 'version', 'help')]
+  [ValidateSet('update', 'inventory', 'clean', 'archive', 'restore', 'history', 'worktrees', 'config', 'processes', 'optimize', 'maintenance', 'run', 'status', 'doctor', 'schedule', 'uninstall', 'version', 'help')]
   [string]$Command = 'help',
   [Parameter(Position = 1)]
   [string]$Action = '',
   [Alias('Check')]
   [switch]$DryRun,
   [string[]]$Targets = @(),
+  [string[]]$Tasks = @(),
   [switch]$InstallMissing,
   [switch]$Offline,
   [string[]]$Rules = @(),
+  [string[]]$Category = @(),
+  [switch]$Json,
+  [switch]$Explain,
   [int]$LogRetentionDays = 30,
   [string]$UpdateAt = '05:00',
   [ValidateSet('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')]
@@ -35,6 +46,10 @@ param(
   [ValidateSet('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')]
   [string]$CleanDay = 'Monday',
   [string]$CleanAt = '12:30',
+  [string[]]$CleanCategory = @(),
+  [int]$Limit = 20,
+  [int]$Offset = 0,
+  [string]$ArchiveId = '',
   [switch]$NoUpdate,
   [switch]$NoInventory,
   [switch]$NoClean,
@@ -42,7 +57,6 @@ param(
   [switch]$MaintenanceApply,
   [string]$Cli = '',
   [string[]]$CliArguments = @(),
-  [switch]$Json,
   [string]$ConfigFile = '',
   [switch]$FilesOnly,
   [switch]$ProcessesOnly,
@@ -67,17 +81,22 @@ function Show-Help {
   Write-Host ''
   Write-Host '  aicm.ps1 update    [-DryRun] [-Targets codex,claude] [-InstallMissing]'
   Write-Host '  aicm.ps1 inventory [-Offline]'
-  Write-Host '  aicm.ps1 clean     [-DryRun] [-Rules id,id]'
+  Write-Host '  aicm.ps1 clean     [-DryRun] [-Rules id,id] [-Category list] [-Json] [-Explain]
+  aicm.ps1 archive list [-Json] [-Limit N] [-Offset N]
+  aicm.ps1 archive gc [-DryRun] [-Json]
+  aicm.ps1 restore ID [-DryRun] [-Json]
+  aicm.ps1 history   [-Limit N] [-Json]'
   Write-Host '  aicm.ps1 worktrees [-Apply] [-Days 14]'
   Write-Host '  aicm.ps1 config'
   Write-Host '  aicm.ps1 processes [-Kill]'
   Write-Host '  aicm.ps1 maintenance [-DryRun|-Apply] [-Json] [-ConfigFile path] [-FilesOnly|-ProcessesOnly]'
   Write-Host "  aicm.ps1 run -Cli claude -CliArguments @('--version')"
+  Write-Host '  aicm.ps1 optimize  [-DryRun | -Apply] [-Tasks npm-verify,uv-prune,pnpm-prune] [-Json]   preview unless -Apply'
   Write-Host '  aicm.ps1 status'
   Write-Host '  aicm.ps1 doctor'
   Write-Host '  aicm.ps1 schedule  install|remove|show|refresh [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
-  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply] [-KeepOtherJobs]'
-  Write-Host '  aicm.ps1 uninstall [-Purge]'
+  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-CleanCategory list] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply] [-KeepOtherJobs]'
+  Write-Host '  aicm.ps1 uninstall [-Purge] [-DryRun]   -DryRun lists what would be removed and changes nothing'
   Write-Host '  aicm.ps1 version'
 }
 
@@ -134,13 +153,14 @@ $script:JobNames = @('Update', 'Inventory', 'Clean', 'Maintenance')
 $script:DayBits = [ordered]@{ Sunday = 1; Monday = 2; Tuesday = 4; Wednesday = 8; Thursday = 16; Friday = 32; Saturday = 64 }
 
 function Get-DefaultScheduleOptions {
-  return [ordered]@{ updateAt = '05:00'; inventoryDay = 'Monday'; inventoryAt = '12:00'; cleanDay = 'Monday'; cleanAt = '12:30'; targets = ''; installMissing = $false; logRetentionDays = 30; maintenanceApply = $false }
+  return [ordered]@{ updateAt = '05:00'; inventoryDay = 'Monday'; inventoryAt = '12:00'; cleanDay = 'Monday'; cleanAt = '12:30'; cleanCategory = ''; targets = ''; installMissing = $false; logRetentionDays = 30; maintenanceApply = $false }
 }
 
 # The options given on the command line.
 function Get-ParamScheduleOptions {
   return [ordered]@{
     updateAt = $UpdateAt; inventoryDay = $InventoryDay; inventoryAt = $InventoryAt; cleanDay = $CleanDay; cleanAt = $CleanAt
+    cleanCategory = ((@($CleanCategory) | ForEach-Object { "$_" }) -join ',')
     targets = ($Targets -join ','); installMissing = [bool]$InstallMissing; logRetentionDays = $LogRetentionDays; maintenanceApply = [bool]$MaintenanceApply
   }
 }
@@ -176,6 +196,11 @@ function Get-InstalledScheduleOptions($Sched) {
     if (-not $task) { continue }
     $t = & $at $task; if ($t) { $o["$($pair[1])At"] = $t }
     $d = & $day $task; if ($d) { $o["$($pair[1])Day"] = $d }
+    if ($pair[0] -eq 'Clean') {
+      $a = [string]$task.Actions[0].Arguments
+      if ($a -match '-Category\s+"([^"]+)"') { $o.cleanCategory = $Matches[1] }
+      elseif ($a -match '-Category\s+(\S+)') { $o.cleanCategory = $Matches[1] }
+    }
   }
   return $o
 }
@@ -208,7 +233,9 @@ function Get-JobSpec([string]$Name, $Opt, [string]$App, [string]$Launcher) {
         Description = 'AI CLI Auto Manager: owned orphan and cache maintenance'; Text = 'hourly (dry-run unless explicitly enabled)' }
     }
     'Clean' {
-      return @{ Action = (New-TaskAction $App 'clean_ai_leftovers.ps1' $retention $Launcher); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.cleanDay -At $Opt.cleanAt)
+      $extra = @() + $retention
+      if ($Opt.cleanCategory) { $extra += @('-Category', "$($Opt.cleanCategory)") }
+      return @{ Action = (New-TaskAction $App 'clean_ai_leftovers.ps1' $extra $Launcher); Trigger = (New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Opt.cleanDay -At $Opt.cleanAt)
         Description = 'AI CLI Auto Manager: remove stale AI CLI leftovers'; Text = "every $($Opt.cleanDay) at $($Opt.cleanAt)" }
     }
   }
@@ -228,7 +255,7 @@ function Get-TaskSignature($Action, $Trigger) {
 # The clone the installed copy came from (when this runs from the installed copy itself).
 function Get-ScheduleSource([string]$App) {
   $sourceFile = Join-Path $App 'SOURCE'
-  if ((Test-AicmSamePath (Get-AicmRoot) $App) -and (Test-Path -LiteralPath $sourceFile)) { return (Get-Content -LiteralPath $sourceFile -TotalCount 1).Trim() }
+  if ((Test-AicmSamePath (Get-AicmRoot) $App) -and (Test-Path -LiteralPath $sourceFile)) { return (Read-AicmUtf8FirstLine $sourceFile) }
   return (Get-AicmRoot)
 }
 
@@ -237,9 +264,15 @@ function Get-ScheduleSource([string]$App) {
 # -Refresh: called after the installed copy was updated; keeps installedAt and does not touch the legacy task.
 function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$Refresh) {
   if (@($Want).Count -eq 0) { throw 'nothing to install: all four jobs were excluded' }
+  if ($Opt.cleanCategory) {
+    try { $Opt.cleanCategory = (@(ConvertTo-AicmCategoryList ([string]$Opt.cleanCategory)) -join ',') }
+    catch { throw $_.Exception.Message }
+  }
   foreach ($k in 'updateAt', 'inventoryAt', 'cleanAt') {
     if (-not (Test-TimeText $Opt[$k])) { throw "invalid time '$($Opt[$k])' for $k`: use HH:MM with hour 0-23 and minute 0-59, like 05:00" }
   }
+  # Options are valid. Only then claim the home (a folder this tool did not create is refused untouched).
+  Confirm-AicmHome
   $prev = Read-AicmState 'schedule'
   $jobs = New-Object System.Collections.Generic.List[string]
   $app = Sync-AicmAppCopy (Get-AicmRoot)
@@ -312,7 +345,7 @@ function Invoke-ScheduleInstall {
     # Jobs that are not being installed keep the days and times they were installed with.
     $base = Get-InstalledScheduleOptions (Read-AicmState 'schedule')
     if ($NoInventory) { $opt.inventoryDay = $base.inventoryDay; $opt.inventoryAt = $base.inventoryAt }
-    if ($NoClean) { $opt.cleanDay = $base.cleanDay; $opt.cleanAt = $base.cleanAt }
+    if ($NoClean) { $opt.cleanDay = $base.cleanDay; $opt.cleanAt = $base.cleanAt; $opt.cleanCategory = $base.cleanCategory }
     if ($NoMaintenance) { $opt.maintenanceApply = $base.maintenanceApply }
     if ($NoUpdate) { foreach ($k in 'updateAt', 'targets', 'installMissing', 'logRetentionDays') { $opt[$k] = $base[$k] } }
   }
@@ -340,45 +373,55 @@ function Remove-Schedule {
   if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
 }
 
-# What -Purge removes: only what this tool writes. Hooks, *.local.conf, repos.conf and anything else
-# the user put there stay, and the folder itself goes only when nothing is left in it. A folder
-# without the .aicm-home marker is purged only when it is the default .ai-cli-auto-manager.
-function Invoke-Purge([string]$HomeDir) {
-  if (-not (Test-Path -LiteralPath $HomeDir)) { Write-Host "nothing to purge: $HomeDir does not exist"; return }
-  if (-not (Test-Path -LiteralPath (Join-Path $HomeDir '.aicm-home')) -and (Split-Path -Leaf $HomeDir) -ne '.ai-cli-auto-manager') {
-    throw "refusing to purge ${HomeDir}: it has no .aicm-home marker, so it may not be an AI CLI Auto Manager folder"
+# The tasks `aicm.ps1 uninstall` would remove (for -DryRun).
+function Show-SchedulePreview {
+  foreach ($name in 'Update', 'Inventory', 'Clean') {
+    if (Get-AicmTask $name) { Write-Host "would remove: $($script:AicmTaskPath)$name" }
   }
-  foreach ($name in 'app', 'app.new', 'app.old', 'logs', 'state', 'archive', 'inventory.md') {
-    $item = Get-Item -LiteralPath (Join-Path $HomeDir $name) -Force -ErrorAction SilentlyContinue
-    if (-not $item) { continue }
-    if ($item -is [System.IO.DirectoryInfo]) { Remove-AicmTree $item $HomeDir } else { $item.Delete() }
-    Write-Host "removed $($item.FullName)"
-  }
-  $left = @(Get-ChildItem -LiteralPath $HomeDir -Force | Where-Object { $_.Name -ne '.aicm-home' })
-  if ($left.Count -eq 0) {
-    Remove-Item -LiteralPath (Join-Path $HomeDir '.aicm-home') -Force -ErrorAction SilentlyContinue
-    [System.IO.Directory]::Delete($HomeDir, $false)
-    Write-Host "removed $HomeDir"
-  } else {
-    Write-Host "kept $HomeDir, which still holds files you wrote: $(($left | ForEach-Object { $_.Name }) -join ' ')"
-  }
+  $file = Join-Path (Join-Path (Get-AicmHome) 'state') 'schedule.json'
+  if (Test-Path -LiteralPath $file) { Write-Host "would remove $file" }
 }
 
 # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless -Purge.
+# Everything is checked before anything is changed; -DryRun only lists what would go.
 function Invoke-Uninstall {
+  $app = Get-AicmAppDir
+  $homeDir = Get-AicmHome
+  $removeApp = $false
+  $busy = Get-AicmBusyOperation
+  if ($busy) {
+    if ($DryRun) { Write-Host "note: $busy; uninstall would refuse to run now" }
+    else { throw "refusing to uninstall while $busy; nothing was changed; run it again when that has finished" }
+  }
+  $appItem = Get-Item -LiteralPath $app -Force -ErrorAction SilentlyContinue
+  # Only a folder that holds an installed copy (it has the SOURCE file) is removed, and only when it holds
+  # nothing a copy never has.
+  if ($appItem -and ((Test-AicmLink $appItem) -or (Test-Path -LiteralPath (Join-Path $app 'SOURCE'))) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
+    if (-not (Test-AicmAppCopyOwned $app)) {
+      throw "refusing to remove ${app}: $($script:AicmHomeProblem); move your files out of it and run again (nothing was changed)"
+    }
+    $removeApp = $true
+  }
+  if ($Purge -and (Test-Path -LiteralPath $homeDir) -and (Get-AicmHomeStatus) -eq 'foreign') {
+    throw "refusing to purge ${homeDir}: $($script:AicmHomeProblem); nothing was changed. 'aicm.ps1 uninstall' without -Purge removes only the tasks and the installed copy"
+  }
+  if ($DryRun) {
+    Show-SchedulePreview
+    if ($removeApp) { Write-Host "would remove installed copy: $app" }
+    if ($Purge) { Invoke-AicmPurge $homeDir -DryRun }
+    else { Write-Host "would keep $homeDir (logs, state, archive, local rules); add -Purge to remove it too"; Write-Host 'dry run: nothing was changed' }
+    return
+  }
   Remove-Schedule
   if (Get-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -ErrorAction SilentlyContinue) {
     Write-Host "note: the legacy task '\$legacyTaskName' is still registered; remove it with: Unregister-ScheduledTask -TaskName '$legacyTaskName'"
   }
-  $app = Get-AicmAppDir
-  # Only a folder that holds an installed copy (it has the SOURCE file) is removed.
-  if ((Test-Path -LiteralPath (Join-Path $app 'SOURCE')) -and -not (Test-AicmSamePath (Get-AicmRoot) $app)) {
-    Remove-AicmTree ([System.IO.DirectoryInfo]::new($app)) (Get-AicmHome)
+  if ($removeApp) {
+    Remove-AicmTree ([System.IO.DirectoryInfo]::new($app)) $homeDir
     Write-Host "removed installed copy: $app"
   }
-  $homeDir = Get-AicmHome
   if ($Purge) {
-    Invoke-Purge $homeDir
+    Invoke-AicmPurge $homeDir
   } else {
     Write-Host "kept $homeDir (logs, state, archive, local rules); add -Purge to remove it too"
   }
@@ -423,7 +466,37 @@ function Get-DoctorProblems {
   try { [void]@(Read-AicmCatalog) } catch { $problems.Add("catalog error: $($_.Exception.Message)") }
   try { [void]@(Read-AicmRules (Join-Path (Get-AicmRoot) 'rules\clean-rules.conf') (Join-Path (Get-AicmHome) 'clean-rules.local.conf')) }
   catch { $problems.Add("rules file error: $($_.Exception.Message)") }
+  # Settings the scheduled runs need, checked the way the runs check them (read only): the home folder,
+  # the optional update policy (the updater refuses to start while it is invalid, or while it exists and
+  # Node.js is missing) and the installed copy the tasks start. Task results are checked above
+  # (Get-AicmTaskProblems reads LastTaskResult).
+  if ((Get-AicmHomeStatus) -eq 'foreign') { $problems.Add("AICM_HOME is not usable, so every run refuses to start: $($script:AicmHomeProblem)") }
+  try { Initialize-AicmUpdatePolicy (Get-AicmMinReleaseAgeDays) }
+  catch { $problems.Add("$($_.Exception.Message); the daily update refuses to run until it is fixed (file: $(Join-Path (Get-AicmHome) 'update-policy.json'))") }
+  if ($sched -and @($sched.jobs).Count -gt 0 -and $sched.PSObject.Properties['app'] -and $sched.app -and -not (Test-Path -LiteralPath (Join-Path ([string]$sched.app) 'bin\aicm.ps1'))) {
+    $problems.Add("the scheduled tasks start $($sched.app), which is missing or incomplete; run: aicm.ps1 schedule install")
+  }
   return $problems
+}
+
+# What the tasks run and where it came from; also notes optional prerequisites that are missing.
+function Get-DoctorInfo {
+  $app = Get-AicmAppDir
+  $version = Read-AicmUtf8FirstLine (Join-Path $app 'VERSION')
+  if ($version) {
+    $source = Read-AicmUtf8FirstLine (Join-Path $app 'SOURCE')
+    $sourceVersion = if ($source) { Read-AicmUtf8FirstLine (Join-Path $source 'VERSION') } else { '' }
+    if (-not $sourceVersion) { $sourceVersion = 'missing' }
+    $shownSource = if ($source) { $source } else { 'unknown' }
+    "info: installed copy $app version $version; source $shownSource (version $sourceVersion)"
+  } else {
+    "info: no installed copy in $app; this command runs from $(Get-AicmRoot) (version $(Get-AicmVersion))"
+  }
+  $node = Resolve-AicmExecutable 'node'
+  if ($node) { "info: Node.js $node" }
+  else { 'info: Node.js not found; archive rules, restore, history, an update policy and the worktree/config/process checks need it' }
+  $policy = Join-Path (Get-AicmHome) 'update-policy.json'
+  if (Test-Path -LiteralPath $policy) { "info: update policy $policy" }
 }
 
 # The last $Count notifications (they may never have shown on screen).
@@ -438,8 +511,22 @@ function Invoke-Child([string]$Script, [hashtable]$Splat) {
   exit $LASTEXITCODE
 }
 
-# The commands that write into AICM_HOME mark it as ours (uninstall never does).
-if ($Command -in @('update', 'inventory', 'clean', 'schedule')) { Set-AicmHomeMarker }
+# The dispatcher never marks AICM_HOME. update, inventory and clean claim it themselves after their
+# arguments are valid and only for a real run, so help, a bad flag or a preview leaves it untouched.
+if ($Command -eq 'clean' -and $Category.Count -gt 0) {
+  try { [void](ConvertTo-AicmCategoryList (($Category | ForEach-Object { "$_" }) -join ',')) }
+  catch { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }
+}
+if ($Command -eq 'schedule' -and $Action -eq 'install' -and $PSBoundParameters.ContainsKey('CleanCategory')) {
+  $cc = (@($CleanCategory) | ForEach-Object { "$_" }) -join ','
+  if (-not "$cc".Trim()) { [Console]::Error.WriteLine('-CleanCategory needs a value'); exit 2 }
+  try { [void](ConvertTo-AicmCategoryList $cc) } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 2 }
+}
+
+# worktrees, config and processes record their results in state\: claim the home first.
+if ($Command -in @('worktrees', 'config', 'processes')) {
+  try { Confirm-AicmHome } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+}
 
 switch ($Command) {
   'help' { Show-Help }
@@ -466,12 +553,14 @@ switch ($Command) {
   'config' { $null = Invoke-AicmNodeModule 'config-drift' @() }
   'run' {
     if (-not $Cli) { throw 'run needs -Cli command [-CliArguments args]' }
+    Confirm-AicmHome
     Initialize-AicmProcessContainment -WholeProcess
     & $Cli @CliArguments
     exit $LASTEXITCODE
   }
   'maintenance' {
-    Initialize-AicmProcessContainment
+    Confirm-AicmHome
+    Initialize-AicmProcessContainment -OwnSession
     $nodeArgs = @()
     if ($Apply -and -not $DryRun) { $nodeArgs += '--apply' } else { $nodeArgs += '--dry-run' }
     if ($Json) { $nodeArgs += '--json' }
@@ -500,10 +589,63 @@ switch ($Command) {
     if ($MinAgeHours -gt 0) { $nodeArgs += @('--min-age-hours', "$MinAgeHours") }
     $null = Invoke-AicmNodeModule 'processes' $nodeArgs
   }
+  'optimize' {
+    # Arguments are checked before anything else; a preview runs no tool and writes nothing. -Apply
+    # claims the home and refuses while an update, cleanup, archive or restore runs (lib\optimize.js
+    # then holds the maintenance lock itself).
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine('aicm optimize needs Node.js'); exit 1 }
+    $optJs = Join-Path (Get-AicmRoot) 'lib\optimize.js'
+    if (-not (Test-Path -LiteralPath $optJs)) { [Console]::Error.WriteLine('aicm optimize: lib\optimize.js is missing from this copy'); exit 1 }
+    $optArgs = @()
+    if ($Apply) { $optArgs += '--apply' }
+    if ($DryRun) { $optArgs += '--dry-run' }
+    if ($PSBoundParameters.ContainsKey('Tasks')) { $optArgs += @('--tasks', ((@($Tasks) | ForEach-Object { "$_" }) -join ',')) }
+    if ($Json) { $optArgs += '--json' }
+    & node $optJs '--check' @optArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($Apply) {
+      $refusal = ''
+      try { Confirm-AicmHome } catch { $refusal = "AICM_HOME: $($_.Exception.Message)" }
+      if (-not $refusal) { $refusal = Get-AicmBusyOperation }
+      if ($refusal) { & node $optJs '--refuse' $refusal @optArgs; exit 1 }
+    }
+    & node $optJs @optArgs
+    exit $LASTEXITCODE
+  }
+  'archive' {
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine('aicm archive needs Node.js'); exit 1 }
+    $sub = if ($Action) { $Action } else { 'list' }
+    $nodeArgs = @((Join-Path (Get-AicmRoot) 'lib\maintenance-cli.js'), 'archive', $sub)
+    if ($Json) { $nodeArgs += '--json' }
+    if ($DryRun) { $nodeArgs += '--dry-run' }
+    if ($PSBoundParameters.ContainsKey('Limit')) { $nodeArgs += @('--limit', "$Limit") }
+    if ($PSBoundParameters.ContainsKey('Offset')) { $nodeArgs += @('--offset', "$Offset") }
+    & node @nodeArgs
+    exit $LASTEXITCODE
+  }
+  'restore' {
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine('aicm restore needs Node.js'); exit 1 }
+    $id = if ($ArchiveId) { $ArchiveId } else { $Action }
+    $nodeArgs = @((Join-Path (Get-AicmRoot) 'lib\maintenance-cli.js'), 'restore', $id)
+    if ($DryRun) { $nodeArgs += '--dry-run' }
+    if ($Json) { $nodeArgs += '--json' }
+    & node @nodeArgs
+    exit $LASTEXITCODE
+  }
+  'history' {
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) { [Console]::Error.WriteLine('aicm history needs Node.js'); exit 1 }
+    $nodeArgs = @((Join-Path (Get-AicmRoot) 'lib\maintenance-cli.js'), 'history', '--limit', "$Limit")
+    if ($Json) { $nodeArgs += '--json' }
+    & node @nodeArgs
+    exit $LASTEXITCODE
+  }
   'clean' {
     $splat = @{ LogRetentionDays = $LogRetentionDays }
     if ($DryRun) { $splat.DryRun = $true }
     if ($Rules.Count -gt 0) { $splat.Rules = $Rules }
+    if ($Category.Count -gt 0) { $splat.Category = $Category }
+    if ($Json) { $splat.Json = $true }
+    if ($Explain) { $splat.Explain = $true }
     Invoke-Child 'clean_ai_leftovers.ps1' $splat
   }
   'status' {
@@ -541,7 +683,8 @@ switch ($Command) {
   }
   'doctor' {
     $problems = @(Get-DoctorProblems)
-    if ($problems.Count -eq 0) { Write-Host 'healthy: schedules registered, recent runs succeeded' }
+    foreach ($line in @(Get-DoctorInfo)) { Write-Host $line }
+    if ($problems.Count -eq 0) { Write-Host 'healthy: schedules registered, recent runs succeeded, settings valid' }
     foreach ($p in $problems) { Write-Host "problem: $p" }
     $recent = @(Get-RecentNotifications 3)
     if ($recent.Count -gt 0) {

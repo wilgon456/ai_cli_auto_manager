@@ -32,6 +32,11 @@ AI 코딩 CLI를 몇 달 쓰면 세 가지가 헷갈리기 시작합니다. 무�
 
 ## 빠른 시작
 
+정리 작업은 30일 동안 쓰지 않은 대화 기록을 영구 삭제할 수 있습니다. 규칙을
+미리 확인하고 보관할 기록은 백업해 두세요. 아래 예시는 업데이트와 목록 예약만
+등록합니다. 지원하는 설치 방식과 정리 예약을 켜는 절차는
+[호환성·첫 실행 안내](docs/compatibility.md)에 있습니다.
+
 ### Windows
 
 ```powershell
@@ -39,10 +44,10 @@ git clone https://github.com/wilgon456/ai_cli_auto_manager.git
 cd ai_cli_auto_manager
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
-.\bin\aicm.ps1 inventory           # 깔린 AI CLI 목록 (아무것도 바꾸지 않음)
+.\bin\aicm.ps1 inventory           # 깔린 AI CLI와 업데이트 지원 여부 확인
 .\bin\aicm.ps1 status              # 예약 상태, 마지막 실행, 폴더별 용량과 지울 수 있는 양
 .\bin\aicm.ps1 clean -DryRun       # 지울 대상만 미리 보기
-.\bin\aicm.ps1 schedule install    # 매일 05:00 업데이트, 매주 월요일 12:00 목록·12:30 정리
+.\bin\aicm.ps1 schedule install -NoClean  # 매일 05:00 업데이트, 매주 월요일 12:00 목록
 ```
 
 ### macOS · Linux
@@ -54,7 +59,7 @@ cd ai_cli_auto_manager
 ./bin/aicm inventory
 ./bin/aicm status
 ./bin/aicm clean --dry-run
-./bin/aicm schedule install
+./bin/aicm schedule install --no-clean
 ```
 
 ## 명령
@@ -63,15 +68,20 @@ cd ai_cli_auto_manager
 | --- | --- |
 | `aicm inventory` | 깔린 AI CLI 목록을 만듭니다. `--offline`(`-Offline`)이면 최신 버전 조회를 건너뜁니다 |
 | `aicm update` | 깔린 AI CLI를 올립니다. `--dry-run`, `--targets codex,claude`, `--install-missing`, `--min-release-age-days N` |
-| `aicm clean` | 오래된 찌꺼기를 지웁니다. `--dry-run`, `--rules codex-sessions,os-temp` |
+| `aicm clean` | 오래된 찌꺼기를 지웁니다. `--dry-run`, `--rules id,id`, `--category sessions,cache,logs,temp,other` 또는 `all`, `--json`, `--explain` |
+| `aicm archive list` | 일반 아카이브 목록(최신순). `--json`, `--limit N`, `--offset N`. 예전 파일은 수동 복원 |
+| `aicm archive gc` | 다시는 복원할 수 없는 색인 기록(보관 폴더가 이미 정리됨, 복원 후 30일 지남)을 지웁니다. `--dry-run`, `--json` |
+| `aicm restore ID` | 색인된 파일 하나를 되돌립니다. `--dry-run`, `--json`. 원래 경로가 있으면 덮어쓰지 않습니다 |
+| `aicm history` | 로컬 업데이트·정리·복원 기록(최대 100건, 파일 내용은 저장하지 않음). `--limit N`, `--json` |
 | `aicm worktrees` | 세션들이 남긴 worktree와 가지. `--apply`(`-Apply`)를 줘야만 지웁니다. `--days 14` |
 | `aicm config` | 깔린 CLI끼리 MCP 서버와 스킬 비교 |
 | `aicm processes` | 세션이 끝난 뒤에도 남아 도는 에이전트 프로세스. `--kill`(`-Kill`)이면 끕니다 |
+| `aicm optimize` | 패키지 관리자 자체 명령(`npm cache verify`, `uv cache prune`, `pnpm store prune`)으로 캐시를 손봅니다. 기본은 미리보기이고 `--apply`(`-Apply`)를 줘야만 실행합니다. `--tasks npm-verify,uv-prune,pnpm-prune`, `--dry-run`, `--json`. Node.js가 필요합니다 |
 | `aicm status` | 예약 상태, 마지막 실행 결과, 마지막 목록, 규칙별 용량과 지울 수 있는 양을 보여 줍니다 |
-| `aicm doctor` | 예약이 사라졌거나 실행이 밀렸거나 실패했으면 문제를 적고 종료 코드 1을 냅니다 |
+| `aicm doctor` | 예약이 사라졌거나 실행이 밀렸거나 실패했을 때, 업데이트 정책이 잘못되었거나(또는 필요한 Node.js가 없을 때), `AICM_HOME`을 쓸 수 없을 때 문제를 적고 종료 코드 1을 냅니다. 설치 사본과 그 원본·버전도 보여 줍니다. 아무것도 바꾸지 않습니다 |
 | `aicm schedule install` | 업데이트·목록·정리 예약을 등록합니다. 다시 실행하면 같은 작업을 덮어씁니다 |
 | `aicm schedule remove` | 등록한 예약을 지웁니다 |
-| `aicm uninstall` | 예약과 설치 사본을 지웁니다. `--purge`(`-Purge`)면 로그·상태·아카이브까지 지웁니다 |
+| `aicm uninstall` | 예약과 설치 사본을 지웁니다. `--purge`(`-Purge`)면 이 도구가 쓴 로그·상태·아카이브까지 지웁니다. `--dry-run`(`-DryRun`)은 지울 것만 보여 주고 아무것도 바꾸지 않습니다 |
 | `aicm version` | 버전을 출력합니다 |
 
 Windows에서는 `.\bin\aicm.ps1 <명령>`을 쓰고, 옵션은 `-DryRun`, `-Targets`, `-Rules`처럼 PowerShell 방식으로 줍니다.
@@ -83,13 +93,13 @@ Windows에서는 `.\bin\aicm.ps1 <명령>`을 쓰고, 옵션은 `-DryRun`, `-Tar
 ```text
 CLI                  via         version        latest         state     daily update
 Claude Code          npm         2.1.288        2.1.291        held      yes
-OpenAI Codex         standalone  0.157.1        0.160.1        behind    no: the update refreshes the npm copy, not the one on PATH
+OpenAI Codex         standalone  0.157.1        0.160.1        behind    no: update the PATH copy with its owning app or installer
                      npm copy 0.160.1 is also installed, but PATH runs C:\...\OpenAI\Codex\bin\codex.exe
 Grok Build           standalone  1.0.46         1.0.46         current   yes
 Cursor Agent         standalone  2026.09.18                    installed yes
 ```
 
-`state`가 `held`이면 더 새 버전이 나왔지만 아직 3일 대기 중이라는 뜻입니다. `daily update` 칸이 `no`이면 매일 업데이트가 그 CLI에 닿지 않는다는 뜻이고, 이유를 함께 적습니다. 위 Codex처럼 터미널이 실행하는 사본과 업데이트가 올리는 사본이 다르면 여기서 드러나고, 처음 발견될 때 해결 방법과 함께 알림이 뜹니다.
+`state`가 `held`이면 더 새 버전이 나왔지만 아직 3일 대기 중이라는 뜻입니다. `daily update` 칸이 `no`이면 매일 업데이트가 그 CLI에 닿지 않는다는 뜻이고, 이유를 함께 적습니다. 위 Codex처럼 자동 업데이트를 지원하지 않는 사본이 PATH에서 npm 설치보다 먼저 선택되면, 선택된 경로를 보여 주고 처음 발견할 때 해결 방법을 알립니다. 업데이트는 PATH가 선택한 설치를 기준으로 진행합니다.
 결과는 `~/.ai-cli-auto-manager/inventory.md`(사람이 읽는 표)와 `state/inventory.json`에 남습니다. 카탈로그에 없는 전역 npm 패키지는 표 아래에 따로 적습니다.
 
 카탈로그에 CLI를 더하려면 `~/.ai-cli-auto-manager/ai-clis.local.conf`에 같은 형식으로 적습니다. `id`가 같으면 기본 줄을 대신합니다.
@@ -143,7 +153,30 @@ my-agent  | myagent | My Agent  | @me/my-agent   |      |        |             |
 - **Homebrew Codex의 터미널 호스트가 실행됩니다.** cask로 받은 파일에는 격리 표시가 붙습니다. 그래서 `codex-code-mode-host`를 처음 실행할 때 Gatekeeper가 "인터넷에서 다운로드한 앱" 확인 창을 띄우고 클릭을 기다립니다. 원격으로 쓰거나 자리를 비운 Mac에서는 아무도 누르지 않아 호스트가 실행되지 않고, 셸·편집 도구 호출이 모두 `timed out negotiating with the code-mode host`로 실패합니다. 매번 실행할 때 Codex cask 폴더의 격리 표시를 지웁니다. 단, `codesign --check-notarization`으로 OpenAI(팀 `2DC432GLL2`)가 서명하고 공증한 빌드인지 확인된 경우에만 지웁니다. 그날 업데이트가 끝나 재시도가 일찍 끝날 때도 이 확인은 합니다. `AICM_CODEX_UNQUARANTINE=0`으로 끕니다.
 - **같은 문제는 한 번만 알립니다.** 처음 생길 때 알리고, 계속되면 일주일에 한 번까지만 다시 알립니다.
 
-업데이트 경로는 PATH에서 실행하는 사본을 기준으로 고릅니다. 그 뒤에 가려진 Homebrew나 npm Codex 사본은 건드리지 않고, npm 중복 설치는 해결 방법과 함께 알립니다.
+### 업데이트 확인
+
+각 업데이트는 PATH가 고른 명령의 전과 후 경로·버전과, 제한 시간 안의 종료 상태를 기록합니다. 전에 있던 명령이 뒤에 없거나, 실패하거나, 출력이 비거나, 시간을 넘기면 실패입니다. 설치가 성공으로 끝나도 명령이 없으면 실패입니다. 버전이 그대로인 것은 최신 설치의 증거가 아닙니다. 전에 실패하던 명령이 뒤에 되면 복구로 기록합니다. 훅은 변경이 정상일 때만 돕니다. 로컬 업데이트 기록은 Node.js가 필요합니다. 자동 롤백은 없고, 버전 고정은 CLI별 선택 사항입니다(아래 참고).
+
+### CLI별 업데이트 정책
+
+`$AICM_HOME`(기본값은 macOS·리눅스 `~/.ai-cli-auto-manager`, 윈도우 `%USERPROFILE%\.ai-cli-auto-manager`)에 `update-policy.json`을 만드세요. `AICM_HOME`을 실행 전에 지정하면 정책을 다른 위치(`$AICM_HOME/update-policy.json`)에 둘 수 있습니다. 정책 검증과 실제 Unix 업데이트의 프로세스 격리에 Node.js가 필요합니다. 형식은 엄격합니다. 모르는 필드나 CLI id, 잘못된 타입, 깨진 JSON, 파일 자리에 디렉터리나 끊긴 링크가 있으면 로그·잠금·상태 파일을 만들기 전에 실행을 거절합니다.
+
+```json
+{
+  "schemaVersion": 1,
+  "tools": {
+    "claude": { "exclude": true },
+    "codex": { "pin": "0.42.0", "minReleaseAgeDays": 14 }
+  }
+}
+```
+
+- `gpt`는 `codex`의 별칭입니다. 둘 중 하나만 설정하고 절대 함께 쓰지 마세요. 둘 다 있으면 별칭 충돌로 거부됩니다.
+- `exclude`는 명시적 `--targets`, `--install-missing`, 중단된 설치 복구, Codex cask 격리 해제/재활용보다 우선합니다. 제외된 CLI는 버전 검사를 하지 않으므로 깨진 `--version`이 실행을 실패시키지 않습니다.
+- `pin`은 정확한 정식 버전이며, 이 관리자가 npm으로 업데이트하는 CLI에만 쓸 수 있습니다(Amp의 타임스탬프/해시 버전 포함). 범위·태그·시험판·URL은 거부합니다. 고정한 버전도 배포 중이고 폐기되지 않았으며 유효 대기 기간을 넘겨야 합니다. 핀은 최신으로 대체되지 않고, 더 새로 깔린 사본을 내리지도 않습니다. npm이 아닌 경로에서는 수동 조치용으로 보류합니다.
+- `minReleaseAgeDays`(0~3650)는 그 CLI에 `AICM_MIN_RELEASE_AGE_DAYS` 대신 적용됩니다. 양수 나이거나 핀은 네이티브·Homebrew·설치 스크립트 사본에서 지킬 수 없어 그 경로를 보류합니다. 명시적 `0`이면 네이티브 경로를 그대로 실행합니다.
+- 규칙이 하나라도 있으면 npm 백업 정리를 멈추므로, 유일한 사본인 백업을 지우지 않습니다. 핀이 걸린 상태에서 중단된 npm 설치는 확인 없이 다시 깔지 않고 보류하며, 수동 `npm install -g` 명령과 함께 백업·상태 항목을 남깁니다.
+- 저장하는 지문에는 정규화된 규칙과 전역 대기 기간이 들어갑니다. 예약 재시도는 같은 지문·대상·날짜일 때만 건너뛰고, 정책을 바꾸거나 지우면 같은 날에도 다시 실행합니다.
 
 ### 업데이트 뒤에 할 일 (훅)
 
@@ -167,10 +200,25 @@ macOS·Linux에서는 `lsof`로 사용 중인지 확인하며, 도구가 없거�
 막는 파일 핸들을 유지합니다. DB가 닫혀 있어도 보조 파일이 열려 있으면 지우지 않습니다.
 
 브라우저 캐시·오래된 보관 폴더 안에 보호 파일, 링크 또는 사용 여부를 확인할 수 없는
-파일이 있으면 폴더 전체를 남깁니다. Windows의 날짜 기준 정리는 SQLite 묶음의 모든
-파일이 날짜·패턴 조건에 맞을 때만 함께 삭제합니다. 읽기 전용이거나 예상과 다른 보조
-파일이 있으면 전체를 보존합니다. Windows 설치 사본 관리에서는 사용자가 지정한
+파일이 있으면 폴더 전체를 남깁니다. 모든 운영체제에서 날짜 기준 정리(`age`, `age-files`)는
+SQLite 묶음(`*.sqlite`, `*.sqliteN`, `*.db`와 `-wal`, `-shm`, `-journal`)의 모든 파일이 날짜·패턴
+조건에 맞을 때만 함께 삭제합니다. 더 새로운 파일(예: 커밋된 내용을 아직 담은 최신 WAL), 읽기
+전용·링크이거나 예상과 다른 보조 파일이 있으면 전체를 보존합니다. macOS·Linux에서는 `lsof`로
+묶음 전체가 쓰이지 않음을 확인해야 하며, `lsof`가 없거나 실패하거나 열린 파일이 있으면 남깁니다.
+본 DB가 없는 보조 파일 하나는 그 하나가 묶음입니다. 다른 캐시 파일은 계속 한 번에 지웁니다. Windows 설치 사본 관리에서는 사용자가 지정한
 `AICM_HOME`의 junction을 허용하며, 사용자 데이터 정리는 연결 경로를 계속 거부합니다.
+
+`--category`는 돌릴 규칙을 고릅니다. 이름은 `sessions`, `cache`, `logs`, `temp`, `other`, `all`(생략 시 기본)입니다. `--rules`와 교집합으로 적용되며, 꺼진 규칙을 켜지 않습니다. `gemini-tmp`와 `qwen-tmp`는 세션이지 캐시가 아닙니다. `--explain`은 읽기 전용으로, 규칙마다 한 줄(나이, 한도, 동작, 보호 대상)입니다. `--json`은 그 선택에 대한 문서 하나이며 파일 목록이 아닙니다. 일반 아카이브 이동·삭제와 `aicm archive` / `restore` / `history`는 Node.js가 필요합니다. Node가 없어도 일반 날짜·명령 정리는 돕니다. 실제 정리는 로컬 기록을 최대 100건까지 남기며 파일 내용은 넣지 않습니다. 미리보기는 기록을 쓰지 않습니다. `aicm restore`는 원래 경로가 있으면 덮어쓰지 않습니다. 예전 아카이브 파일은 수동으로 옮기라고만 보여 줍니다. Codex 자체 세션은 일반 복원 id가 아닙니다.
+
+```sh
+aicm clean --category cache --dry-run --json
+aicm restore ID --dry-run
+```
+
+```powershell
+.\bin\aicm.ps1 clean -Category cache,logs -Json -DryRun
+# schedule install -CleanCategory 'cache,logs' 또는 배열. 둘 다 같은 값으로 정규화됩니다
+```
 
 기본 규칙은 [`rules/clean-rules.conf`](rules/clean-rules.conf) 한 파일에 있고, Windows와 macOS·Linux가 같은 파일을 읽습니다. 기준은 처음 만든 날이 아니라 마지막으로 쓴 날이라서, 지금 이어서 쓰는 긴 대화는 지워지지 않습니다. 대부분의 규칙은 폴더 바로 아래 항목(세션 폴더 등)을 한 덩어리로 보고, 그 안이 정해 둔 날 동안 하나도 안 바뀌었을 때만 통째로 지웁니다. 그래서 아직 쓰는 세션이나 플러그인 폴더에서 오래된 파일만 빠져 망가지는 일이 없습니다.
 
@@ -219,7 +267,92 @@ os-temp             | windows | age         | {temp}                        | * 
 my-notebook-cache   | all     | age         | ~/.cache/my-tool              | *.tmp     | 14   |       | on      | 내 규칙 추가
 ```
 
-`kind`는 일곱 가지입니다. `age`는 폴더 바로 아래 항목(세션 폴더, 파일) 하나를 한 덩어리로 보고, 그 안이 `days` 동안 하나도 안 바뀌었을 때만 통째로 지웁니다. 그래서 쓰고 있는 폴더를 파일 몇 개만 지워 망가뜨리지 않습니다. `age-files`는 폴더 아래 어디든 `days`보다 오래된 파일을 하나씩 지웁니다(항목이 서로 독립인 캐시용). `codex`는 Codex 공식 명령으로 지우거나(`limit` 0) 아카이브 후 지웁니다. `archive`는 아카이브로 옮겼다가 `limit`일 뒤 지웁니다. `cap`은 바로 아래 파일 중 날짜가 지났거나 크기(MB)를 넘은 것을 지웁니다. `keep-latest`는 `이름-숫자` 꼴 폴더에서 이름별로 최신 몇 개만 남깁니다. `command`는 도구가 제공하는 정리 명령을 실행합니다.
+`kind`는 여덟 가지입니다. `age`는 폴더 바로 아래 항목(세션 폴더, 파일) 하나를 한 덩어리로 보고, 그 안이 `days` 동안 하나도 안 바뀌었을 때만 통째로 지웁니다. 그래서 쓰고 있는 폴더를 파일 몇 개만 지워 망가뜨리지 않습니다. `age-files`는 폴더 아래 어디든 `days`보다 오래된 파일을 하나씩 지웁니다(항목이 서로 독립인 캐시용). `codex`는 Codex 공식 명령으로 지우거나(`limit` 0) 아카이브 후 지웁니다. `archive`는 아카이브로 옮겼다가 `limit`일 뒤 지웁니다. `cap`은 바로 아래 파일 중 날짜가 지났거나 크기(MB)를 넘은 것을 지웁니다(파일 하나하나 기준). `budget`은 캐시 폴더 하나의 전체 크기를 `limit` MiB 이하로 유지합니다(아래 참고). `keep-latest`는 `이름-숫자` 꼴 폴더에서 이름별로 최신 몇 개만 남깁니다. `command`는 도구가 제공하는 정리 명령을 실행합니다.
+
+### 캐시 용량 한도 (선택)
+
+`budget` 규칙은 항목이 서로 독립인 캐시 폴더 하나(npm `_cacache`, pip 캐시)의 **전체** 논리 크기에
+한도를 둡니다. 기본 규칙 중 이 종류를 쓰는 것은 없고, 기본값은 계속 날짜 기준입니다. 쓰려면
+`clean-rules.local.conf`에서 규칙을 바꿉니다. 예:
+
+```text
+# id      | os   | kind   | path            | pattern | days | limit | default | note
+npm-cache | unix | budget | ~/.npm/_cacache | *       | 14   | 2048  | on      | npm 캐시를 2 GiB 아래로
+pip-cache | mac  | budget | ~/Library/Caches/pip | *  | 7    | 1024  | on      | pip 캐시를 1 GiB 아래로
+```
+
+`days`(1 이상)는 지워도 되는 최소 나이, `limit`(1 이상)은 MiB 단위 한도입니다. 0, 빈 값, 잘못된
+값은 실행 전에 거부합니다. 동작:
+
+- 규칙 폴더를 재귀로 훑습니다(링크는 들어가지도 따라가지도 않습니다). 보호·최근·하드 링크·SQLite·
+  열린 파일까지 **모든** 일반 파일이 합계에 들어갑니다.
+- 후보는 `pattern`에 맞고, `days`보다 오래되고, 링크가 하나뿐이고, 보호 대상이 아니고, SQLite
+  파일·부속 파일(`*.sqlite*`, `*.db`, `-wal`, `-shm`, `-journal`)이 아닌 파일뿐입니다. 수정 시각이
+  오래된 것부터(같으면 경로순) 합계가 한도 이하가 될 때까지 지웁니다. 접근 시각을 추적하지 않으므로
+  LRU(최근 사용 순)가 *아닙니다*.
+- 지우기 직전에 파일을 다시 확인합니다(같은 종류·크기·시각·식별자, 규칙 폴더까지 링크 없음, 규칙
+  폴더 자체가 옮겨지거나 링크로 바뀌지 않음). 열린 파일이면 안 지웁니다: macOS/Linux는 `lsof`(없거나
+  실패하면 아무것도 안 지움), Windows는 FileGuard 독점 핸들. 확인 직후 다른 프로그램이 여는 경쟁을
+  좁힐 뿐 완전히 없애지는 못합니다.
+- 훑기가 끝까지 못 가면(읽을 수 없는 폴더·파일, 상한 `AICM_BUDGET_MAX_FILES` 200000,
+  `AICM_BUDGET_MAX_DEPTH` 32, `AICM_BUDGET_SCAN_SECONDS` 300) 그 규칙은 아무것도 지우지 않고
+  알려 줍니다. 다른 규칙은 그대로 돕니다.
+- 사용 중이거나 보호된 데이터 때문에 한도를 못 맞추면 얼마나 넘는지 알려 줍니다("budget not reachable").
+
+budget 규칙의 JSON 행에는 `totalBytes`(실행 전 합계), `budgetBytes`, `remainingBytes`(실제 실행 뒤
+다시 센 값, 미리보기는 합계 그대로), `projectedRemainingBytes`(선택대로 지웠을 때 남을 양. Windows
+미리보기는 파일을 열지 않으므로 후보가 사용 중이 아니라고 가정), `budgetUnmetBytes`, `scanStatus`
+(`complete`, `partial`, `unavailable`)가 더해집니다. 모두 **논리 파일 크기**이고 실제로 늘어난 디스크
+여유 공간을 잰 값이 아닙니다(하드 링크·압축·희소 파일·블록 크기 때문에 다릅니다). 2 GiB를 넘어도
+바이트 수는 정확합니다. 한도는 캐시 폴더 단위입니다. npm 캐시 하나를 같이 쓰는 CLI 여러 개는 한도
+하나를 나눠 씁니다. 지운 항목은 도구가 다시 필요할 때 내려받습니다.
+
+## 최적화 (선택)
+
+`aicm optimize`는 패키지 관리자 자체 유지 보수 명령 중 정해진 것만 실행합니다. 다른 명령은 실행할 수
+없습니다. 임의 명령, `npm install`/`update`/`dlx`/`npx`는 없습니다.
+
+| 작업 | 명령 | 효과 |
+| --- | --- | --- |
+| `npm-verify` | `npm cache verify` | npm 캐시를 검사하고 필요 없는 항목을 정리합니다 |
+| `uv-prune` | `uv cache prune` | uv 캐시에서 안 쓰는 항목을 지웁니다(공식 방법. uv 캐시를 손으로 지우지 마세요) |
+| `pnpm-prune` | `pnpm store prune` | 어떤 프로젝트도 참조하지 않는 패키지를 pnpm 저장소에서 지웁니다 |
+
+```sh
+aicm optimize                               # 미리보기: PATH에서 도구를 찾기만 하고 실행·기록하지 않음
+aicm optimize --tasks uv-prune --dry-run --json
+aicm optimize --apply --tasks npm-verify,pnpm-prune
+```
+
+```powershell
+.\bin\aicm.ps1 optimize -Json
+.\bin\aicm.ps1 optimize -Apply -Tasks npm-verify,uv-prune
+```
+
+- 기본값과 `--dry-run`은 미리보기입니다. PATH(절대 경로 항목만)에서 도구를 찾아 경로만 기록하고 실행하지
+  않으므로 Corepack 초기화나 다운로드도 일어나지 않습니다. 모르는·중복·빈 작업 이름, `--apply`와
+  `--dry-run`을 함께 준 경우는 아무것도 찾거나 쓰기 전에 거부합니다(종료 코드 2). 작업은 항상 위 표 순서로 돕니다.
+- `--apply`는 다른 실제 실행처럼 `AICM_HOME`을 확인·표시하고, 업데이트·정리·아카이브·복원이 도는 동안은
+  거부하며, 마지막 명령이 끝날 때까지 공유 유지 보수 잠금(`state/maintenance.lock`)을 잡습니다. 명령이
+  실패하거나 실행이 중단돼도 잠금은 그 명령이 멈춘 뒤 풀립니다.
+- 해당 패키지 관리자 프로세스가 돌고 있으면 그 작업을 건너뜁니다. 이 명령을 띄운 패키지 관리자도
+  포함하고, 최적화 프로세스 자체만 제외합니다. 프로세스 목록을 읽지 못하거나 Node/Bun 명령줄을 확인할
+  수 없을 때도 해당 npm/pnpm 작업을 건너뜁니다.
+- 각 명령은 오프라인으로 돕니다. Corepack의 네트워크·프로젝트 버전 선택·프로젝트 환경 파일·확인
+  질문·자동 고정을 끄고, npm/pnpm과 uv에도 오프라인 설정을 적용합니다. pnpm의 프로젝트 버전 자동
+  설치도 구·신 설정을 함께 사용해 끕니다. 기존 환경 변수는 대소문자와 관계없이 이 값들로 덮어씁니다.
+  아직 내려받지 않은 패키지 관리자를 부르는 Corepack shim은 내려받는 대신 실패합니다. 명령마다 시간 제한(`AICM_OPTIMIZE_TIMEOUT`, 기본 900초)이 있고, 넘으면
+  프로세스 그룹(Windows는 프로세스 트리) 전체를 멈춥니다.
+- 작업 하나가 실패해도 다른 작업은 돕니다. 없는 도구는 `unavailable`이고, 실패·시간 초과·건너뜀은 성공으로
+  세지 않습니다. 선택한 작업이 모두 성공했을 때만 종료 코드가 0입니다.
+- Windows에서 `.cmd`/`.bat` shim(npm, pnpm)은 `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`로, 따옴표로
+  감싼 경로와 위의 고정 단어만 넘겨 실행합니다. 경로에 `" % ! ^ & | < > ( )`가 있으면 거부하고, `.ps1`
+  shim은 실행하지 않습니다.
+- 이 명령들은 바이트 단위로 정확한 트랜잭션이 아닙니다. 미리보기는 얼마나 지울지 알 수 없고, 정리된 패키지는
+  나중에 다시 내려받습니다. optimize 예약은 없습니다. 직접 실행하세요.
+- `--json`은 문서 하나를 냅니다: `schemaVersion`, `mode`(`preview`/`apply`), `status`, 작업별 행(`id`,
+  `command`, `executable`, `status`: `would-run`, `ok`, `failed`, `timeout`, `busy`, `skipped`, `refused`,
+  `unavailable`, `reason`, `exitCode`, `durationMs`, 마지막 출력), `summary` 개수.
 
 ## 여러 세션을 돌릴 때 (Paseo, Orca 등)
 
@@ -283,7 +416,34 @@ Windows는 PC가 꺼져 있어 시각을 놓치면 다음에 켜질 때 실행�
 
 로그는 30일 지나면 지웁니다. 기간은 `LOG_RETENTION_DAYS` 환경 변수(Windows는 `-LogRetentionDays`도 됨)로 바꿉니다. 위치는 `AICM_HOME` 환경 변수로 바꿀 수 있습니다.
 
-`uninstall --purge`(`-Purge`)는 이 도구가 만든 것(`app`, `logs`, `state`, `archive`, `inventory.md`)만 지우고, 직접 넣은 파일(`hooks/`, `*.local.conf`, `repos.conf`)은 남깁니다. 폴더는 안이 비었을 때만 지웁니다. `.aicm-home` 표시 파일이 없는 폴더는 기본 위치 `~/.ai-cli-auto-manager`일 때만 지웁니다.
+### 이 도구가 쓰는 폴더
+
+`AICM_HOME`은 새 폴더이거나 비어 있을 때, 이 도구가 쓴 `.aicm-home` 표시 파일이 있을 때, 또는
+설치 사본(`SOURCE`와 `VERSION`이 있는 `app`)이 있고 그 밖에는 이 도구가 쓰는 것(`logs`, `state`,
+`archive`, `inventory.md`)과 사용자가 넣는 것(`hooks/`, `*.local.conf`, `repos.conf`,
+`update-policy.json`)만 있는 예전 버전의 폴더일 때만 씁니다. 예전 버전 폴더는 처음 실제로 실행할
+때 표시 파일을 붙입니다. 그 밖의 경우, 즉 폴더 이름(`.ai-cli-auto-manager`)만 맞거나, 예약된
+폴더(`archive/<rule>/<date>`)만 있거나, 내용이 다른 표시 파일이 있거나, 홈 폴더 자체인 경우에는
+모든 실행과 `schedule install`, `--purge`가 그 안에 쓰거나 지우기 전에 멈춥니다. 도움말·잘못된
+인자·미리보기는 표시 파일을 만들지 않습니다.
+
+표시 파일이 있다고 안의 내용을 전부 믿지 않습니다. 설치 사본을 바꾸거나 지우거나 purge하기 전에
+`app`(및 `app.new`/`app.old`)에는 사본이 가진 것만 있어야 합니다. 사본은 자기 파일 목록을
+`app/.aicm-copy`에 남기므로, 그 안 어디에든 개인 파일(`app/personal.txt`, `app/lib/notes.txt`)이
+있으면 동기화나 uninstall이 지우지 않고 이유를 알리며 멈춥니다. `uninstall --purge`(`-Purge`)는
+이 도구가 쓰는 이름의 로그·상태 파일과 아카이브 색인에 (같은 크기로) 기록된 보관 파일만 지웁니다.
+색인에 없는 파일은 날짜 보관 폴더 안에 있어도, 링크로 연결된 것도 남기고 목록으로 알려 줍니다.
+직접 넣은 파일(`hooks/`, `*.local.conf`, `repos.conf`)은 남고, 폴더는 안이 비었을 때만 지웁니다.
+`uninstall --purge --dry-run`(`-Purge -DryRun`)은 예약·사본·데이터를 지우지 않고 표시 파일·로그·
+상태도 쓰지 않은 채 이 모든 것을 보여 줍니다. Windows에서 junction으로 지정한 `AICM_HOME`은
+계속 쓸 수 있고, 그 안의 링크·junction은 따라가지 않습니다.
+
+`archive list`는 색인을 최신순으로, 한 페이지에 최대 10000건 읽습니다(더 오래된 것은
+`--offset`). `archive/` 아래 파일은 색인 전체(최대 100000건)와 보관 폴더를 다 읽었을 때만
+"예전 파일(legacy)"로 표시합니다. 그렇지 못하면 JSON에 `"legacy": {"complete": false}`라고
+적고 추측하지 않습니다. 아카이브 규칙이 돈 실제 정리는 같은 유지 관리 잠금 아래에서
+`archive gc`도 실행해, 만료되었거나 복원된 지 오래된 기록이 쌓이지 않게 합니다. 대기 중이거나
+아직 복원할 수 있거나 읽을 수 없는 기록과 다른 파일은 지우지 않습니다.
 
 ## 1.x(ai_cli_auto_update)에서 옮기기
 
@@ -301,24 +461,48 @@ Windows는 PC가 꺼져 있어 시각을 놓치면 다음에 켜질 때 실행�
 shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
 bash tests/clean_test.sh
 python3 tests/cleanup_safety_test.py
+bash tests/cache_budget_test.sh
 bash tests/aicm_test.sh
 bash tests/inventory_test.sh
+python3 tests/npm_recovery_safety_test.py
 bash tests/codex_host_test.sh
+bash tests/maintenance_integration_test.sh
+bash tests/update_verify_test.sh
+bash tests/update_policy_test.sh
 node --test tests/node/*.test.js
+python3 scripts/check_manifest.py
+python3 tests/release_packaging_test.py
 ```
 
 ```powershell
 .\tests\clean_test.ps1
+.\tests\cache_budget_test.ps1
 .\tests\aicm_test.ps1
 .\tests\inventory_test.ps1
+.\tests\maintenance_json_test.ps1
+.\tests\update_policy_test.ps1
+.\tests\home_ownership_test.ps1
+.\tests\unicode_paths_test.ps1
 ```
 
+배포 담당자는 [docs/release-checklist.md](docs/release-checklist.md)를 보세요.
+
 CI는 Ubuntu, macOS(기본 내장된 bash 3.2), Windows PowerShell 5.1과 PowerShell 7에서 같은 테스트를 돌립니다.
+
+## 다음 작업
+
+이번 반복에는 정리 범주, JSON, 복원, 로컬 기록, 업데이트 확인이 들어 있습니다. 이 변경의 Windows·Linux 실실행은 아직 대기 중이며, 설정된 CI가 이 체크아웃에서 돌았다는 뜻은 아닙니다.
+
+CLI별 pin·제외·대기 기간 정책, 캐시 용량 한도(`budget`) 규칙, 선택 실행 `optimize` 명령도 이번 반복에
+들어 있습니다. 이번 배포에 없고 다음으로 미룬 것: OS DNS 캐시 비우기, macOS QuickLook 캐시 초기화, 도구
+데이터베이스의 SQLite `VACUUM`. 선택적 TUI는 그 뒤입니다.
 
 ## 한계
 
 - 개인 장비와 작은 팀을 위한 도구입니다. 조직 전체에 배포하려면 변경 관리 절차를 따로 두는 편이 좋습니다.
 - 문제가 생긴 버전으로 자동으로 되돌리는 기능은 없습니다.
+- budget과 optimize는 논리 바이트와 명령 결과를 알려 줄 뿐, 실제 디스크 여유 공간을 재지 않습니다.
+  정리된 캐시는 필요할 때 다시 내려받습니다.
 - 3일 묵히기와 서명·이상 징후 검사는 npm으로 깐 CLI에만 적용됩니다. Homebrew·winget·자체 업데이트 명령(`claude update` 등)·xAI 설치 스크립트로 올리는 CLI는 그 경로를 그대로 믿습니다.
 - Grok Build는 베타이고, 계정·구독 조건이 있을 수 있습니다.
 

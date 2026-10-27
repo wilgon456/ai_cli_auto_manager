@@ -12,18 +12,24 @@ AI CLI Auto Manager $(aicm_version)
 
   aicm update    [--dry-run] [--targets codex,claude] [--install-missing]
   aicm inventory [--offline]   list installed AI CLIs, their versions and update coverage
-  aicm clean     [--dry-run] [--rules id,id]
+  aicm clean     [--dry-run] [--rules id,id] [--category list] [--json] [--explain]
+  aicm archive list [--json] [--limit N] [--offset N]   newest first
+  aicm archive gc [--dry-run] [--json]   drop index records of expired or long-restored archives
+  aicm restore ID [--dry-run] [--json]
+  aicm history   [--limit N] [--json]
   aicm worktrees [--apply] [--days 14]   worktrees and branches agents left behind (report unless --apply)
   aicm config    MCP servers and skills compared across the installed CLIs
   aicm maintenance [--dry-run|--apply] [--json]   owned orphan/cache maintenance (dry-run by default)
   aicm run -- command [args...]   run a CLI in a contained, tagged session
   aicm processes [--kill]   owned orphans; untagged runtimes remain alert-only
+  aicm optimize  [--dry-run | --apply] [--tasks npm-verify,uv-prune,pnpm-prune] [--json]
+                 preview by default; --apply runs npm cache verify, uv cache prune, pnpm store prune (needs Node.js)
   aicm status    disk use per cleanup rule, schedules, last runs
-  aicm doctor    exit 1 when a schedule is missing or a run is overdue or failed
+  aicm doctor    exit 1 when a schedule is missing, a run is overdue or failed, or a setting is invalid
   aicm schedule  install|remove|show|refresh [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
-                                             [--clean-day mon] [--clean-at 12:30] [--targets list]
+                                             [--clean-day mon] [--clean-at 12:30] [--clean-category list] [--targets list]
                                              [--no-update] [--no-inventory] [--no-clean] [--no-maintenance] [--maintenance-apply]
-  aicm uninstall [--purge]
+  aicm uninstall [--purge] [--dry-run]   --dry-run lists what would be removed and changes nothing
   aicm version
 EOF
 }
@@ -101,19 +107,74 @@ capture_job_path() {
 # Succeeds when weekly job $1 (due on day $2, 1 = Monday .. 7 = Sunday, at HH:MM $3) completed a run
 # after its latest due time, so a daily start can skip it. Any completed run counts, also a failed one:
 # it already reported its errors, and running it again every day would only repeat them.
-weekly_done() { # job day HH:MM
-  local state="$STATE_DIR/last-clean.json" today now_hm at_hm days_back ref rc=0
-  [[ "$1" == inventory ]] && state="$STATE_DIR/inventory.json"
-  [[ -f "$state" && "$2" =~ ^[1-7]$ ]] && valid_time "$3" || return 1
+# A recorded category list covers a request only when the request names no rules and each requested
+# category is in the record. An empty request is a full clean and is not covered by a subset.
+# "all" or an empty recorded category list is the full category set.
+scope_categories_cover() { # recorded requested
+  local rec="$1" req="$2" tok
+  [[ "$rec" == all ]] && rec=""
+  [[ "$req" == all ]] && req=""
+  [[ -z "$req" && -n "$rec" ]] && return 1
+  [[ -z "$req" ]] && return 0
+  IFS=',' read -r -a _req_parts <<< "$req"
+  for tok in "${_req_parts[@]}"; do
+    [[ -n "$tok" ]] || continue
+    [[ ",$rec," == *",$tok,"* ]] || return 1
+  done
+  return 0
+}
+
+# Old last-clean files have no scope and count as a full clean. A cache-only or rule-only run does not.
+clean_scope_covers() { # state-file [scheduled args...]
+  local file="$1" req_cat="" req_rules="" rec_cat rec_rules tok
+  shift
+  if ! grep -q '"scopeCategories"' "$file" && ! grep -q '"scopeRules"' "$file"; then return 0; fi
+  rec_cat="$(aicm_json_field "$file" scopeCategories)"
+  rec_rules="$(aicm_json_field "$file" scopeRules)"
+  while (($#)); do
+    case "$1" in
+      --category) shift; req_cat="${1:-}" ;;
+      --category=*) req_cat="${1#--category=}" ;;
+      --rules) shift; req_rules="${1:-}" ;;
+      --rules=*) req_rules="${1#--rules=}" ;;
+    esac
+    shift || break
+  done
+  req_cat="${req_cat// /}"; req_rules="${req_rules// /}"
+  [[ -z "$req_cat" ]] || req_cat="$(aicm_normalize_categories "$req_cat")" || return 1
+  [[ "$rec_cat" == all || -z "$rec_cat" ]] && [[ -z "$rec_rules" ]] && return 0
+  if [[ -n "$rec_rules" ]]; then
+    [[ -n "$req_rules" ]] || return 1
+    IFS=',' read -r -a _rule_parts <<< "$req_rules"
+    for tok in "${_rule_parts[@]}"; do
+      [[ -n "$tok" ]] || continue
+      [[ ",$rec_rules," == *",$tok,"* ]] || return 1
+    done
+    scope_categories_cover "$rec_cat" "$req_cat"
+    return $?
+  fi
+  [[ -z "$req_rules" ]] || return 1
+  scope_categories_cover "$rec_cat" "$req_cat"
+}
+
+weekly_done() { # job day HH:MM [remaining job args...]
+  local state="$STATE_DIR/last-clean.json" today now_hm at_hm days_back ref rc=0 job="$1" day="$2" at="$3"
+  [[ "$job" == inventory ]] && state="$STATE_DIR/inventory.json"
+  [[ -f "$state" && "$day" =~ ^[1-7]$ ]] && valid_time "$at" || return 1
   today="$(date +%u)"; now_hm="$(date +%H%M)"
-  at_hm="$(printf '%02d%02d' "$(hm_hour "$3")" "$(hm_minute "$3")")"
-  days_back=$(( (today - $2 + 7) % 7 ))
+  at_hm="$(printf '%02d%02d' "$(hm_hour "$at")" "$(hm_minute "$at")")"
+  days_back=$(( (today - day + 7) % 7 ))
   if ((days_back == 0 && 10#$now_hm < 10#$at_hm)); then days_back=7; fi
   ref="$STATE_DIR/.weekly-due.$$"
   touch -t "$(aicm_date_days_ago "$days_back")$at_hm" "$ref" 2>/dev/null || return 1
   [[ "$state" -nt "$ref" ]] || rc=1
   rm -f "$ref"
-  return "$rc"
+  ((rc == 0)) || return 1
+  if [[ "$job" == clean ]]; then
+    shift 3
+    clean_scope_covers "$state" "$@" || return 1
+  fi
+  return 0
 }
 
 # Runs a job from its crontab line: puts the PATH captured at install first, and for a weekly job
@@ -128,7 +189,7 @@ scheduled_run() { # job [--weekly day HH:MM] args...
     (($# >= 3)) || { echo "--weekly needs a day and a time" >&2; exit 2; }
     local day="$2" at="$3"
     shift 3
-    if weekly_done "$job" "$day" "$at"; then
+    if weekly_done "$job" "$day" "$at" "$@"; then
       echo "[$(aicm_ts)] $job: this week's run already happened; nothing to do"
       exit 0
     fi
@@ -146,6 +207,7 @@ scheduled_run() { # job [--weekly day HH:MM] args...
 maintenance_run() {
   local out rc=0 line
   command -v node >/dev/null 2>&1 || { echo 'maintenance needs Node.js' >&2; return 1; }
+  aicm_claim_home || return 1
   out="$(node "$AICM_ROOT/lib/auto-maintenance.js" "$@")" || rc=$?
   [[ -z "$out" ]] || printf '%s\n' "$out"
   while IFS= read -r line; do
@@ -156,6 +218,7 @@ maintenance_run() {
 
 # Schedule options (set by schedule_install from the command line, by schedule_refresh from schedule.json).
 S_UPDATE_AT=05:00 S_INVENTORY_DAY=mon S_INVENTORY_AT=12:00 S_CLEAN_DAY=mon S_CLEAN_AT=12:30 S_TARGETS=""
+S_CLEAN_CATEGORY=""
 S_NO_UPDATE=false S_NO_INVENTORY=false S_NO_CLEAN=false S_NO_MAINTENANCE=false S_MAINTENANCE_APPLY=false
 SCHEDULE_CHANGED=false
 
@@ -241,6 +304,15 @@ schedule_install() {
       --no-inventory) S_NO_INVENTORY=true ;;
       --clean-day) shift; S_CLEAN_DAY="${1:-}" ;;
       --clean-at) shift; S_CLEAN_AT="${1:-}" ;;
+      --clean-category)
+        shift
+        [[ -n "${1:-}" ]] || { echo "--clean-category needs a value" >&2; exit 2; }
+        S_CLEAN_CATEGORY="$1"
+        ;;
+      --clean-category=*)
+        S_CLEAN_CATEGORY="${1#--clean-category=}"
+        [[ -n "$S_CLEAN_CATEGORY" ]] || { echo "--clean-category needs a value" >&2; exit 2; }
+        ;;
       --targets) shift; S_TARGETS="${1:-}" ;;
       --no-update) S_NO_UPDATE=true ;;
       --no-clean) S_NO_CLEAN=true ;;
@@ -291,6 +363,16 @@ schedule_options_from_jobs() {
     if [[ -n "$line" ]]; then S_INVENTORY_DAY="${line% *}"; S_INVENTORY_AT="${line#* }"; fi
     line="$(cron_aicm_lines | grep '# aicm:clean$' | sed -n 's/.* --weekly \([1-7]\) \([0-9:]*\) .*/\1 \2/p' | head -n 1)"
     if [[ -n "$line" ]]; then S_CLEAN_DAY="${line% *}"; S_CLEAN_AT="${line#* }"; fi
+    line="$(cron_aicm_lines | grep '# aicm:clean$' | head -n 1)"
+    if [[ "$line" == *" --category "* ]]; then
+      S_CLEAN_CATEGORY="${line#* --category }"; S_CLEAN_CATEGORY="${S_CLEAN_CATEGORY%% *}"
+    fi
+  fi
+  if [[ "$(aicm_os)" == mac ]]; then
+    local plist="$HOME/Library/LaunchAgents/$AICM_LAUNCHD_PREFIX.clean.plist"
+    if [[ -f "$plist" ]]; then
+      S_CLEAN_CATEGORY="$(awk '/<string>--category<\/string>/ { getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$plist")"
+    fi
   fi
   # Crontab and plists hold plain numbers: 13:5 becomes 13:05.
   local v
@@ -311,6 +393,7 @@ schedule_refresh() {
     S_UPDATE_AT="$(aicm_json_field "$file" updateAt)"; S_INVENTORY_DAY="$(aicm_json_field "$file" inventoryDay)"
     S_INVENTORY_AT="$(aicm_json_field "$file" inventoryAt)"; S_CLEAN_DAY="$(aicm_json_field "$file" cleanDay)"
     S_CLEAN_AT="$(aicm_json_field "$file" cleanAt)"; S_TARGETS="$(aicm_json_field "$file" targets)"
+    S_CLEAN_CATEGORY="$(aicm_json_field "$file" cleanCategory)"
   else
     schedule_options_from_jobs
   fi
@@ -330,11 +413,19 @@ schedule_apply() {
   for t in "$S_UPDATE_AT" "$S_INVENTORY_AT" "$S_CLEAN_AT"; do
     valid_time "$t" || { echo "invalid time '$t': use HH:MM with hour 0-23 and minute 0-59, like 05:00" >&2; exit 2; }
   done
+  # Reject a bad category before any job, copy or schedule.json change.
+  if [[ -n "$S_CLEAN_CATEGORY" ]]; then
+    local norm
+    norm="$(aicm_normalize_categories "$S_CLEAN_CATEGORY")" || exit 2
+    S_CLEAN_CATEGORY="$norm"
+  fi
   # 6:5 read back from a crontab line is stored as 06:05.
   S_UPDATE_AT="$(hm_text "$S_UPDATE_AT")"; S_INVENTORY_AT="$(hm_text "$S_INVENTORY_AT")"; S_CLEAN_AT="$(hm_text "$S_CLEAN_AT")"
   [[ "$S_NO_UPDATE" == true && "$S_NO_INVENTORY" == true && "$S_NO_CLEAN" == true && "$S_NO_MAINTENANCE" == true ]] && { echo "nothing to install" >&2; exit 2; }
   local maintenance_mode=dry-run
   [[ "$S_MAINTENANCE_APPLY" == true ]] && maintenance_mode=apply
+  # Options are valid. Only then claim the home (a bad time or category must not create or mark it).
+  aicm_claim_home || exit 1
   local wd iwd jobs="" update_args=()
   wd="$(weekday_number "$S_CLEAN_DAY")" || exit 2
   iwd="$(weekday_number "$S_INVENTORY_DAY")" || exit 2
@@ -368,7 +459,12 @@ schedule_apply() {
     if [[ "$S_NO_INVENTORY" == true ]]; then remove_plist inventory
     else write_plist inventory "$app/bin/inventory_ai_clis.sh" "$(hm_hour "$S_INVENTORY_AT")" "$(hm_minute "$S_INVENTORY_AT")" "$iwd"; jobs+='"inventory",'; fi
     if [[ "$S_NO_CLEAN" == true ]]; then remove_plist clean
-    else write_plist clean "$app/bin/clean_ai_leftovers.sh" "$(hm_hour "$S_CLEAN_AT")" "$(hm_minute "$S_CLEAN_AT")" "$wd"; jobs+='"clean",'; fi
+    else
+      local clean_args=()
+      [[ -n "$S_CLEAN_CATEGORY" ]] && clean_args=(--category "$S_CLEAN_CATEGORY")
+      write_plist clean "$app/bin/clean_ai_leftovers.sh" "$(hm_hour "$S_CLEAN_AT")" "$(hm_minute "$S_CLEAN_AT")" "$wd" "${clean_args[@]+"${clean_args[@]}"}"
+      jobs+='"clean",'
+    fi
     if [[ "$S_NO_MAINTENANCE" == true ]]; then remove_plist maintenance
     else write_plist maintenance "$app/bin/aicm" '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23' 7 "" scheduled maintenance "--$maintenance_mode"; jobs+='"maintenance",'; fi
     if [[ "$SCHEDULE_MODE" != refresh && -f "$HOME/Library/LaunchAgents/com.example.ai-cli-auto-update.plist" ]]; then
@@ -381,9 +477,12 @@ schedule_apply() {
     # only /usr/bin:/bin, and a long PATH on the line itself would be cut at 1000 characters by
     # Debian's cron). cron does not run missed jobs, so the weekly jobs are started every day at
     # their time and run only when this week's run has not happened yet (--weekly day time).
-    local lines="" q_aicm q_targets=""
+    local lines="" q_aicm q_targets="" q_category=""
     q_aicm="$(printf '%q' "$app/bin/aicm")"
     [[ -n "$S_TARGETS" ]] && q_targets=" --targets $(printf '%q' "$S_TARGETS")"
+    # Names are validated (letters and commas only), so the value is not shell-quoted.
+    # Quoting would turn the comma into \ , which cron would store and refresh would not parse.
+    [[ -n "$S_CLEAN_CATEGORY" ]] && q_category=" --category $S_CLEAN_CATEGORY"
     if [[ "$S_NO_UPDATE" != true ]]; then
       lines+="$(hm_minute "$S_UPDATE_AT") $retry_hours * * * /bin/bash $q_aicm scheduled update --scheduled$q_targets >> $(printf '%q' "$LOG_DIR/cron.update.log") 2>&1 # aicm:update"$'\n'
       jobs+='"update",'
@@ -393,7 +492,7 @@ schedule_apply() {
       jobs+='"inventory",'
     fi
     if [[ "$S_NO_CLEAN" != true ]]; then
-      lines+="$(hm_minute "$S_CLEAN_AT") $(hm_hour "$S_CLEAN_AT") * * * /bin/bash $q_aicm scheduled clean --weekly $wd $S_CLEAN_AT >> $(printf '%q' "$LOG_DIR/cron.clean.log") 2>&1 # aicm:clean"$'\n'
+      lines+="$(hm_minute "$S_CLEAN_AT") $(hm_hour "$S_CLEAN_AT") * * * /bin/bash $q_aicm scheduled clean --weekly $wd $S_CLEAN_AT$q_category >> $(printf '%q' "$LOG_DIR/cron.clean.log") 2>&1 # aicm:clean"$'\n'
       jobs+='"clean",'
     fi
     if [[ "$S_NO_MAINTENANCE" != true ]]; then
@@ -416,7 +515,12 @@ schedule_apply() {
     t="$(aicm_json_field "$file" installedAt)"; [[ -n "$t" ]] && installed_at="$t"
     ref="$STATE_DIR/.schedule-time.$$"; touch -r "$file" "$ref"
   fi
-  aicm_state_write schedule "{\"installedAt\":\"$installed_at\",\"version\":\"$(aicm_version)\",\"app\":\"$(aicm_json_escape "$app")\",\"source\":\"$(aicm_json_escape "$(schedule_source)")\",\"jobs\":[${jobs%,}],\"options\":{\"updateAt\":\"$S_UPDATE_AT\",\"inventoryDay\":\"$iwd\",\"inventoryAt\":\"$S_INVENTORY_AT\",\"cleanDay\":\"$wd\",\"cleanAt\":\"$S_CLEAN_AT\",\"targets\":\"$(aicm_json_escape "$S_TARGETS")\",\"maintenanceMode\":\"$maintenance_mode\"},\"path\":\"$(aicm_json_escape "$JOB_PATH")\",\"tools\":{$JOB_TOOLS}}"
+  local options_json
+  options_json="{\"updateAt\":\"$S_UPDATE_AT\",\"inventoryDay\":\"$iwd\",\"inventoryAt\":\"$S_INVENTORY_AT\",\"cleanDay\":\"$wd\",\"cleanAt\":\"$S_CLEAN_AT\",\"targets\":\"$(aicm_json_escape "$S_TARGETS")\""
+  # Omit an empty category so schedules written before this field still match.
+  [[ -n "$S_CLEAN_CATEGORY" ]] && options_json+=",\"cleanCategory\":\"$(aicm_json_escape "$S_CLEAN_CATEGORY")\""
+  options_json+=",\"maintenanceMode\":\"$maintenance_mode\"}"
+  aicm_state_write schedule "{\"installedAt\":\"$installed_at\",\"version\":\"$(aicm_version)\",\"app\":\"$(aicm_json_escape "$app")\",\"source\":\"$(aicm_json_escape "$(schedule_source)")\",\"jobs\":[${jobs%,}],\"options\":$options_json,\"path\":\"$(aicm_json_escape "$JOB_PATH")\",\"tools\":{$JOB_TOOLS}}"
   if [[ -n "$ref" ]]; then touch -r "$ref" "$file"; rm -f "$ref"; fi
   if [[ "$SCHEDULE_MODE" == refresh ]]; then
     [[ "$SCHEDULE_CHANGED" == true ]] || echo "scheduled jobs already match the installed copy"
@@ -473,14 +577,60 @@ doctor() {
   if ! (aicm_load_rules "$AICM_ROOT/rules/clean-rules.conf" "$AICM_HOME/clean-rules.local.conf") 2>/dev/null; then
     problems+=("rules file error; run: aicm clean --dry-run")
   fi
+  while IFS= read -r p; do [[ -n "$p" ]] && problems+=("$p"); done < <(doctor_settings_problems)
+  doctor_info
   if ((${#problems[@]} == 0)); then
-    echo "healthy: schedules registered, recent runs succeeded"
+    echo "healthy: schedules registered, recent runs succeeded, settings valid"
     recent_notifications 3
     return 0
   fi
   for p in "${problems[@]}"; do echo "problem: $p"; done
   recent_notifications 3
   return 1
+}
+
+# Settings the scheduled runs need, checked the way the runs check them (read only): the home folder,
+# the optional update policy (the updater refuses to start while it is invalid, or while it exists and
+# Node.js is missing) and the installed copy the jobs start.
+doctor_settings_problems() {
+  local err rc app
+  aicm_home_status
+  if [[ "$AICM_HOME_STATE" == foreign ]]; then
+    echo "AICM_HOME is not usable, so every run refuses to start: $AICM_HOME_PROBLEM"
+  fi
+  if [[ -e "$AICM_HOME/update-policy.json" || -L "$AICM_HOME/update-policy.json" ]]; then
+    rc=0
+    err="$( { aicm_load_catalog "" "" >/dev/null && aicm_policy_load "$(aicm_min_release_age_days)"; } 2>&1 >/dev/null )" || rc=$?
+    if ((rc != 0)); then
+      err="$(printf '%s' "$err" | tr '\n' ' ' | sed 's/ *$//')"
+      echo "${err:-update policy: $AICM_HOME/update-policy.json is invalid}; the daily update refuses to run until it is fixed (file: $AICM_HOME/update-policy.json)"
+    fi
+  fi
+  app="$(aicm_json_field "$STATE_DIR/schedule.json" app)"
+  if [[ -n "$(scheduled_jobs)" && -n "$app" && ! -f "$app/bin/aicm" ]]; then
+    echo "the scheduled jobs start $app, which is missing or incomplete; run: aicm schedule install"
+  fi
+  return 0
+}
+
+# What the jobs run and where it came from; also notes optional prerequisites that are missing.
+doctor_info() {
+  local app="$AICM_APP_DIR" src v sv node
+  if [[ -f "$app/VERSION" && ! -L "$app" ]]; then
+    v="$(head -n 1 "$app/VERSION" | tr -d '[:space:]')"
+    src="$(head -n 1 "$app/SOURCE" 2>/dev/null || true)"
+    if [[ -n "$src" && -f "$src/VERSION" ]]; then sv="$(head -n 1 "$src/VERSION" | tr -d '[:space:]')"; else sv="missing"; fi
+    echo "info: installed copy $app version $v; source ${src:-unknown} (version $sv)"
+  else
+    echo "info: no installed copy in $app; this command runs from $AICM_ROOT (version $(aicm_version))"
+  fi
+  if node="$(command -v node 2>/dev/null)"; then
+    echo "info: Node.js $node ($(node --version 2>/dev/null || echo unknown))"
+  else
+    echo "info: Node.js not found; archive rules, restore, history, an update policy and the worktree/config/process checks need it"
+  fi
+  if [[ -f "$AICM_HOME/update-policy.json" ]]; then echo "info: update policy $AICM_HOME/update-policy.json"; fi
+  return 0
 }
 
 # The last N notifications (they may never have shown on screen, e.g. from cron).
@@ -491,26 +641,157 @@ recent_notifications() { # count
   tail -n "$1" "$log" | sed 's/^/  /'
 }
 
-# What --purge removes: only what this tool writes. Hooks, *.local.conf, repos.conf and anything else
-# the user put there stay, and the folder itself goes only when nothing is left in it. A folder
-# without the .aicm-home marker is purged only when it is the default ~/.ai-cli-auto-manager.
-purge_home() {
-  local h="$AICM_HOME" item
-  [[ -d "$h" ]] || { echo "nothing to purge: $h does not exist"; return 0; }
-  if [[ ! -f "$h/.aicm-home" && "$(basename "$h")" != .ai-cli-auto-manager ]]; then
-    echo "refusing to purge $h: it has no .aicm-home marker, so it may not be an AI CLI Auto Manager folder" >&2
-    exit 1
+# Succeeds when the home may be purged: it is marked, or it is an unmarked folder of an older version
+# that holds only what this tool writes (aicm_home_status "legacy"). The folder name alone never counts.
+purge_allowed() {
+  aicm_home_status
+  case "$AICM_HOME_STATE" in owned|legacy|empty|missing) return 0 ;; esac
+  echo "refusing to purge $AICM_HOME: ${AICM_HOME_PROBLEM:-it is not an AI CLI Auto Manager folder}" >&2
+  echo "nothing was changed; 'aicm uninstall' without --purge removes only the jobs and the installed copy" >&2
+  return 1
+}
+
+PURGE_DRY=false PURGE_KEPT=()
+purge_rm() { # path
+  if [[ "$PURGE_DRY" == true ]]; then echo "would remove $1"; return 0; fi
+  rm -rf -- "$1" && echo "removed $1"
+}
+purge_rmdir_if_empty() { # dir
+  [[ -n "$(aicm_dir_entries "$1")" ]] && return 1
+  [[ "$PURGE_DRY" == true ]] && return 0
+  rmdir -- "$1" 2>/dev/null
+}
+
+# Removes the entries of logs/, state/ or archive/ that this tool wrote; anything else is kept and
+# reported. In dry-run mode only reports. Prints nothing for a folder that is not there.
+purge_folder() { # name
+  local d="$AICM_HOME/$1" name sub left=false
+  [[ -e "$d" || -L "$d" ]] || return 0
+  if [[ -L "$d" || ! -d "$d" ]]; then PURGE_KEPT+=("$1 (not a real folder)"); return 0; fi
+  while IFS= read -r name; do
+    case "$1" in
+      logs)
+        if [[ -f "$d/$name" && ! -L "$d/$name" ]] && aicm_log_name_owned "$name"; then purge_rm "$d/$name"
+        else PURGE_KEPT+=("logs/$name"); left=true; fi ;;
+      state)
+        if [[ -d "$d/$name" && ! -L "$d/$name" ]] && aicm_state_dir_owned "$name"; then
+          if [[ "$name" == maintenance.lock ]] && [[ -f "$d/$name/owner.json" ]] &&
+             kill -0 "$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$d/$name/owner.json" 2>/dev/null)" 2>/dev/null; then
+            PURGE_KEPT+=("state/$name (held by a running cleanup)"); left=true; continue
+          fi
+          local sub_left=false
+          while IFS= read -r sub; do
+            if [[ -f "$d/$name/$sub" && ! -L "$d/$name/$sub" ]] && aicm_state_subfile_owned "$name" "$sub"; then
+              [[ "$PURGE_DRY" == true ]] || rm -f -- "$d/$name/$sub"
+            else PURGE_KEPT+=("state/$name/$sub"); sub_left=true; fi
+          done < <(aicm_dir_entries "$d/$name")
+          if [[ "$sub_left" == true ]]; then left=true
+          elif [[ "$PURGE_DRY" == true ]]; then echo "would remove $d/$name"
+          elif rmdir -- "$d/$name" 2>/dev/null; then echo "removed $d/$name"
+          else left=true; fi
+        elif [[ -f "$d/$name" && ! -L "$d/$name" ]] && aicm_state_file_owned "$name"; then purge_rm "$d/$name"
+        else PURGE_KEPT+=("state/$name"); left=true; fi ;;
+    esac
+  done < <(aicm_dir_entries "$d")
+  if [[ "$left" == true ]]; then return 0; fi
+  if [[ "$PURGE_DRY" == true ]]; then echo "would remove $d"
+  elif rmdir -- "$d" 2>/dev/null; then echo "removed $d"; fi
+}
+
+# Archived files the index says this tool moved there ("stored<TAB>size" lines, sorted): records still
+# holding their file (archived, pending, missing) whose stored path needs no JSON unescaping.
+purge_indexed_archive() {
+  local idx="$AICM_HOME/state/archive-index"
+  [[ -d "$idx" && ! -L "$idx" ]] || return 0
+  # shellcheck disable=SC2016 # awk program, not shell
+  find "$idx" -maxdepth 1 -type f -name '*.json' ! -name '.*' -print0 2>/dev/null |
+    xargs -0 awk 'FNR == 1 {
+      s = ""; st = ""; sz = ""
+      if (match($0, /"stored":"[^"\\]*"/)) s = substr($0, RSTART + 10, RLENGTH - 11)
+      if (match($0, /"status":"[a-z]*"/)) st = substr($0, RSTART + 10, RLENGTH - 11)
+      if (match($0, /"size":[0-9]+/)) sz = substr($0, RSTART + 7, RLENGTH - 7)
+      if (s != "" && s !~ /(^|\/)\.\.?(\/|$)/ && sz != "" && (st == "archived" || st == "pending" || st == "missing")) print s "\t" sz
+    }' 2>/dev/null | LC_ALL=C sort -u
+}
+
+# archive/: removes only files an index record says this tool archived there (same size, no link on
+# the way); unindexed files, even in a dated folder, stay. Then removes folders left empty.
+purge_archive_folder() {
+  local d="$AICM_HOME/archive" rel size p c ok removed=0 n gone
+  [[ -e "$d" || -L "$d" ]] || return 0
+  if [[ -L "$d" || ! -d "$d" ]]; then PURGE_KEPT+=("archive (not a real folder)"); return 0; fi
+  gone="$(mktemp)" || return 1
+  while IFS=$'\t' read -r rel size; do
+    p="$d/$rel"
+    [[ -f "$p" && ! -L "$p" ]] || continue
+    ok=true; c="$(dirname "$p")"
+    while [[ "$c" != "$d" ]]; do [[ -L "$c" ]] && { ok=false; break; }; c="$(dirname "$c")"; done
+    [[ "$ok" == true && "$(file_size "$p")" == "$size" ]] || continue
+    removed=$((removed + 1))
+    printf '%s\n' "$rel" >> "$gone"
+    [[ "$PURGE_DRY" == true ]] || rm -f -- "$p"
+  done < <(purge_indexed_archive)
+  if [[ "$PURGE_DRY" == true ]]; then echo "would remove $removed archived files listed in the archive index"
+  else
+    echo "removed $removed archived files listed in the archive index"
+    find "$d" -mindepth 1 -type d -empty -delete 2>/dev/null || true
   fi
-  for item in app app.new app.old logs state archive inventory.md; do
+  # What stays: unindexed files (and, in a dry run, what would stay after the indexed ones go).
+  n=0
+  while IFS= read -r -d '' p; do
+    rel="${p#"$d"/}"
+    if [[ "$PURGE_DRY" == true ]] && grep -Fxq -- "$rel" "$gone"; then continue; fi
+    n=$((n + 1)); ((n <= 20)) && PURGE_KEPT+=("archive/$rel (not in the archive index)")
+  done < <(find "$d" -mindepth 1 ! -type d -print0 2>/dev/null)
+  rm -f "$gone"
+  ((n > 20)) && PURGE_KEPT+=("... and $((n - 20)) more under archive/")
+  if ((n == 0)); then
+    if [[ "$PURGE_DRY" == true ]]; then echo "would remove $d"; elif rmdir -- "$d" 2>/dev/null; then echo "removed $d"; fi
+  fi
+  return 0
+}
+file_size() { printf '%s\0' "$1" | aicm_sizes_stdin; }
+
+# What --purge removes: only what this tool wrote. Each reserved entry is checked first (the marker
+# does not whitelist content): an installed copy holding files a copy never has, a log or state file
+# under a name the tool never uses, or anything linked stays. Hooks, *.local.conf, repos.conf,
+# update-policy.json and anything else the user put there stay, and the folder itself goes only when
+# nothing is left in it. With --dry-run nothing is changed and no marker, log or state is written.
+purge_home() { # [dry]
+  local h="$AICM_HOME" item left="" name
+  PURGE_DRY=false; [[ "${1:-}" == dry ]] && PURGE_DRY=true
+  PURGE_KEPT=()
+  [[ -d "$h" ]] || { echo "nothing to purge: $h does not exist"; return 0; }
+  purge_allowed || exit 1
+  for item in app app.new app.old; do
     [[ -e "$h/$item" || -L "$h/$item" ]] || continue
-    rm -rf -- "${h:?}/$item" && echo "removed $h/$item"
+    if [[ "$(cd "$AICM_ROOT" && pwd -P)" == "$(cd "$h/$item" 2>/dev/null && pwd -P)" ]]; then PURGE_KEPT+=("$item (this command runs from it)"); continue; fi
+    if aicm_app_copy_owned "$h/$item" "$([[ "$item" == app.new ]] && echo partial)"; then purge_rm "$h/$item"
+    else PURGE_KEPT+=("$item ($AICM_HOME_PROBLEM)"); fi
   done
-  local left="" f
-  for f in "$h"/* "$h"/.[!.]* "$h"/..?*; do
-    [[ -e "$f" || -L "$f" ]] || continue
-    [[ "${f##*/}" == .aicm-home ]] && continue
-    left+="${f##*/} "
-  done
+  if [[ -e "$h/inventory.md" || -L "$h/inventory.md" ]]; then
+    if aicm_inventory_owned "$h/inventory.md"; then purge_rm "$h/inventory.md"; else PURGE_KEPT+=("inventory.md"); fi
+  fi
+  # archive/ before state/: its index says which archived files are the tool's.
+  purge_folder logs
+  purge_archive_folder
+  purge_folder state
+  if ((${#PURGE_KEPT[@]})); then
+    echo "kept what this tool did not write:"
+    for item in "${PURGE_KEPT[@]}"; do echo "  $item"; done
+  fi
+  if [[ "$PURGE_DRY" == true ]]; then
+    while IFS= read -r name; do
+      case "$name" in .aicm-home) ;; app|app.new|app.old|inventory.md|logs|state|archive) ;; *) left+="$name " ;; esac
+    done < <(aicm_dir_entries "$h")
+    if [[ -z "$left" && ${#PURGE_KEPT[@]} == 0 ]]; then echo "would remove $h"
+    else echo "would keep $h, which still holds files you wrote: ${left% }"; fi
+    echo "dry run: nothing was changed"
+    return 0
+  fi
+  while IFS= read -r name; do
+    [[ "$name" == .aicm-home ]] || left+="$name "
+  done < <(aicm_dir_entries "$h")
   if [[ -z "$left" ]]; then
     rm -f -- "$h/.aicm-home"
     rmdir -- "$h" && echo "removed $h"
@@ -519,24 +800,105 @@ purge_home() {
   fi
 }
 
+# The jobs `aicm uninstall` would remove (for --dry-run).
+schedule_preview() {
+  local job
+  if [[ "$(aicm_os)" == mac ]]; then
+    for job in update inventory clean; do
+      [[ -f "$HOME/Library/LaunchAgents/$AICM_LAUNCHD_PREFIX.$job.plist" ]] && echo "would remove: $AICM_LAUNCHD_PREFIX.$job"
+    done
+  elif command -v "${AICM_CRONTAB:-crontab}" >/dev/null 2>&1; then
+    cron_aicm_lines | sed 's/^/would remove: /'
+  fi
+  [[ -f "$STATE_DIR/schedule.json" ]] && echo "would remove $STATE_DIR/schedule.json"
+  return 0
+}
+
+uninstall() {
+  local purge=false dry=false a remove_app=false
+  for a in "$@"; do
+    case "$a" in
+      --purge) purge=true ;;
+      --dry-run) dry=true ;;
+      *) echo "unknown argument: $a (use --purge and --dry-run)" >&2; exit 2 ;;
+    esac
+  done
+  # Everything is checked before anything is changed, including that nothing else is running.
+  local busy
+  if busy="$(aicm_busy_operation)"; then
+    if [[ "$dry" == true ]]; then echo "note: $busy; uninstall would refuse to run now"
+    else
+      echo "refusing to uninstall while $busy; nothing was changed; run it again when that has finished" >&2
+      exit 1
+    fi
+  fi
+  if [[ -e "$AICM_APP_DIR" || -L "$AICM_APP_DIR" ]] && [[ -f "$AICM_APP_DIR/SOURCE" || -L "$AICM_APP_DIR" ]] &&
+     [[ "$(cd "$AICM_ROOT" && pwd -P)" != "$(cd "$AICM_APP_DIR" 2>/dev/null && pwd -P)" ]]; then
+    if ! aicm_app_copy_owned "$AICM_APP_DIR"; then
+      echo "refusing to remove $AICM_APP_DIR: $AICM_HOME_PROBLEM; move your files out of it and run again (nothing was changed)" >&2
+      exit 1
+    fi
+    remove_app=true
+  fi
+  if [[ "$purge" == true && -d "$AICM_HOME" ]]; then purge_allowed || exit 1; fi
+  if [[ "$dry" == true ]]; then
+    schedule_preview
+    [[ "$remove_app" == true ]] && echo "would remove installed copy: $AICM_APP_DIR"
+    if [[ "$purge" == true ]]; then purge_home dry
+    else echo "would keep $AICM_HOME (logs, state, archive, local rules); add --purge to remove it too"; echo "dry run: nothing was changed"; fi
+    return 0
+  fi
+  # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless --purge.
+  schedule_remove
+  if [[ "$remove_app" == true ]]; then rm -rf -- "${AICM_APP_DIR:?}"; echo "removed installed copy: $AICM_APP_DIR"; fi
+  if [[ "$purge" == true ]]; then
+    purge_home
+  else
+    echo "kept $AICM_HOME (logs, state, archive, local rules); add --purge to remove it too"
+  fi
+}
+
 cmd="${1:-help}"
 (($#)) && shift
-# The commands that write into AICM_HOME mark it as ours (uninstall never does).
-case "$cmd" in update|inventory|clean|schedule|scheduled) aicm_mark_home ;; esac
+# The dispatcher never marks AICM_HOME. update, inventory and clean claim it themselves after their
+# arguments are valid and only for a real run, so help, a bad flag or a preview leaves it untouched.
 case "$cmd" in
   update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
   # Internal: what the crontab lines run.
   scheduled) scheduled_run "$@" ;;
   inventory) exec "$BIN_DIR/inventory_ai_clis.sh" "$@" ;;
   clean) exec "$BIN_DIR/clean_ai_leftovers.sh" "$@" ;;
+  archive|restore|history)
+    command -v node >/dev/null 2>&1 || { echo "aicm $cmd needs Node.js" >&2; exit 1; }
+    [[ -f "$AICM_ROOT/lib/maintenance-cli.js" && -f "$AICM_ROOT/lib/maintenance.js" ]] || { echo "aicm $cmd: lib/maintenance.js is missing from this copy" >&2; exit 1; }
+    exec node "$AICM_ROOT/lib/maintenance-cli.js" "$cmd" "$@"
+    ;;
   run)
-    [[ "${1:-}" == -- ]] || { echo 'usage: aicm run -- command [args...]' >&2; exit 2; }
+    [[ "${1:-}" == -- && $# -ge 2 ]] || { echo 'usage: aicm run -- command [args...]' >&2; exit 2; }
+    aicm_claim_home || exit 1
     exec node "$AICM_ROOT/lib/supervise.js" "$@" ;;
   maintenance) maintenance_run "$@" ;;
   worktrees|config|processes)
     command -v node >/dev/null 2>&1 || { echo "aicm $cmd needs Node.js" >&2; exit 1; }
+    # These record their results in state/: claim the home first (not for --help).
+    case " $* " in *" -h "*|*" --help "*) ;; *) aicm_claim_home || exit 1 ;; esac
     module="$cmd"; [[ "$cmd" == config ]] && module=config-drift
     exec node "$AICM_ROOT/lib/$module.js" "$@" ;;
+  optimize)
+    # Arguments are checked before anything else; a preview runs no tool and writes nothing. --apply
+    # claims the home and refuses while an update, cleanup, archive or restore runs (lib/optimize.js
+    # then holds the maintenance lock itself).
+    command -v node >/dev/null 2>&1 || { echo "aicm optimize needs Node.js" >&2; exit 1; }
+    js="$AICM_ROOT/lib/optimize.js"
+    [[ -f "$js" && -f "$AICM_ROOT/lib/maintenance.js" ]] || { echo "aicm optimize: lib/optimize.js is missing from this copy" >&2; exit 1; }
+    node "$js" --check "$@" || exit $?
+    case " $* " in
+      *" --apply "*)
+        aicm_claim_home 2>/dev/null || exec node "$js" --refuse "AICM_HOME: ${AICM_HOME_PROBLEM:-it is not an AI CLI Auto Manager folder}" "$@"
+        if busy="$(aicm_busy_operation)"; then exec node "$js" --refuse "$busy" "$@"; fi
+        ;;
+    esac
+    exec node "$js" "$@" ;;
   status)
     echo "AI CLI Auto Manager $(aicm_version)   home: $AICM_HOME"
     echo
@@ -578,19 +940,7 @@ case "$cmd" in
       *) echo "unknown schedule action: $action (use install, remove, show or refresh)" >&2; exit 2 ;;
     esac
     ;;
-  uninstall)
-    # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless --purge.
-    schedule_remove
-    # Only a folder that holds an installed copy (it has the SOURCE file) is removed.
-    if [[ -f "$AICM_APP_DIR/SOURCE" && "$(cd "$AICM_ROOT" && pwd -P)" != "$(cd "$AICM_APP_DIR" && pwd -P)" ]]; then
-      rm -rf -- "${AICM_APP_DIR:?}"; echo "removed installed copy: $AICM_APP_DIR"
-    fi
-    if [[ "${1:-}" == --purge ]]; then
-      purge_home
-    else
-      echo "kept $AICM_HOME (logs, state, archive, local rules); add --purge to remove it too"
-    fi
-    ;;
+  uninstall) uninstall "$@" ;;
   version|--version) echo "AI CLI Auto Manager $(aicm_version)" ;;
   help|-h|--help) usage ;;
   *) echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;

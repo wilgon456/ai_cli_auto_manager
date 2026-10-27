@@ -135,6 +135,19 @@ aicm_path_allowed() {
   [[ "$real" == "$real_anchor" || "$real" == "$real_anchor/"* ]]
 }
 
+# Moves into AICM_HOME/archive and purges of date folders must stay inside that tree.
+# Linked ancestors (including archive itself or a nested destination) are refused.
+# aicm_path_allowed already preserves macOS /var -> /private/var aliases above HOME/TMP.
+aicm_archive_dest_ok() {
+  local dest="$1" archive="${AICM_HOME%/}/archive"
+  [[ -n "$dest" && -n "$AICM_HOME" ]] || return 1
+  case "$dest" in
+    "$archive"|"$archive"/*) ;;
+    *) return 1 ;;
+  esac
+  aicm_path_allowed "$dest" 0
+}
+
 aicm_display_path() {
   local p="$1"
   if [[ "$p" == "$HOME/"* ]]; then
@@ -158,7 +171,9 @@ aicm_sizes_stdin() {
   fi
 }
 
-aicm_sum_lines() { awk '{ s += $1 } END { printf "%d", s }'; }
+# Sums one byte count per line. printf "%d" is a 32-bit conversion in some awks (mawk clamps it at
+# 2147483647), so the sum is printed with %.0f: exact for every whole number below 2^53 (8 PiB).
+aicm_sum_lines() { awk '{ s += $1 } END { printf "%.0f", s }'; }
 
 # Rules: parallel arrays filled by aicm_load_rules (bash 3.2 has no associative arrays).
 AICM_RULE_ID=(); AICM_RULE_KIND=(); AICM_RULE_PATH=(); AICM_RULE_PATTERN=()
@@ -187,11 +202,12 @@ aicm_load_rule_file() {
     id="$(aicm_trim "$id")"; os="$(aicm_lower "$(aicm_trim "$os")")"; kind="$(aicm_lower "$(aicm_trim "$kind")")"
     path="$(aicm_trim "$path")"; pattern="$(aicm_trim "$pattern")"; days="$(aicm_trim "$days")"
     limit="$(aicm_trim "$limit")"; default="$(aicm_lower "$(aicm_trim "$default")")"; note="$(aicm_trim "$note")"
-    case "$kind" in age|age-files|cap|keep-latest|command|archive|codex) ;; *) echo "invalid rule kind '$kind' in $source: $line" >&2; return 1 ;; esac
+    case "$kind" in age|age-files|cap|budget|keep-latest|command|archive|codex) ;; *) echo "invalid rule kind '$kind' in $source: $line" >&2; return 1 ;; esac
     case "$default" in on|off) ;; *) echo "invalid default '$default' in $source: $line" >&2; return 1 ;; esac
     [[ -z "$days" || "$days" =~ ^[0-9]+$ ]] || { echo "invalid days in $source: $line" >&2; return 1; }
     [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || { echo "invalid limit in $source: $line" >&2; return 1; }
     if [[ "$kind" == age || "$kind" == age-files ]] && (( ${days:-0} < 1 )); then echo "$kind rule needs days >= 1 in $source: $line" >&2; return 1; fi
+    if [[ "$kind" == budget ]] && (( ${days:-0} < 1 || ${limit:-0} < 1 )); then echo "budget rule needs days >= 1 (minimum age) and limit >= 1 (total MiB) in $source: $line" >&2; return 1; fi
     if [[ "$kind" == keep-latest ]] && (( ${limit:-0} < 1 )); then echo "keep-latest rule needs limit >= 1 in $source: $line" >&2; return 1; fi
     if [[ "$kind" == archive ]] && (( ${days:-0} < 1 || ${limit:-0} < 1 )); then echo "archive rule needs days >= 1 (archive after) and limit >= 1 (delete after) in $source: $line" >&2; return 1; fi
     if [[ "$kind" == codex ]] && (( ${days:-0} < 1 )); then echo "codex rule needs days >= 1 in $source: $line" >&2; return 1; fi
@@ -209,6 +225,126 @@ aicm_load_rules() {
   AICM_RULE_DAYS=(); AICM_RULE_LIMIT=(); AICM_RULE_ENABLED=(); AICM_RULE_NOTE=()
   aicm_load_rule_file "$1" || return 1
   aicm_load_rule_file "$2" || return 1
+}
+
+# id -> category. Ids missing from the map are "other" (custom and local rules).
+AICM_CAT_ID=(); AICM_CAT_NAME=()
+
+aicm_load_categories() {
+  local file="$AICM_ROOT/rules/clean-categories.conf" line id cat
+  AICM_CAT_ID=(); AICM_CAT_NAME=()
+  [[ -f "$file" ]] || { echo "category map missing: $file" >&2; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$(aicm_trim "$line")" ]] && continue
+    [[ "$(aicm_trim "$line")" == \#* ]] && continue
+    IFS='|' read -r id cat _ <<< "$line"
+    id="$(aicm_trim "$id")"; cat="$(aicm_lower "$(aicm_trim "$cat")")"
+    [[ -n "$id" && -n "$cat" ]] || { echo "invalid category row: $line" >&2; return 1; }
+    case "$cat" in
+      sessions|cache|logs|temp|other) ;;
+      *) echo "invalid category '$cat' for $id" >&2; return 1 ;;
+    esac
+    local i
+    for ((i = 0; i < ${#AICM_CAT_ID[@]}; i++)); do
+      [[ "${AICM_CAT_ID[$i]}" == "$id" ]] && { echo "duplicate category id: $id" >&2; return 1; }
+    done
+    AICM_CAT_ID+=("$id"); AICM_CAT_NAME+=("$cat")
+  done < "$file"
+}
+
+aicm_rule_category() { # id
+  local id="$1" i
+  for ((i = 0; i < ${#AICM_CAT_ID[@]}; i++)); do
+    if [[ "${AICM_CAT_ID[$i]}" == "$id" ]]; then
+      printf '%s' "${AICM_CAT_NAME[$i]}"
+      return 0
+    fi
+  done
+  printf '%s' other
+}
+
+# Prints a normalized comma list (sessions,cache,logs,temp,other,all). Empty input prints nothing.
+# "all" cannot be combined. Duplicates, blanks and unknown names fail.
+aicm_normalize_categories() {
+  local raw="$1" tok seen="" out=""
+  local parts=()
+  [[ -n "$raw" ]] || return 0
+  # read drops a trailing empty field, so a final comma has to be rejected first.
+  [[ "$raw" == *, || "$raw" == ,* ]] && { echo "empty category in '$raw'" >&2; return 1; }
+  IFS=',' read -r -a parts <<< "$raw"
+  for tok in "${parts[@]}"; do
+    tok="$(aicm_lower "$(aicm_trim "$tok")")"
+    [[ -n "$tok" ]] || { echo "empty category in '$raw'" >&2; return 1; }
+    case "$tok" in
+      sessions|cache|logs|temp|other|all) ;;
+      *) echo "unknown category: $tok" >&2; return 1 ;;
+    esac
+    case " $seen " in
+      *" $tok "*) echo "duplicate category: $tok" >&2; return 1 ;;
+    esac
+    seen="$seen $tok"
+    out="${out:+$out,}$tok"
+  done
+  if [[ "$out" == *all* && "$out" != all ]]; then
+    echo "category 'all' cannot be combined with other categories" >&2
+    return 1
+  fi
+  printf '%s' "$out"
+}
+
+aicm_protection_policy() { printf '%s' 'never removes memory, credentials, settings or keys'; }
+
+# Records one local history entry through maintenance.js. Failure warns and does not change the caller's result.
+aicm_record_history() { # kind json-file
+  local js="$AICM_ROOT/lib/maintenance.js" errf rc=0
+  if ! command -v node >/dev/null 2>&1; then
+    echo "warning: history was not recorded (Node.js is not available)" >&2
+    return 0
+  fi
+  if [[ ! -f "$js" ]]; then
+    echo "warning: history was not recorded (lib/maintenance.js is missing)" >&2
+    return 0
+  fi
+  if [[ ! -f "${2:-}" ]]; then
+    echo "warning: history was not recorded (summary file is missing)" >&2
+    return 0
+  fi
+  errf="$(mktemp)"
+  node "$js" history-add --kind "$1" --file "$2" --json >"$errf.out" 2>"$errf" || rc=$?
+  if ((rc != 0)); then
+    echo "warning: history was not recorded: $(tr '\n' ' ' < "$errf" | head -c 300)" >&2
+  fi
+  rm -f "$errf" "$errf.out"
+  return 0
+}
+
+aicm_rule_action() { # kind limit
+  case "$1" in
+    archive) printf '%s' archive ;;
+    codex) if [[ "${2:-0}" == 0 ]]; then printf '%s' delete; else printf '%s' archive; fi ;;
+    command) printf '%s' run ;;
+    keep-latest) printf '%s' keep ;;
+    *) printf '%s' delete ;;
+  esac
+}
+
+# Read-only reason: the rule note, plus the earlier archive age when the CLI deletes on its own.
+aicm_rule_reason() { # id kind days note
+  local id="$1" kind="$2" days="$3" note="$4" reason="$4" eff native extra
+  if [[ "$kind" == archive ]]; then
+    eff="$(aicm_archive_days "$id" "$days")"
+    if [[ "$eff" != "$days" ]]; then
+      native="$(aicm_native_retention_days "$id")"
+      extra="archive after ${eff}d (the CLI deletes after ${native}d)"
+      if [[ -n "$reason" ]]; then reason="$reason; $extra"; else reason="$extra"; fi
+    fi
+  fi
+  if [[ -z "$reason" ]]; then
+    reason="$kind"
+    [[ "${days:-0}" != 0 ]] && reason="$reason after ${days}d"
+  fi
+  printf '%s' "$reason"
 }
 
 # find(1) arguments that keep protected files out of every result.
@@ -372,12 +508,277 @@ PY
 
 AICM_APP_DIR="$AICM_HOME/app"
 
-# Marks AICM_HOME as this tool's folder; `aicm uninstall --purge` removes only a marked folder (or
-# the default one), so AICM_HOME=~/.config can never wipe ~/.config.
-aicm_mark_home() {
-  [[ -f "$AICM_HOME/.aicm-home" ]] && return 0
-  mkdir -p "$AICM_HOME" 2>/dev/null && printf 'AI CLI Auto Manager home (logs, state, archive, installed copy)\n' > "$AICM_HOME/.aicm-home" 2>/dev/null
+# ---------------------------------------------------------------------------
+# Ownership of AICM_HOME. The tool writes only these top-level entries: app (app.new, app.old while
+# swapping), logs, state, archive and inventory.md, plus the .aicm-home marker. Users may add hooks,
+# *.local.conf, repos.conf and update-policy.json. A folder that holds anything else, or a reserved
+# entry with content the tool did not write (app/personal.txt), is never adopted, and nothing in it
+# is replaced or removed. The marker alone does not whitelist content: every reserved entry is
+# checked again before a copy swap, an uninstall or a purge removes it. AICM_HOME itself may be a
+# link chosen on purpose; links in the reserved entries are refused.
+# ---------------------------------------------------------------------------
+
+AICM_HOME_MARKER_TEXT='AI CLI Auto Manager home (logs, state, archive, installed copy)'
+AICM_HOME_STATE="" AICM_HOME_PROBLEM=""
+
+# Entries of folder $1, one per line (names only, hidden ones included).
+aicm_dir_entries() {
+  local e
+  for e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [[ -e "$e" || -L "$e" ]] && printf '%s\n' "${e##*/}"
+  done
   return 0
+}
+
+aicm_home_reserved_name() { case "$1" in app|app.new|app.old|logs|state|archive|inventory.md) return 0 ;; esac; return 1; }
+aicm_home_user_name() { case "$1" in .aicm-home|hooks|repos.conf|update-policy.json|*.local.conf|.DS_Store) return 0 ;; esac; return 1; }
+
+# A marker the tool wrote: a small regular file whose first line is the marker text.
+aicm_marker_valid() { # home
+  local m="$1/.aicm-home" line="" size
+  [[ -f "$m" && ! -L "$m" ]] || return 1
+  size="$(wc -c < "$m" 2>/dev/null | tr -d ' ')"
+  [[ "$size" =~ ^[0-9]+$ ]] && ((size <= 1024)) || return 1
+  IFS= read -r line < "$m" || [[ -n "$line" ]] || return 1
+  [[ "${line%$'\r'}" == "$AICM_HOME_MARKER_TEXT" ]]
+}
+
+# A file name the tool ships in bin/, lib/, rules/ or windows/ (used only for copies built before the
+# copy kept its own file list in .aicm-copy).
+aicm_app_file_shape() { # exact legacy file names only
+  case "$1" in
+    bin/aicm|bin/aicm.ps1|bin/clean_ai_leftovers.ps1|bin/clean_ai_leftovers.sh|bin/inventory_ai_clis.ps1|bin/inventory_ai_clis.sh|bin/update_ai_clis.ps1|bin/update_ai_clis.sh) return 0 ;;
+    lib/aicm-common.ps1|lib/aicm-common.sh|lib/aicm-file-guard.cs|lib/aicm-job.cs|lib/aicm-process-token.cs|lib/auto-maintenance.js|lib/codex-host.sh|lib/config-drift.js|lib/maintenance-cli.js|lib/maintenance-files.js|lib/maintenance-files.ps1|lib/maintenance-processes.js|lib/maintenance.js|lib/node-common.js|lib/npm-guard.js|lib/optimize.js|lib/processes.js|lib/supervise.js|lib/update-policy.js|lib/worktrees.js) return 0 ;;
+    rules/ai-clis.conf|rules/clean-categories.conf|rules/clean-rules.conf|rules/maintenance.conf) return 0 ;;
+    windows/install_scheduled_task.ps1|windows/run-hidden.vbs) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# An installed copy this tool built: a real folder with only the entries a copy has, and below bin, lib,
+# rules and windows only regular files the copy was built with (listed in its .aicm-copy; a copy from
+# an older version without that list: files its source checkout or this checkout also has, or files
+# named like the tool's own). app and app.old also need SOURCE and VERSION; a half-built app.new
+# ("partial") may still lack them.
+aicm_app_copy_owned() { # dir [partial]
+  local d="$1" name f src
+  if [[ -L "$d" || ! -d "$d" ]]; then AICM_HOME_PROBLEM="$d is not a real folder"; return 1; fi
+  while IFS= read -r name; do
+    case "$name" in
+      bin|lib|rules|windows)
+        [[ -d "$d/$name" && ! -L "$d/$name" ]] || { AICM_HOME_PROBLEM="$d/$name is not a real folder"; return 1; } ;;
+      VERSION|LICENSE|README.md|SOURCE|.aicm-copy)
+        [[ -f "$d/$name" && ! -L "$d/$name" ]] || { AICM_HOME_PROBLEM="$d/$name is not a regular file"; return 1; } ;;
+      .DS_Store) ;;
+      *) AICM_HOME_PROBLEM="$d holds $name, which an installed copy does not have"; return 1 ;;
+    esac
+  done < <(aicm_dir_entries "$d")
+  if [[ "${2:-}" != partial && ! ( -f "$d/SOURCE" && -f "$d/VERSION" ) ]]; then
+    AICM_HOME_PROBLEM="$d has no SOURCE and VERSION files, so it is not an installed copy"
+    return 1
+  fi
+  f="$(cd "$d" && find bin lib rules windows ! -type f ! -type d -print -quit 2>/dev/null)"
+  if [[ -n "$f" ]]; then AICM_HOME_PROBLEM="$d/$f is a link or special file, which an installed copy does not have"; return 1; fi
+  src=""
+  if [[ ! -f "$d/.aicm-copy" ]]; then
+    src="$(head -n 1 "$d/SOURCE" 2>/dev/null || true)"
+    [[ "$src" == /* && -d "$src" ]] || src=""
+    if [[ -n "$src" && "$(cd "$src" && pwd -P)" == "$(cd "$d" && pwd -P)" ]]; then src=""; fi
+  fi
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ -f "$d/.aicm-copy" ]]; then
+      grep -Fxq -- "$f" "$d/.aicm-copy" && continue
+    elif { [[ -n "$src" && -f "$src/$f" ]]; } ||
+         { [[ "$(cd "$AICM_ROOT" 2>/dev/null && pwd -P)" != "$(cd "$d" && pwd -P)" && -f "$AICM_ROOT/$f" ]]; } ||
+         aicm_app_file_shape "$f"; then
+      continue
+    fi
+    AICM_HOME_PROBLEM="$d/$f is not part of the installed copy"
+    return 1
+  done < <(cd "$d" && find bin lib rules windows -type f 2>/dev/null)
+  return 0
+}
+
+# Names the tool gives files in logs/ (logs, transcripts, cron/launchd output and their temp files).
+aicm_log_name_owned() {
+  case "$1" in
+    maintenance-[0-9]*.jsonl|maintenance-[0-9]*.txt|update-[0-9]*.log|clean-[0-9]*.log|inventory-[0-9]*.log|latest.log|notifications.log) return 0 ;;
+    cron.update.log|cron.inventory.log|cron.clean.log|cron.maintenance.log|launchd.*.out.log|launchd.*.err.log) return 0 ;;
+    *.log.[0-9]*.tmp) return 0 ;;
+  esac
+  return 1
+}
+
+# Names the tool gives files directly in state/.
+aicm_state_file_owned() {
+  local n="${1%.[0-9]*.tmp}"
+  case "$1" in .weekly-due.[0-9]*|.schedule-time.[0-9]*) return 0 ;; esac
+  case "$n" in
+    last-update.json|last-clean.json|last-maintenance.json|inventory.json|schedule.json|npm-verdicts.json|npm-verdicts.tsv) return 0 ;;
+    update-running.json|update-npm.json|update-npm.tsv|update-deferred.json|inventory-error.json) return 0 ;;
+    inventory.tsv|inventory-shadow.txt|config-drift.json|processes.json|worktrees.json|*-attention.json) return 0 ;;
+    attention-*.tsv|attention-*.json) return 0 ;;
+  esac
+  return 1
+}
+
+# Folders the tool keeps in state/ and the names it gives files there (manifests, history, lock).
+aicm_state_dir_owned() { case "$1" in archive-index|history|sessions|maintenance.lock|maintenance.lock.stale-*) return 0 ;; esac; return 1; }
+aicm_state_subfile_owned() { # dir file
+  case "$1" in
+    archive-index|history) [[ "$2" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.json(\.[0-9]+\.[0-9a-f]+\.tmp)?$ ]] ;;
+    sessions) [[ "$2" =~ ^[a-f0-9-]{36}\.json$ ]] ;;
+    maintenance.lock*) [[ "$2" == owner.json || "$2" =~ ^\.owner\.json\.[0-9]+\.[0-9a-f]+\.tmp$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+# A dated archive folder (archive/<rule>/<yyyymmdd>) holds only real folders and regular files.
+aicm_archive_day_owned() { # dir
+  [[ -d "$1" && ! -L "$1" && "${1##*/}" =~ ^[0-9]{8}$ ]] || return 1
+  [[ -z "$(find "$1" ! -type f ! -type d -print -quit 2>/dev/null)" ]]
+}
+
+# The first line of inventory.md as the inventory writes it.
+aicm_inventory_owned() { # file
+  local line=""
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  IFS= read -r line < "$1" || [[ -n "$line" ]] || return 1
+  line="${line#$'\xef\xbb\xbf'}"
+  [[ "$line" == "# AI CLI inventory"* ]]
+}
+
+# Succeeds when every entry of reserved child $1 of AICM_HOME is something the tool wrote.
+aicm_home_child_owned() { # name
+  local p="$AICM_HOME/$1" name sub
+  case "$1" in
+    app|app.old) aicm_app_copy_owned "$p" ;;
+    app.new) aicm_app_copy_owned "$p" partial ;;
+    inventory.md) aicm_inventory_owned "$p" || { AICM_HOME_PROBLEM="$p was not written by the inventory"; return 1; } ;;
+    logs|state|archive)
+      if [[ -L "$p" || ! -d "$p" ]]; then AICM_HOME_PROBLEM="$p is not a real folder"; return 1; fi
+      while IFS= read -r name; do
+        case "$1" in
+          logs) [[ -f "$p/$name" && ! -L "$p/$name" ]] && aicm_log_name_owned "$name" ;;
+          state)
+            if [[ -d "$p/$name" && ! -L "$p/$name" ]] && aicm_state_dir_owned "$name"; then
+              while IFS= read -r sub; do
+                [[ -f "$p/$name/$sub" && ! -L "$p/$name/$sub" ]] && aicm_state_subfile_owned "$name" "$sub" || { AICM_HOME_PROBLEM="$p/$name/$sub was not written by this tool"; return 1; }
+              done < <(aicm_dir_entries "$p/$name")
+            else
+              [[ -f "$p/$name" && ! -L "$p/$name" ]] && aicm_state_file_owned "$name"
+            fi ;;
+          archive)
+            if [[ -d "$p/$name" && ! -L "$p/$name" && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+              while IFS= read -r sub; do
+                aicm_archive_day_owned "$p/$name/$sub" || { AICM_HOME_PROBLEM="$p/$name/$sub is not a dated archive folder"; return 1; }
+              done < <(aicm_dir_entries "$p/$name")
+            else
+              false
+            fi ;;
+        esac || { AICM_HOME_PROBLEM="$p/$name was not written by this tool"; return 1; }
+      done < <(aicm_dir_entries "$p") ;;
+    *) return 1 ;;
+  esac
+}
+
+# Sets AICM_HOME_STATE: missing | empty | owned (valid marker) | legacy (no marker, but only entries
+# this tool writes or users add on purpose, each reserved one with content the tool wrote) | foreign
+# (anything else; AICM_HOME_PROBLEM says why). Reads only.
+aicm_home_status() {
+  local h="$AICM_HOME" name any=false evidence=false real home
+  AICM_HOME_PROBLEM=""
+  # The home folder itself, or a folder above it, is never the manager's folder, whatever marker it holds.
+  real="$(aicm_real_dir "${h%/}")"; home="$(aicm_real_dir "${HOME%/}")"
+  if [[ -z "$real" || "$real" == / ]] || { [[ -n "$home" && "$home" != / ]] && [[ "$home/" == "$real/"* ]]; }; then
+    AICM_HOME_STATE=foreign; AICM_HOME_PROBLEM="$h is your home folder or a folder above it"; return 0
+  fi
+  if [[ ! -e "$h" && ! -L "$h" ]]; then AICM_HOME_STATE=missing; return 0; fi
+  if [[ ! -d "$h" ]]; then AICM_HOME_STATE=foreign; AICM_HOME_PROBLEM="$h is not a folder"; return 0; fi
+  if aicm_marker_valid "$h"; then AICM_HOME_STATE=owned; return 0; fi
+  if [[ -e "$h/.aicm-home" || -L "$h/.aicm-home" ]] && [[ -L "$h/.aicm-home" || ! -f "$h/.aicm-home" ]]; then
+    AICM_HOME_STATE=foreign; AICM_HOME_PROBLEM="$h/.aicm-home is not a regular file"; return 0
+  fi
+  while IFS= read -r name; do
+    any=true
+    if aicm_home_reserved_name "$name"; then
+      aicm_home_child_owned "$name" || { AICM_HOME_STATE=foreign; return 0; }
+      [[ "$name" == app || "$name" == app.old ]] && evidence=true
+    elif ! aicm_home_user_name "$name"; then
+      AICM_HOME_STATE=foreign; AICM_HOME_PROBLEM="$h holds $name, which AI CLI Auto Manager did not create"; return 0
+    fi
+  done < <(aicm_dir_entries "$h")
+  if [[ "$any" != true ]]; then AICM_HOME_STATE=empty; return 0; fi
+  # Reserved names alone (a dated archive folder, a logs folder) prove nothing. An older install is
+  # recognized by its installed copy; a folder with only user files (hooks, local rules) is safe to use.
+  if [[ "$evidence" == true ]]; then AICM_HOME_STATE=legacy; return 0; fi
+  while IFS= read -r name; do
+    if aicm_home_reserved_name "$name"; then
+      AICM_HOME_STATE=foreign
+      AICM_HOME_PROBLEM="$h has no installed copy (app) that shows it is an AI CLI Auto Manager folder, but holds $name"
+      return 0
+    fi
+  done < <(aicm_dir_entries "$h")
+  AICM_HOME_STATE=legacy
+  return 0
+}
+
+aicm_home_refusal() {
+  echo "refusing to use AICM_HOME=$AICM_HOME: ${AICM_HOME_PROBLEM:-it is not an AI CLI Auto Manager folder}." >&2
+  echo "Point AICM_HOME at an empty or new folder, or move the entries this tool did not create out of it." >&2
+}
+
+# Prints what is running when another operation is in progress: an archive, restore or cleanup holding
+# the maintenance lock, or an update or cleanup run holding its lock. Fails (prints nothing) otherwise.
+aicm_busy_operation() {
+  local f pid kind
+  f="$AICM_HOME/state/maintenance.lock/owner.json"
+  if [[ -f "$f" && ! -L "$f" ]]; then
+    pid="$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -n 1)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "an archive, restore or cleanup holds the maintenance lock (pid $pid)"
+      return 0
+    fi
+  fi
+  for kind in update clean; do
+    f="$(aicm_temp_dir)/ai-cli-auto-manager-$kind-$(id -u).lockdir/pid"
+    pid="$(cat "$f" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "an $kind run is in progress (pid $pid)"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Read-only check for commands that only write new logs (previews): fails for a foreign folder.
+aicm_home_usable() {
+  aicm_home_status
+  [[ "$AICM_HOME_STATE" != foreign ]] && return 0
+  aicm_home_refusal
+  return 1
+}
+
+# Marks AICM_HOME as this tool's folder before a real run writes into it. A missing or empty folder
+# and an unmarked folder of an older version that passes the structure check are marked; a foreign
+# folder is refused (exit status 1) and left exactly as it was.
+aicm_claim_home() {
+  aicm_home_status
+  case "$AICM_HOME_STATE" in
+    owned) return 0 ;;
+    missing|empty|legacy)
+      mkdir -p "$AICM_HOME" 2>/dev/null || { AICM_HOME_PROBLEM="cannot create $AICM_HOME"; aicm_home_refusal; return 1; }
+      if ! printf '%s\n' "$AICM_HOME_MARKER_TEXT" > "$AICM_HOME/.aicm-home.$$.tmp" 2>/dev/null ||
+         ! mv -f "$AICM_HOME/.aicm-home.$$.tmp" "$AICM_HOME/.aicm-home" 2>/dev/null; then
+        rm -f "$AICM_HOME/.aicm-home.$$.tmp" 2>/dev/null
+        AICM_HOME_PROBLEM="cannot write $AICM_HOME/.aicm-home"; aicm_home_refusal; return 1
+      fi
+      [[ "$AICM_HOME_STATE" == legacy ]] && echo "note: $AICM_HOME holds only what this tool writes; marked it as the AI CLI Auto Manager home" >&2
+      return 0 ;;
+  esac
+  aicm_home_refusal
+  return 1
 }
 
 # Succeeds when copy $2 has every file of source $1 (bin, lib, rules, windows) with the same content,
@@ -400,7 +801,16 @@ aicm_app_copy_complete() { # source copy
 aicm_sync_app_copy() {
   local src="$1" app="$AICM_APP_DIR" d f
   if [[ "$(cd "$src" && pwd -P)" == "$( [[ -d "$app" ]] && cd "$app" && pwd -P)" ]]; then echo "$app"; return 0; fi
-  aicm_mark_home
+  aicm_claim_home || return 1
+  # Nothing is moved or removed unless each copy folder is one this tool built.
+  for d in "$app" "$app.new" "$app.old"; do
+    [[ -e "$d" || -L "$d" ]] || continue
+    f=""; [[ "$d" == "$app.new" ]] && f=partial
+    if ! aicm_app_copy_owned "$d" $f; then
+      echo "installed copy: refusing to replace or remove $d: $AICM_HOME_PROBLEM; move it out of the way and run again" >&2
+      return 1
+    fi
+  done
   # A run that stopped between the two renames left only app.old behind: put it back first.
   if [[ ! -d "$app" && -d "$app.old" ]]; then mv "$app.old" "$app" || return 1; fi
   rm -rf -- "${app:?}.new" "${app:?}.old" || return 1
@@ -412,6 +822,8 @@ aicm_sync_app_copy() {
     if [[ -f "$src/$f" ]]; then cp "$src/$f" "$app.new/$f" || { rm -rf -- "${app:?}.new"; return 1; }; fi
   done
   printf '%s\n' "$src" > "$app.new/SOURCE" || { rm -rf -- "${app:?}.new"; return 1; }
+  # The copy's own file list: what a later sync, uninstall or purge may replace or remove.
+  (cd "$app.new" && find bin lib rules windows -type f 2>/dev/null | LC_ALL=C sort) > "$app.new/.aicm-copy" || { rm -rf -- "${app:?}.new"; return 1; }
   if ! aicm_app_copy_complete "$src" "$app.new"; then
     echo "installed copy: the new copy of $src is incomplete; keeping the old one" >&2
     rm -rf -- "${app:?}.new"
@@ -572,7 +984,7 @@ exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
 AICM_TIMEOUT_GNU=""
 aicm_timeout() {
   local secs="$1"; shift
-  if command -v node >/dev/null 2>&1 && [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]]; then
+  if command -v node >/dev/null 2>&1 && [[ "${AICM_TIMEOUT_TOOL:-}" != perl && "${AICM_CONTAINED:-}" == 1 && "${AI_CLI_MANAGER_SESSION:-}" =~ ^[a-f0-9-]{36}$ ]]; then
     node "$AICM_ROOT/lib/supervise.js" --timeout "$secs" -- "$@"
   elif [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]] && command -v timeout >/dev/null 2>&1; then
     # -k: KILL 10 seconds after TERM when the command ignores TERM (GNU coreutils only).
@@ -675,6 +1087,159 @@ aicm_load_catalog() {
 
 aicm_is_builtin() { [[ "$AICM_BUILTIN_IDS" == *" $1 "* ]]; }
 
+# ---------------------------------------------------------------------------
+# Per-CLI update policies ($AICM_HOME/update-policy.json)
+#   Node.js is required only when the file exists. Validation happens before the updater creates a
+#   log, lock or state file, so a broken policy never starts a run.
+#   AICM_POLICY_PRESENT   true when the file exists (even with no rules)
+#   AICM_POLICY_FINGERPRINT  deterministic policy + global age baseline ("none:<age>" without a file)
+# ---------------------------------------------------------------------------
+AICM_POLICY_PRESENT=false
+AICM_POLICY_FINGERPRINT=""
+AICM_POLICY_ID=(); AICM_POLICY_EXCLUDE=(); AICM_POLICY_PIN=(); AICM_POLICY_AGE=(); AICM_POLICY_EFF=()
+
+aicm_policy_reset() {
+  AICM_POLICY_ID=(); AICM_POLICY_EXCLUDE=(); AICM_POLICY_PIN=(); AICM_POLICY_AGE=(); AICM_POLICY_EFF=()
+}
+
+# Reads and validates the policy. Expects aicm_load_catalog to have run when the file exists.
+# Returns 0 (no file or valid), 1 (invalid policy) or 2 (Node.js required but missing).
+aicm_policy_load() { # global-age-days
+  local age="${1:-3}" file="$AICM_HOME/update-policy.json" out rc=0 ids="" i kind a b c d e idx
+  local saw_schema=false saw_fingerprint=false
+  aicm_policy_reset
+  AICM_POLICY_FINGERPRINT="none:${age}"
+  if [[ ! -e "$file" && ! -L "$file" ]]; then AICM_POLICY_PRESENT=false; return 0; fi
+  # A directory or a dangling symlink is a broken policy location, not an absent file: fail closed.
+  if [[ ! -f "$file" || ! -r "$file" ]]; then
+    echo "update policy: $file exists but is not a readable file" >&2
+    return 1
+  fi
+  AICM_POLICY_PRESENT=true
+  if ! command -v node >/dev/null 2>&1; then
+    echo "update policy: $file exists but Node.js is required to read it" >&2
+    return 2
+  fi
+  for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
+    [[ -n "${AICM_CLI_ID[$i]}" ]] || continue
+    ids+="${ids:+,}${AICM_CLI_ID[$i]}"
+  done
+  out="$(node "$AICM_ROOT/lib/update-policy.js" load --file "$file" --ids "$ids" --global-age "$age" 2>&1)" || rc=$?
+  if ((rc != 0)); then
+    echo "update policy: ${out:-invalid policy file}" >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r kind a b c d e; do
+    case "$kind" in
+      schema)
+        [[ "$a" == 1 ]] || { echo "update policy: unexpected schema version '$a'" >&2; return 1; }
+        saw_schema=true
+        ;;
+      fingerprint)
+        [[ "$a" =~ ^[0-9a-f]{64}$ ]] || { echo "update policy: invalid fingerprint" >&2; return 1; }
+        AICM_POLICY_FINGERPRINT="policy:$a"
+        saw_fingerprint=true
+        ;;
+      rule)
+        [[ "$a" =~ ^[a-z0-9][a-z0-9-]*$ && "$b" =~ ^[01]$ ]] || { echo "update policy: invalid rule output" >&2; return 1; }
+        if idx="$(aicm_policy_index "$a")"; then :; else idx=${#AICM_POLICY_ID[@]}; fi
+        AICM_POLICY_ID[idx]="$a"
+        AICM_POLICY_EXCLUDE[idx]="$b"
+        AICM_POLICY_PIN[idx]="$([[ "$c" == - ]] && printf '' || printf '%s' "$c")"
+        AICM_POLICY_AGE[idx]="$([[ "$d" == - ]] && printf '' || printf '%s' "$d")"
+        AICM_POLICY_EFF[idx]="$e"
+        ;;
+      "")
+        ;;
+      *)
+        echo "update policy: unexpected output '$kind'" >&2
+        return 1
+        ;;
+    esac
+  done <<< "$out"
+  # Empty or truncated output is not a valid policy even when the reader exits 0.
+  if [[ "$saw_schema" != true || "$saw_fingerprint" != true ]]; then
+    echo "update policy: incomplete output from the policy reader" >&2
+    return 1
+  fi
+  return 0
+}
+
+aicm_policy_index() { # id -> index
+  local id="$1" i
+  [[ "$id" == gpt ]] && id=codex
+  for ((i = 0; i < ${#AICM_POLICY_ID[@]}; i++)); do
+    [[ "${AICM_POLICY_ID[$i]}" == "$id" ]] && { printf '%s' "$i"; return 0; }
+  done
+  return 1
+}
+
+aicm_policy_excluded() {
+  local i
+  i="$(aicm_policy_index "$1")" || return 1
+  [[ "${AICM_POLICY_EXCLUDE[$i]}" == 1 ]]
+}
+
+aicm_policy_pin() {
+  local i
+  i="$(aicm_policy_index "$1")" || return 0
+  printf '%s' "${AICM_POLICY_PIN[$i]}"
+}
+
+# The explicit per-tool age, empty when the global baseline applies.
+aicm_policy_explicit_age() {
+  local i
+  i="$(aicm_policy_index "$1")" || return 0
+  printf '%s' "${AICM_POLICY_AGE[$i]}"
+}
+
+# The age the npm route must enforce for this tool.
+aicm_policy_effective_age() { # id global
+  local explicit
+  explicit="$(aicm_policy_explicit_age "$1")"
+  if [[ -n "$explicit" ]]; then printf '%s' "$explicit"; else printf '%s' "${2:-0}"; fi
+}
+
+# True when a policy rule (any rule) is configured; used to preserve npm backups for excluded tools.
+aicm_policy_has_rules() { ((${#AICM_POLICY_ID[@]} > 0)); }
+
+# A pin/positive age cannot be enforced by a non-npm install owner. Prints the hold reason or nothing.
+aicm_policy_route_hold() { # id method
+  local id="$1" method="$2" pin age
+  pin="$(aicm_policy_pin "$id")"
+  if [[ -n "$pin" && "$method" != npm ]]; then
+    printf 'update policy pins %s to %s, which requires the npm install route; the active copy is managed by %s, so no update was attempted' "$id" "$pin" "${method:-an unknown route}"
+    return 0
+  fi
+  age="$(aicm_policy_explicit_age "$id")"
+  if [[ -n "$age" && "$age" -gt 0 && "$method" != npm ]]; then
+    printf 'update policy sets minReleaseAgeDays=%s for %s, which cannot be enforced for %s installs; no update was attempted' "$age" "$id" "${method:-an unknown route}"
+    return 0
+  fi
+  return 0
+}
+
+# Validates an exact pin against the registry. Prints a hold reason, or nothing when it may be installed.
+# Returns 1 when the registry data could not be read (the caller treats that like other registry errors).
+aicm_policy_validate_pin() { # package pin age [amp]
+  local pkg="$1" pin="$2" age="$3" amp="${4:-}" f out rc=0 why
+  f="$(aicm_npm_view_file "$pkg" name time dist-tags versions)" || { echo "could not read the release list of $pkg"; return 1; }
+  out="$(node "$AICM_ROOT/lib/update-policy.js" pin-check --file "$f" --pin "$pin" --age "$age" ${amp:+--amp} 2>&1)" || rc=$?
+  rm -f "$f"
+  if ((rc != 0)); then
+    printf '%s' "${out#error: }"
+    return 0
+  fi
+  why="$(AICM_NPM_TIMEOUT=60 aicm_npm view "$pkg@$pin" deprecated 2>/dev/null)" || {
+    echo "could not read the deprecation state of $pkg@$pin"
+    return 1
+  }
+  if [[ -n "${why//[[:space:]]/}" ]]; then
+    printf 'pinned version %s is deprecated (%s)' "$pin" "$why"
+  fi
+  return 0
+}
+
 AICM_NPM_CMD="${NPM:-$(command -v npm 2>/dev/null || true)}"
 AICM_NPM_PREFIX_CACHE=""; AICM_NPM_ROOT_CACHE=""; AICM_NPM_CACHED=false
 
@@ -722,13 +1287,104 @@ aicm_brew_prefix() {
   printf '%s' "$AICM_BREW_PREFIX_CACHE"
 }
 
-# Sets CLI_INSTALLED CLI_PATH CLI_METHOD (npm|brew|standalone) CLI_NPMCOPY for catalog index $1.
+# Candidate npm packages for catalog index $1: canonical first, then known aliases.
+# Amp: @ampcode/cli is current; @sourcegraph/amp remains installed on some machines.
+aicm_cli_npm_names() {
+  local i="$1" npm
+  npm="${AICM_CLI_NPM[$i]}"
+  [[ -n "$npm" ]] && printf '%s\n' "$npm"
+  case "${AICM_CLI_ID[$i]}:$npm" in
+    amp:@ampcode/cli|amp:@sourcegraph/amp)
+      [[ "$npm" != "@ampcode/cli" ]] && printf '%s\n' "@ampcode/cli"
+      [[ "$npm" != "@sourcegraph/amp" ]] && printf '%s\n' "@sourcegraph/amp"
+      ;;
+    opencode:@opencode/cli|opencode:opencode-ai)
+      [[ "$npm" != "@opencode/cli" ]] && printf '%s\n' "@opencode/cli"
+      [[ "$npm" != opencode-ai ]] && printf '%s\n' opencode-ai
+      ;;
+  esac
+  # This is a list producer: a false final alias condition is not a failed listing.
+  return 0
+}
+
+# Package whose install folder owns the resolved command, empty when none does.
+aicm_cli_npm_owner() {
+  local i="$1" real="$2" pkg pkg_real root npm_names
+  [[ -n "$real" ]] || return 0
+  aicm_npm_cache
+  root="$AICM_NPM_ROOT_CACHE"
+  [[ -n "$root" ]] || return 0
+  npm_names="$(aicm_cli_npm_names "$i")" || true
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" && -e "$root/$pkg" ]] || continue
+    pkg_real="$(aicm_realpath "$root/$pkg")"
+    [[ -n "$pkg_real" ]] || continue
+    if [[ "$real" == "$pkg_real" || "$real" == "$pkg_real/"* ]]; then
+      printf '%s' "$pkg"
+      return 0
+    fi
+  done <<< "$npm_names"
+}
+
+# Package whose npm install owns a launcher placed directly in npm's prefix/bin. A real npm launcher
+# is a symlink into the package (or a small script that references its node_modules folder). A
+# standalone executable or wrapper in the same prefix is not npm-owned, even when npm has a hidden
+# copy of the same CLI. The file is read, never executed; a real package reference still identifies an
+# interrupted install whose package folder is currently missing.
+aicm_npm_prefix_shim_owner() { # catalog-index path
+  local i="$1" path="$2" pkg link size npm_names
+  aicm_npm_cache
+  [[ -n "$path" && -n "$AICM_NPM_PREFIX_CACHE" && "$path" == "$AICM_NPM_PREFIX_CACHE/bin/"* ]] || return 0
+  npm_names="$(aicm_cli_npm_names "$i")" || true
+  if [[ -L "$path" ]]; then
+    link="$(readlink "$path" 2>/dev/null || true)"
+    [[ -n "$link" ]] || return 0
+    while IFS= read -r pkg; do
+      [[ -n "$pkg" ]] || continue
+      case "$link" in
+        *"node_modules/$pkg/"*) printf '%s' "$pkg"; return 0 ;;
+      esac
+      if [[ -n "$AICM_NPM_ROOT_CACHE" && "$link" == *"$AICM_NPM_ROOT_CACHE/$pkg"* ]]; then
+        printf '%s' "$pkg"; return 0
+      fi
+    done <<< "$npm_names"
+    return 0
+  fi
+  [[ -f "$path" ]] || return 0
+  size="$(wc -c < "$path" 2>/dev/null | tr -d ' ' || true)"
+  [[ "$size" =~ ^[0-9]+$ && "$size" -le 65536 ]] || return 0
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    if grep -Fq -- "node_modules/$pkg/" "$path" 2>/dev/null; then printf '%s' "$pkg"; return 0; fi
+    if [[ -n "$AICM_NPM_ROOT_CACHE" ]] && grep -Fq -- "$AICM_NPM_ROOT_CACHE/$pkg" "$path" 2>/dev/null; then
+      printf '%s' "$pkg"; return 0
+    fi
+  done <<< "$npm_names"
+}
+
+# First installed candidate (canonical, then aliases).
+aicm_cli_npm_installed() {
+  local i="$1" pkg npm_names
+  npm_names="$(aicm_cli_npm_names "$i")" || true
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    if [[ -n "$(aicm_npm_pkg_version "$pkg")" ]]; then
+      printf '%s' "$pkg"
+      return 0
+    fi
+  done <<< "$npm_names"
+}
+
+# Sets CLI_INSTALLED CLI_PATH CLI_METHOD (npm|brew|standalone) CLI_NPMCOPY CLI_NPMPKG for catalog index $1.
+# CLI_NPMPKG is the package inventory and the updater use for this copy (PATH owner when both exist).
 aicm_cli_install() {
-  local i="$1" cmd npm_version real brew_prefix
-  CLI_INSTALLED=false; CLI_PATH=""; CLI_METHOD=""; CLI_NPMCOPY=""
+  local i="$1" cmd npm_version real npm_root_real owner installed_npm
+  CLI_INSTALLED=false; CLI_PATH=""; CLI_METHOD=""; CLI_NPMCOPY=""; CLI_NPMPKG=""
   cmd="${AICM_CLI_CMD[$i]}"
   [[ -n "$cmd" ]] || return 0
-  npm_version="$(aicm_npm_pkg_version "${AICM_CLI_NPM[$i]}")"
+  installed_npm="$(aicm_cli_npm_installed "$i")"
+  CLI_NPMPKG="${installed_npm:-${AICM_CLI_NPM[$i]}}"
+  npm_version="$(aicm_npm_pkg_version "$CLI_NPMPKG")"
   CLI_PATH="$(command -v "$cmd" 2>/dev/null || true)"
   if [[ -z "$CLI_PATH" ]]; then
     if [[ -n "$npm_version" ]]; then CLI_INSTALLED=true; CLI_METHOD=npm; CLI_PATH="(npm package, command not on PATH)"; fi
@@ -737,14 +1393,22 @@ aicm_cli_install() {
   CLI_INSTALLED=true
   real="$(aicm_realpath "$CLI_PATH")"
   aicm_npm_cache
-  brew_prefix="$(aicm_brew_prefix)"
-  # npm only when it lives in npm's own global folder: pnpm, bun and volta also keep node_modules
-  # folders, but `npm install -g` would only add a second copy that PATH does not run.
-  if { [[ -n "$AICM_NPM_ROOT_CACHE" ]] && [[ "$real" == "$(aicm_realpath "$AICM_NPM_ROOT_CACHE")/"* ]]; } ||
-     { [[ -n "$AICM_NPM_PREFIX_CACHE" ]] && [[ "$CLI_PATH" == "$AICM_NPM_PREFIX_CACHE/bin/"* ]]; }; then
+  owner="$(aicm_cli_npm_owner "$i" "$real")"
+  [[ -z "$owner" ]] && owner="$(aicm_npm_prefix_shim_owner "$i" "$CLI_PATH")"
+  [[ -n "$owner" ]] && CLI_NPMPKG="$owner"
+  npm_version="$(aicm_npm_pkg_version "$CLI_NPMPKG")"
+  npm_root_real=""
+  [[ -n "$AICM_NPM_ROOT_CACHE" ]] && npm_root_real="$(aicm_realpath "$AICM_NPM_ROOT_CACHE")"
+  # Proven ownership first: the resolved file in npm's node_modules, or Homebrew Cellar/Caskroom.
+  # A launcher in npm's prefix/bin only counts when it is a symlink into the package or a small shim
+  # that references its node_modules folder, so a standalone /usr/local/bin/agy is not npm (or brew)
+  # just because prefixes overlap or a hidden npm copy exists.
+  if [[ -n "$npm_root_real" && "$real" == "$npm_root_real/"* ]]; then
     CLI_METHOD=npm
-  elif [[ "$real" == */Cellar/* || "$real" == */Caskroom/* ]] || { [[ -n "$brew_prefix" ]] && [[ "$real" == "$brew_prefix/"* ]]; }; then
+  elif [[ "$real" == */Cellar/* || "$real" == */Caskroom/* ]]; then
     CLI_METHOD=brew
+  elif [[ -n "$owner" ]]; then
+    CLI_METHOD=npm
   else
     CLI_METHOD=standalone
   fi
@@ -833,6 +1497,13 @@ aicm_npm_backup() { # pkg
 # copy of a CLI whose install was cut off. rm -rf removes links inside as links; it never follows them.
 aicm_npm_leftovers() {
   aicm_npm_cache
+  # A backup folder can be the only copy of a CLI whose policy excludes updates or pins a version.
+  # While any policy rule is configured, skip the global housekeeping rather than guess which
+  # leftovers are policy-protected.
+  if [[ "${AICM_POLICY_PRESENT:-false}" == true ]] && ((${#AICM_POLICY_ID[@]} > 0)); then
+    echo "pass: npm leftover cleanup skipped while update policy is configured"
+    return 0
+  fi
   local root="$AICM_NPM_ROOT_CACHE" d name owner
   [[ -n "$root" && -d "$root" && ! -L "$root" ]] || return 0
   while IFS= read -r -d '' d; do
@@ -859,7 +1530,7 @@ aicm_npm_target() { # pkg days [installed skip-deprecated]
     return 0
   fi
   ((days < 0)) && days=0
-  f="$(aicm_npm_view_file "$pkg" time dist-tags versions)" || return 1
+  f="$(aicm_npm_view_file "$pkg" name time dist-tags versions)" || return 1
   out="$(node "$AICM_ROOT/lib/npm-guard.js" candidates "$days" "$f")" || { rm -f "$f"; return 1; }
   rm -f "$f"
   if [[ -z "$skipdep" ]]; then printf '%s\n' "$out" | head -n 1; return 0; fi

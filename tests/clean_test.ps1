@@ -66,6 +66,10 @@ $pythonPath = if ($python) { (Get-Command $python -CommandType Application | Sel
 
 try {
   New-Item -ItemType Directory -Path $fakeHome, $fakeTemp, $fakeLocal, $aicmHome, $outside, $fakeBin -Force | Out-Null
+  # The home already belongs to the tool (an earlier run or 'aicm.ps1 schedule install' marked it). An
+  # unmarked folder holding only dated archive folders is no longer adopted (no proof it is ours), so the
+  # archive fixtures below need the marker to reach the archive rules under test.
+  [System.IO.File]::WriteAllText((Join-Path $aicmHome '.aicm-home'), "AI CLI Auto Manager home (logs, state, archive, installed copy)`r`n")
   '@echo fake-cache-pruned' | Set-Content -LiteralPath "$fakeBin\uv.cmd" -Encoding ASCII
 
   # Fake codex (codex.ps1 and codex.cmd, like an npm install): records calls; archive moves the rollout
@@ -440,6 +444,82 @@ exit 0
   Expect-Gone "$codexHome\logs_22.sqlite" 'idle DB can be cleaned after its WAL closes'
   Expect-Gone "$codexHome\logs_22.sqlite-wal" 'idle WAL cleaned with its DB'
 
+  Write-Host '# archive containment: linked archive ancestors are not purged or written'
+  $outsideArchive = Join-Path $work 'outside-archive'
+  New-Item -ItemType Directory -Path "$outsideArchive\arch-link\20200101", "$fakeHome\archsrc" -Force | Out-Null
+  New-TestFile "$outsideArchive\arch-link\20200101\note.txt" 2000
+  $archiveRoot = Join-Path $aicmHome 'archive'
+  if (Test-Path -LiteralPath $archiveRoot) { [System.IO.Directory]::Delete($archiveRoot, $true) }
+  New-Item -ItemType Junction -Path $archiveRoot -Target $outsideArchive | Out-Null
+  'arch-link | all | archive | ~/archsrc | * | 1 | 1 | off |' | Set-Content -LiteralPath "$work\arch-link.conf" -Encoding ASCII
+  $null = Invoke-Clean @('-RulesFile', "$work\arch-link.conf", '-LocalRulesFile', "$work\none.conf")
+  Expect-Exists "$outsideArchive\arch-link\20200101\note.txt" 'purge does not follow a linked archive root'
+  [System.IO.Directory]::Delete($archiveRoot, $false)
+  $outsideDest = Join-Path $work 'outside-dest'
+  New-Item -ItemType Directory -Path $outsideDest, "$aicmHome\archive\arch-move", "$fakeHome\archsrc" -Force | Out-Null
+  New-TestFile "$fakeHome\archsrc\old.txt" 10
+  New-Item -ItemType Junction -Path "$aicmHome\archive\arch-move\$today" -Target $outsideDest | Out-Null
+  'arch-move | all | archive | ~/archsrc | * | 1 | 60 | on |' | Set-Content -LiteralPath "$work\arch-move.conf" -Encoding ASCII
+  $null = Invoke-Clean @('-RulesFile', "$work\arch-move.conf", '-LocalRulesFile', "$work\none.conf")
+  Expect-Exists "$fakeHome\archsrc\old.txt" 'archive move refuses a linked destination ancestor'
+  if (@(Get-ChildItem -LiteralPath $outsideDest -Force -ErrorAction SilentlyContinue).Count -eq 0) { Pass 'linked dest received no archived files' } else { Fail 'linked dest was written' }
+
+  Write-Host '# categories, explain and json'
+  foreach ($bad in 'nope', 'sessions,', 'sessions,sessions', 'all,temp') {
+    $r = Invoke-Clean @('-Category', $bad)
+    if ($r.ExitCode -eq 2) { Pass "category '$bad' rejected" } else { Fail "category '$bad' accepted" }
+  }
+  New-TestFile "$fakeHome\.gemini\tmp\chat\old.json" 40
+  New-TestFile "$fakeHome\.qwen\tmp\chat\old.json" 40
+  Set-DirAge "$fakeHome\.gemini\tmp\chat" 40
+  Set-DirAge "$fakeHome\.qwen\tmp\chat" 40
+  New-TestFile "$codexHome\.tmp\cat-only.bin" 40
+  New-TestFile "$aicmHome\archive\codex-images\20200103\old.png" 2000
+  $r = Invoke-Clean @('-Explain', '-Category', 'temp')
+  if ($r.Output -match 'codex-tmp\tcategory=temp\t' -and $r.Output -match 'age=7\tlimit=0\taction=delete' -and $r.Output -notmatch 'gemini-tmp') { Pass 'explain shows temp age, size limit and action' } else { Fail "explain: $($r.Output)" }
+  $null = Invoke-Clean @('-Category', 'temp')
+  Expect-Gone "$codexHome\.tmp\cat-only.bin" 'category temp removes temp files'
+  Expect-Exists "$fakeHome\.gemini\tmp\chat\old.json" 'gemini chats are sessions, not temp'
+  Expect-Exists "$aicmHome\archive\codex-images\20200103\old.png" 'category temp does not purge other archives'
+  $r = Invoke-Clean @('-Category', 'sessions')
+  Expect-Gone "$fakeHome\.gemini\tmp\chat\old.json" 'category sessions removes gemini chats'
+  Expect-Gone "$fakeHome\.qwen\tmp\chat\old.json" 'category sessions removes qwen chats'
+  'my-extra | all | age | ~/my-extra | * | 1 | | on | custom leftovers' | Add-Content -LiteralPath "$aicmHome\clean-rules.local.conf" -Encoding ASCII
+  New-TestFile "$fakeHome\my-extra\old.txt" 5
+  $r = Invoke-Clean @('-Explain', '-Category', 'other', '-Rules', 'my-extra')
+  if ($r.Output -match 'my-extra\tcategory=other\t' -and (Test-Path -LiteralPath "$fakeHome\my-extra\old.txt")) { Pass 'custom id is other and explain is read-only' } else { Fail "custom explain: $($r.Output)" }
+  New-TestFile "$fakeHome\only-temp\old.bin" 5 128
+  'only-temp | all | age | ~/only-temp | * | 1 | | on | json byte check' | Set-Content -LiteralPath "$work\only-temp.conf" -Encoding ASCII
+  '' | Set-Content -LiteralPath "$work\none.conf" -Encoding ASCII
+  $r = Invoke-Clean @('-Json', '-DryRun', '-Rules', 'only-temp', '-RulesFile', "$work\only-temp.conf", '-LocalRulesFile', "$work\none.conf", '-Category', 'other')
+  $jsonLine = @($r.Output -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+  try {
+    $doc = $jsonLine | ConvertFrom-Json
+    if ($doc.schemaVersion -eq 1 -and $doc.dryRun -eq $true -and $doc.rules[0].id -eq 'only-temp' -and $doc.rules[0].candidateBytes -eq 128 -and $doc.summary.freedBytes -eq 0) { Pass 'json preview document' } else { Fail "json preview: $jsonLine" }
+  } catch { Fail "json preview parse: $jsonLine" }
+  Expect-Exists "$fakeHome\only-temp\old.bin" 'json preview deletes nothing'
+
+  # Off archive: dry-run JSON plans the expired date folder; cache does not include it.
+  New-Item -ItemType Directory -Path "$fakeHome\off-arch-src" -Force | Out-Null
+  if (Test-Path -LiteralPath "$aicmHome\archive\claude-transcripts") { Remove-Item -LiteralPath "$aicmHome\archive\claude-transcripts" -Recurse -Force }
+  New-TestFile "$aicmHome\archive\claude-transcripts\20200102\kept.jsonl" 1 64
+  'claude-transcripts | all | archive | ~/off-arch-src | *.jsonl | 30 | 60 | off |' | Set-Content -LiteralPath "$work\off-arch.conf" -Encoding ASCII
+  $r = Invoke-Clean @('-Json', '-DryRun', '-RulesFile', "$work\off-arch.conf", '-LocalRulesFile', "$work\none.conf")
+  $jsonLine = @($r.Output -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+  try {
+    $doc = $jsonLine | ConvertFrom-Json
+    $rule = $doc.rules[0]
+    if ($doc.dryRun -eq $true -and $rule.enabled -eq $false -and $rule.candidates -eq 0 -and $rule.purgeCandidates -eq 1 -and $rule.purgeCandidateBytes -eq 64 -and $doc.summary.plannedBytes -eq 64 -and $doc.summary.freedBytes -eq 0) { Pass 'off archive dry-run plans purge bytes' } else { Fail "off archive json: $jsonLine" }
+  } catch { Fail "off archive json parse: $jsonLine" }
+  Expect-Exists "$aicmHome\archive\claude-transcripts\20200102\kept.jsonl" 'off archive dry-run keeps the file'
+  $r = Invoke-Clean @('-Json', '-DryRun', '-Category', 'cache', '-RulesFile', "$work\off-arch.conf", '-LocalRulesFile', "$work\none.conf")
+  $jsonLine = @($r.Output -split "`r?`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
+  try {
+    $doc = $jsonLine | ConvertFrom-Json
+    if ($doc.categories -contains 'cache' -and @($doc.rules).Count -eq 0 -and $doc.summary.plannedBytes -eq 0) { Pass 'category cache omits the sessions archive' } else { Fail "cache json: $jsonLine" }
+  } catch { Fail "cache json parse: $jsonLine" }
+  Expect-Exists "$aicmHome\archive\claude-transcripts\20200102\kept.jsonl" 'category cache leaves the sessions archive'
+
   Write-Host '# unknown rule id'
   $r = Invoke-Clean @('-Rules', 'nope')
   if ($r.ExitCode -eq 2) { Pass 'unknown id rejected' } else { Fail "unknown id exit $($r.ExitCode)" }
@@ -453,8 +533,8 @@ exit 0
   if ($r.ExitCode -ne 0) { Pass 'archive rule needs a delete-after limit' } else { Fail 'archive rule without limit accepted' }
 } finally {
   # Unlink junctions before removing the work folder so their targets are never walked.
-  foreach ($j in "$codexHome\.tmp\linked", "$fakeLocal\ms-playwright\chromium-1000\linked", "$fakeHome\alias", "$fakeHome\parent-link", "$fakeHome\parent-symlink") {
-    if (Test-Path -LiteralPath $j) { [System.IO.Directory]::Delete($j, $false) }
+  foreach ($j in "$codexHome\.tmp\linked", "$fakeLocal\ms-playwright\chromium-1000\linked", "$fakeHome\alias", "$fakeHome\parent-link", "$fakeHome\parent-symlink", "$aicmHome\archive", "$aicmHome\archive\arch-move\$today") {
+    if ((Test-Path -LiteralPath $j) -and ([IO.File]::GetAttributes($j) -band [IO.FileAttributes]::ReparsePoint)) { [System.IO.Directory]::Delete($j, $false) }
   }
   Remove-TestWorkspace $work
 }

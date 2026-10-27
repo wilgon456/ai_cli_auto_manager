@@ -33,6 +33,11 @@ Every run checks that the other jobs are still registered, and shows a desktop n
 
 ## Quick start
 
+Cleanup can permanently delete conversation history unused for 30 days. Preview
+the rules and keep a backup before enabling it. The examples below start with
+update and inventory schedules only; see [compatibility and first use](docs/compatibility.md)
+for supported installation channels and how to enable cleanup after review.
+
 ### Windows
 
 ```powershell
@@ -40,10 +45,10 @@ git clone https://github.com/wilgon456/ai_cli_auto_manager.git
 cd ai_cli_auto_manager
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
-.\bin\aicm.ps1 inventory           # installed AI CLIs (changes nothing)
+.\bin\aicm.ps1 inventory           # report installed CLIs and update coverage
 .\bin\aicm.ps1 status              # schedules, last runs, disk use and what can be freed
 .\bin\aicm.ps1 clean -DryRun       # preview what would be removed
-.\bin\aicm.ps1 schedule install    # update daily 05:00, inventory Mon 12:00, clean Mon 12:30
+.\bin\aicm.ps1 schedule install -NoClean  # update daily 05:00, inventory Mon 12:00
 ```
 
 ### macOS · Linux
@@ -55,7 +60,7 @@ cd ai_cli_auto_manager
 ./bin/aicm inventory
 ./bin/aicm status
 ./bin/aicm clean --dry-run
-./bin/aicm schedule install
+./bin/aicm schedule install --no-clean
 ```
 
 ## Automatic maintenance
@@ -76,17 +81,22 @@ logs, version floors and the process safety policy. `processes --kill` now follo
 | --- | --- |
 | `aicm inventory` | Lists the installed AI CLIs. `--offline` (`-Offline`) skips the latest-version lookups |
 | `aicm update` | Updates installed AI CLIs. `--dry-run`, `--targets codex,claude`, `--install-missing`, `--min-release-age-days N` |
-| `aicm clean` | Removes stale leftovers. `--dry-run`, `--rules codex-sessions,os-temp` |
+| `aicm clean` | Removes stale leftovers. `--dry-run`, `--rules id,id`, `--category sessions,cache,logs,temp,other` or `all`, `--json`, `--explain` |
+| `aicm archive list` | Indexed generic archives, newest first. `--json`, `--limit N`, `--offset N`. Legacy files say to restore by hand |
+| `aicm archive gc` | Drops index records that can never be restored again (archive folder already purged, or restored 30+ days ago). `--dry-run`, `--json` |
+| `aicm restore ID` | Puts one indexed file back. `--dry-run`, `--json`. Refuses when the original path exists |
+| `aicm history` | Local update, clean, and restore notes (at most 100; no file contents). `--limit N`, `--json` |
 | `aicm worktrees` | Worktrees and branches agent sessions left behind. Report only unless `--apply` (`-Apply`); `--days 14` |
 | `aicm config` | MCP servers and skills compared across the installed CLIs |
 | `aicm processes` | Ownership-aware orphan scan; `--kill` (`-Kill`) applies only to verified tagged orphans. Untagged runtimes are alert-only |
 | `aicm maintenance` | Quarantine owned stale files and report orphan processes; dry-run unless `--apply` (`-Apply`) |
 | `aicm run -- command` | Run a CLI in a tagged, contained session (Windows: `run -Cli command -CliArguments @(...)`) |
+| `aicm optimize` | Opt-in cache maintenance through the package managers' own commands (`npm cache verify`, `uv cache prune`, `pnpm store prune`). Preview by default; only `--apply` (`-Apply`) runs them. `--tasks npm-verify,uv-prune,pnpm-prune`, `--dry-run`, `--json`. Needs Node.js |
 | `aicm status` | Schedules, last run results, the last inventory, disk use per rule and what can be freed |
-| `aicm doctor` | Exits 1 with a list of problems when a schedule is missing or a run is overdue or failed |
+| `aicm doctor` | Exits 1 with a list of problems when a schedule is missing, a run is overdue or failed, the update policy is invalid (or needs a missing Node.js), or `AICM_HOME` is not usable. Also shows the installed copy, its source and versions. Changes nothing |
 | `aicm schedule install` | Registers update, inventory, clean and hourly maintenance jobs; running it again replaces them |
 | `aicm schedule remove` | Removes the jobs |
-| `aicm uninstall` | Removes the jobs and the installed copy; `--purge` (`-Purge`) also removes logs, state and archives |
+| `aicm uninstall` | Removes the jobs and the installed copy; `--purge` (`-Purge`) also removes the logs, state and archives the tool wrote. `--dry-run` (`-DryRun`) lists what would go and changes nothing |
 | `aicm version` | Prints the version |
 
 On Windows use `.\bin\aicm.ps1 <command>` with PowerShell-style options such as `-DryRun`, `-Targets`, `-Rules`.
@@ -98,13 +108,13 @@ The CLIs to look for are listed in the catalog [`rules/ai-clis.conf`](rules/ai-c
 ```text
 CLI                  via         version        latest         state     daily update
 Claude Code          npm         2.1.288        2.1.291        held      yes
-OpenAI Codex         standalone  0.157.1        0.160.1        behind    no: the update refreshes the npm copy, not the one on PATH
+OpenAI Codex         standalone  0.157.1        0.160.1        behind    no: update the PATH copy with its owning app or installer
                      npm copy 0.160.1 is also installed, but PATH runs C:\...\OpenAI\Codex\bin\codex.exe
 Grok Build           standalone  1.0.46         1.0.46         current   yes
 Cursor Agent         standalone  2026.09.18                    installed yes
 ```
 
-`held` means a newer release exists but is still inside the 3-day waiting period. `no` in the `daily update` column means the daily update does not reach that CLI, with the reason. When the copy the terminal runs differs from the copy the update refreshes (Codex above), the inventory says so and notifies you once with a concrete fix.
+`held` means a newer release exists but is still inside the 3-day waiting period. `no` in the `daily update` column means the daily update does not reach that CLI, with the reason. When an unsupported copy on PATH hides an npm installation (Codex above), the inventory shows the selected path and notifies you once with a concrete fix. Updates follow the installation selected by PATH.
 Results go to `~/.ai-cli-auto-manager/inventory.md` (a readable table) and `state/inventory.json`. Global npm packages that are not in the catalog are listed below the table.
 
 To add a CLI, write a row in the same format to `~/.ai-cli-auto-manager/ai-clis.local.conf`. A row with an existing `id` replaces the built-in one.
@@ -161,6 +171,31 @@ Security fixes also arrive as updates, so a long waiting period has a cost. Thre
 - **A Homebrew Codex starts its terminal host.** The cask build is quarantined, so the first exec of `codex-code-mode-host` waits on Gatekeeper's "downloaded from the Internet" prompt. On an unattended or remote Mac nobody answers it, the host never starts, and every shell and edit tool call fails with `timed out negotiating with the code-mode host`. Each run clears the quarantine from the Codex cask folder, but only after `codesign --check-notarization` confirms a notarized build signed by OpenAI (team `2DC432GLL2`). Retries that end early after a complete run still do this check. `AICM_CODEX_UNQUARANTINE=0` turns this off.
 - **One notification per problem.** A problem is notified when it first appears and then at most once a week while it lasts.
 
+### Update verification
+
+Each update records the PATH-selected command's path and version before and after, and a bounded exit status. A command that was present and is then missing, failed, empty, or timed out is a failure. An install reported as success with no command afterward is a failure. An unchanged version does not prove the latest release is installed. A command that failed before and works after is recorded as repaired. Post-update hooks run only after a healthy change. Local update history needs Node.js. There is no automatic rollback; version pins are optional per CLI (see below).
+
+### Per-CLI update policy
+
+Create `update-policy.json` in `$AICM_HOME` (default `~/.ai-cli-auto-manager` on macOS/Linux, `%USERPROFILE%\.ai-cli-auto-manager` on Windows). Set `AICM_HOME` before a run to keep the policy at a custom location (`$AICM_HOME/update-policy.json`). Node.js validates this file and also supplies the Unix process-containment launcher for real update runs. The file is strict: unknown fields or CLI ids, wrong types, malformed JSON, a directory or a dangling link in its place fail the run before any log, lock or state file is created.
+
+```json
+{
+  "schemaVersion": 1,
+  "tools": {
+    "claude": { "exclude": true },
+    "codex": { "pin": "0.42.0", "minReleaseAgeDays": 14 }
+  }
+}
+```
+
+- `gpt` is an alias for `codex`. Configure one or the other, never both: a policy that names both is rejected as an alias collision.
+- `exclude` wins over an explicit `--targets` entry, `--install-missing`, interrupted-install recovery, and Codex cask quarantine/recycle. An excluded CLI is not probed, so a broken `--version` cannot fail the run.
+- `pin` is an exact stable release and only supported for CLIs that this manager updates through npm (plus Amp's timestamp/hash releases). Ranges, tags, prereleases and URLs are refused. The pinned release must still be published, not deprecated, and at least the effective waiting period old. A pin never falls back to latest, and it never downgrades a newer installed copy. On a non-npm route the pin is held for manual action.
+- `minReleaseAgeDays` (0-3650) overrides `AICM_MIN_RELEASE_AGE_DAYS` for that CLI. A positive age or a pin cannot be enforced for a native/Homebrew/installer copy, so that route is held; an explicit `0` lets the native route run normally.
+- While any rule is configured, npm backup housekeeping is suspended, so a backup that is the only copy is not deleted. An interrupted npm install under a configured pin is held rather than reinstalled unchecked; the message names the manual `npm install -g` command and the backup and state entry are kept.
+- The stored fingerprint covers the normalized rules and the global waiting period. A scheduled retry skips only when the same fingerprint, targets and local day match; changing or removing the policy reruns the same day.
+
 ### Post-update hook
 
 A daemon that is already running may keep the old CLI binaries loaded. Put a hook file in place and it runs after an update that changed at least one CLI version; a failing hook only produces a warning.
@@ -183,10 +218,26 @@ the entire group is kept. On Windows cleanup holds handles that exclude readers/
 finishes deleting the group. An open sidecar alone is enough to keep the database.
 
 Recursive browser/archive cleanup keeps the whole directory if it contains protected files,
-links, or files that cannot be proven idle. Windows age rules only delete a SQLite family when
-all existing members meet the age and pattern conditions; readonly or unexpected sidecars keep
-all members. An explicitly selected Windows `AICM_HOME` may be a junction for installed-copy
+links, or files that cannot be proven idle. Date rules (`age`, `age-files`) on every platform only
+delete a SQLite family (`*.sqlite`, `*.sqliteN`, `*.db` with `-wal`, `-shm`, `-journal`) when all
+existing members meet the age and pattern conditions; a newer member (for example a fresh WAL that
+still holds committed data), a readonly, linked or unexpected sidecar keeps all members. On macOS
+and Linux the family must also be proven idle with `lsof`; a missing or failing `lsof`, or an open
+member, keeps it. A lone sidecar whose database is gone is a family of one. Other cache files are
+still removed in one batch. An explicitly selected Windows `AICM_HOME` may be a junction for installed-copy
 maintenance; user-data cleanup still refuses linked paths.
+
+`--category` limits which rules run. Names are `sessions`, `cache`, `logs`, `temp`, `other` and `all` (the default when the flag is omitted). It intersects `--rules` and does not enable a disabled rule. `gemini-tmp` and `qwen-tmp` are sessions, not cache. `--explain` is read-only: one line per rule (age, limit, action, what is protected). `--json` is one document for that same selection, not a per-file listing. Generic archive moves and purges, and `aicm archive` / `restore` / `history`, need Node.js. Real Unix cleanup uses Node.js for session containment; read-only native previews remain available without it. A real clean records a short local history entry (at most 100, no file contents). Previews do not. `aicm restore` never overwrites an existing path. Legacy archive files are listed for a manual move. Codex-native sessions are not generic restore ids.
+
+```sh
+aicm clean --category cache --dry-run --json
+aicm restore ID --dry-run
+```
+
+```powershell
+.\bin\aicm.ps1 clean -Category cache,logs -Json -DryRun
+# schedule install -CleanCategory 'cache,logs' or an array; both are normalized
+```
 
 The built-in rules live in one file, [`rules/clean-rules.conf`](rules/clean-rules.conf), shared by Windows and macOS/Linux. Ages count from the last time a file was used, not when it was created, so a long conversation you are still continuing is never removed. Most rules look at each entry of their folder as a whole (a session folder, say): it goes only when nothing inside it changed for the rule's days, so a session or a plugin checkout that is still in use is never thinned out file by file.
 
@@ -235,7 +286,96 @@ os-temp             | windows | age         | {temp}                        | * 
 my-notebook-cache   | all     | age         | ~/.cache/my-tool              | *.tmp     | 14   |       | on      | add your own
 ```
 
-There are seven kinds. `age` treats each entry directly in the folder (a session folder, a file) as one unit and deletes it once nothing inside it changed for `days`, so a folder still in use is never thinned out. `age-files` deletes single files older than `days` anywhere below the folder (for caches whose entries stand alone). `codex` deletes through Codex's commands (`limit` 0) or archives first. `archive` moves files to the archive and deletes them `limit` days later. `cap` deletes files directly in the folder when older than `days` or larger than `limit` MB. `keep-latest` keeps the newest `limit` versioned folders (`name-1234`) per name. `command` runs a tool's own cleanup command.
+There are eight kinds. `age` treats each entry directly in the folder (a session folder, a file) as one unit and deletes it once nothing inside it changed for `days`, so a folder still in use is never thinned out. `age-files` deletes single files older than `days` anywhere below the folder (for caches whose entries stand alone). `codex` deletes through Codex's commands (`limit` 0) or archives first. `archive` moves files to the archive and deletes them `limit` days later. `cap` deletes files directly in the folder when older than `days` or larger than `limit` MB (each file on its own). `budget` keeps a whole cache folder at or below `limit` MiB in total (see below). `keep-latest` keeps the newest `limit` versioned folders (`name-1234`) per name. `command` runs a tool's own cleanup command.
+
+### Cache budgets (optional)
+
+A `budget` rule caps the **total** logical size of one cache folder whose entries stand alone (the
+npm `_cacache`, the pip cache). No built-in rule uses it; the defaults stay age-based. To use it,
+replace a rule in `clean-rules.local.conf`, for example:
+
+```text
+# id      | os   | kind   | path            | pattern | days | limit | default | note
+npm-cache | unix | budget | ~/.npm/_cacache | *       | 14   | 2048  | on      | keep the npm cache under 2 GiB
+pip-cache | mac  | budget | ~/Library/Caches/pip | *  | 7    | 1024  | on      | keep the pip cache under 1 GiB
+```
+
+`days` (at least 1) is the minimum age of a file before it may go; `limit` (at least 1) is the budget
+in MiB. A zero, missing or malformed value is refused before anything runs. What happens:
+
+- The rule folder is scanned recursively (links are never entered or followed). **Every** ordinary
+  file counts toward the total, also protected, recent, hard-linked, SQLite and open files.
+- Only files that match `pattern`, are older than `days`, have a single link, are not protected and
+  are not SQLite database files or sidecars (`*.sqlite*`, `*.db`, `-wal`, `-shm`, `-journal`) are
+  candidates. They go oldest modification time first, ties by path, until the total is at or below the
+  budget. This is *not* least-recently-used: access times are not tracked.
+- Before each deletion the file is checked again (same type, size, time and identity; no link between
+  it and the rule folder; the rule folder itself not moved or replaced by a link) and must not be open:
+  `lsof` on macOS/Linux (missing or failing `lsof` deletes nothing), an exclusive FileGuard handle on
+  Windows. This narrows but cannot close the race with a program that opens the file right afterwards.
+- A scan that is not complete (an unreadable folder or file, or the bounds `AICM_BUDGET_MAX_FILES`
+  200000, `AICM_BUDGET_MAX_DEPTH` 32, `AICM_BUDGET_SCAN_SECONDS` 300) deletes nothing for that rule and
+  says so; the other rules still run.
+- When busy or protected data keeps the cache above the budget, the run says by how much
+  ("budget not reachable").
+
+The JSON row of a budget rule adds `totalBytes` (scanned before the run), `budgetBytes`,
+`remainingBytes` (what is left after a real run, counted again; a preview leaves it at the total),
+`projectedRemainingBytes` (what the selection would leave; on Windows a preview opens no files, so it
+assumes the candidates are not in use), `budgetUnmetBytes` and `scanStatus` (`complete`, `partial` or
+`unavailable`). These are **logical file sizes**, not a measurement of freed disk space (hard links,
+compression, sparse files and file-system blocks make them differ). Byte counts stay exact above 2 GiB.
+A budget is per cache folder: several CLIs that share one npm cache share one budget. Deleted entries
+are downloaded again when a tool needs them.
+
+## Optimize (opt-in)
+
+`aicm optimize` runs a fixed allowlist of the package managers' own maintenance commands. Nothing else
+can be run through it: no arbitrary command, no `npm install`/`update`/`dlx`/`npx`.
+
+| Task | Command | Effect |
+| --- | --- | --- |
+| `npm-verify` | `npm cache verify` | Checks the npm cache and garbage-collects entries nothing needs |
+| `uv-prune` | `uv cache prune` | Removes unused entries from the uv cache (the supported way; never delete uv's cache by hand) |
+| `pnpm-prune` | `pnpm store prune` | Removes packages no project references from the pnpm store |
+
+```sh
+aicm optimize                               # preview: looks the tools up on PATH, runs none, writes nothing
+aicm optimize --tasks uv-prune --dry-run --json
+aicm optimize --apply --tasks npm-verify,pnpm-prune
+```
+
+```powershell
+.\bin\aicm.ps1 optimize -Json
+.\bin\aicm.ps1 optimize -Apply -Tasks npm-verify,uv-prune
+```
+
+- The default and `--dry-run` are previews: each tool is only looked up on PATH (absolute PATH entries;
+  the path found is recorded), never started, so no Corepack bootstrap or download happens. Unknown,
+  duplicated or empty task names and `--apply` together with `--dry-run` are refused (exit 2) before
+  anything is looked up or written. Tasks always run in the order of the table.
+- `--apply` claims `AICM_HOME` like other real runs, refuses while an update, cleanup, archive or
+  restore runs, and holds the shared maintenance lock (`state/maintenance.lock`) until its last command
+  has ended, also when a command fails or the run is interrupted.
+- A task is skipped while a process of that package manager runs, including a package manager that
+  started this optimizer. This optimizer itself is excluded. An unreadable process table or an
+  unreadable Node/Bun command line also holds the affected npm/pnpm tasks.
+- Each command runs offline (Corepack network, project selection, project env-file, prompts and
+  auto-pin disabled; npm/pnpm offline; uv offline). pnpm project-version bootstrap is disabled across
+  the legacy and current setting names. Guard values override inherited settings regardless of
+  capitalization. A Corepack shim whose package manager is not downloaded yet fails instead of
+  downloading it. Each command has a time limit (`AICM_OPTIMIZE_TIMEOUT`, default
+  900 seconds); on timeout its whole process group (Windows: process tree) is stopped.
+- One failing task does not stop the others. A missing tool is `unavailable`, a failure, timeout or
+  skip is never counted as success; the exit code is 0 only when every selected task succeeded.
+- On Windows a `.cmd`/`.bat` shim (npm, pnpm) runs through `%SystemRoot%\System32\cmd.exe /d /v:off /s /c`
+  with its quoted path and the fixed words above; a path containing `" % ! ^ & | < > ( )` is refused,
+  and a `.ps1` shim is never run.
+- These commands are not byte-precise transactions: the preview cannot say how much each will remove,
+  and pruned packages are downloaded again later. There is no schedule for optimize; run it yourself.
+- `--json` prints one document: `schemaVersion`, `mode` (`preview`/`apply`), `status`, one row per task
+  (`id`, `command`, `executable`, `status`: `would-run`, `ok`, `failed`, `timeout`, `busy`, `skipped`,
+  `refused` or `unavailable`, `reason`, `exitCode`, `durationMs`, last output) and `summary` counts.
 
 ## Running many sessions (Paseo, Orca, ...)
 
@@ -307,7 +447,34 @@ Scheduled jobs can disappear or stop working silently. The jobs installed are re
 
 Logs are kept for 30 days; change that with `LOG_RETENTION_DAYS` (or `-LogRetentionDays` on Windows). Set `AICM_HOME` to move everything elsewhere.
 
-`uninstall --purge` (`-Purge`) removes only what the tool wrote (`app`, `logs`, `state`, `archive`, `inventory.md`) and keeps your own files there (`hooks/`, `*.local.conf`, `repos.conf`); the folder goes only when nothing is left in it. A folder without the `.aicm-home` marker is purged only when it is the default `~/.ai-cli-auto-manager`.
+### Which folder the tool owns
+
+`AICM_HOME` is used only when it is new or empty, carries the `.aicm-home` marker the tool wrote, or
+is an unmarked folder of an older version that holds an installed copy (`app` with `SOURCE` and
+`VERSION`) and otherwise only what the tool writes (`logs`, `state`, `archive`, `inventory.md`) or
+what you add (`hooks/`, `*.local.conf`, `repos.conf`, `update-policy.json`); such a folder is marked
+on its first real run. Anything else, a folder name alone (`.ai-cli-auto-manager`), a reserved folder
+alone (`archive/<rule>/<date>`), a marker with other content, or your home folder itself is refused:
+every run, `schedule install` and `--purge` stop before writing or deleting anything there. Help, bad
+arguments and previews never create the marker.
+
+The marker does not whitelist content. Before the installed copy is replaced, removed or purged,
+`app` (and `app.new`/`app.old`) must hold only what a copy holds; a copy records its own file list in
+`app/.aicm-copy`, so a personal file anywhere in it (`app/personal.txt`, `app/lib/notes.txt`) stops
+the sync or uninstall with a message instead of being deleted. `uninstall --purge` (`-Purge`) removes
+only log and state files under the names the tool uses and archived files listed in the archive index
+(same size); unindexed files, even in a dated archive folder, and anything linked are kept and listed.
+Your own files (`hooks/`, `*.local.conf`, `repos.conf`) stay, and the folder goes only when nothing is
+left in it. `uninstall --purge --dry-run` (`-Purge -DryRun`) shows all of this without removing jobs,
+the copy or data, and without writing a marker, log or state. A Windows `AICM_HOME` you point at a
+junction still works; links and junctions inside it are never followed.
+
+`archive list` reads the index newest first, at most 10000 records per page (`--offset` for older
+ones). Files under `archive/` are called legacy only when the whole index (up to 100000 records) and
+the archive folder could be read; otherwise the JSON says `"legacy": {"complete": false}` and none are
+guessed. A real clean that ran an archive rule also runs `archive gc` under the same maintenance lock,
+so expired and long-restored records do not pile up; pending, still-restorable and unreadable records
+and any other file are never removed.
 
 ## Moving from 1.x (ai_cli_auto_update)
 
@@ -319,30 +486,57 @@ Logs are kept for 30 days; change that with `LOG_RETENTION_DAYS` (or `-LogRetent
 
 ## Development and tests
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for compatibility rules and contribution
+checks, and [SECURITY.md](SECURITY.md) for vulnerability reporting.
+
 All tests run in a throwaway home folder and never touch your real home folder or real scheduled tasks. Inventory, update and clean tests use fake CLIs, a fake npm and a fake codex, so no real CLI is run or updated. The Node tests build throwaway repositories and inject orphan-process snapshots. Containment tests terminate only the fixture processes they create.
 
 ```bash
 shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
 bash tests/clean_test.sh
 python3 tests/cleanup_safety_test.py
+bash tests/cache_budget_test.sh
 bash tests/aicm_test.sh
 bash tests/inventory_test.sh
+python3 tests/npm_recovery_safety_test.py
 bash tests/codex_host_test.sh
+bash tests/maintenance_integration_test.sh
+bash tests/update_verify_test.sh
+bash tests/update_policy_test.sh
 node --test tests/node/*.test.js
+python3 scripts/check_manifest.py
+python3 tests/release_packaging_test.py
 ```
 
 ```powershell
 .\tests\clean_test.ps1
+.\tests\cache_budget_test.ps1
 .\tests\aicm_test.ps1
 .\tests\inventory_test.ps1
+.\tests\maintenance_json_test.ps1
+.\tests\update_policy_test.ps1
+.\tests\home_ownership_test.ps1
+.\tests\unicode_paths_test.ps1
 ```
 
+Release maintainers: see [docs/release-checklist.md](docs/release-checklist.md).
+
 CI runs the same tests on Ubuntu, macOS (with the bash 3.2 that ships with it), Windows PowerShell 5.1 and PowerShell 7.
+
+## Follow-up
+
+Categories, JSON, restore, local history, and update verification are in this iteration. Exact Windows and Linux runs of that work are still pending; configured CI is not a record that this checkout ran there.
+
+Per-CLI pin, exclude, and waiting-period policies, cache budget rules and the opt-in `optimize`
+command are in this iteration. Not in this release, left for later: flushing the OS DNS cache,
+resetting the macOS QuickLook cache, and SQLite `VACUUM` of tool databases. An optional TUI may come later.
 
 ## Limitations
 
 - Built for personal machines and small teams; for organization-wide rollout, add your own change management.
 - There is no automatic rollback to a previous version.
+- Budget and optimize report logical bytes and command results, not measured free disk space; pruned
+  caches are downloaded again when needed.
 - The waiting period and the signature and red-flag checks apply to npm-installed CLIs only. CLIs updated through Homebrew, winget, their own updater (`claude update` and similar) or the xAI install script rely on that channel.
 - Grok Build is in beta and may require an account or subscription.
 

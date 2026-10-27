@@ -33,10 +33,16 @@ function Invoke-FakeNpm([string[]]$Arguments) {
 
 function New-NpmCli([string]$Command, [string]$Package, [string]$Version) {
   Invoke-FakeNpm @('install', '-g', "$Package@$Version")
-  $pj = Join-Path $npmRoot (($Package -replace '/', '\') + '\package.json')
-  "(Get-Content -LiteralPath '$pj' -Raw | ConvertFrom-Json).version | ForEach-Object { '$Command ' + `$_ }" |
-    Set-Content -LiteralPath "$prefix\$Command-impl.ps1" -Encoding ASCII
-  "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0$Command-impl.ps1`" %*" | Set-Content -LiteralPath "$prefix\$Command.cmd" -Encoding ASCII
+  $rel = $Package -replace '/', '\'
+  $pkgDir = Join-Path $npmRoot $rel
+  "console.log('$Command ' + require('./package.json').version)" |
+    Set-Content -LiteralPath (Join-Path $pkgDir 'cli.js') -Encoding ASCII
+  $payload = Join-Path "$work\package-payloads" $rel
+  New-Item -ItemType Directory -Path $payload -Force | Out-Null
+  Copy-Item -LiteralPath (Join-Path $pkgDir 'cli.js') -Destination $payload -Force
+  # A real npm global .cmd calls the package script directly, so ownership detection can read the
+  # node_modules reference instead of guessing from the prefix.
+  "@node `"%~dp0node_modules\$rel\cli.js`" %*" | Set-Content -LiteralPath "$prefix\$Command.cmd" -Encoding ASCII
 }
 
 function Invoke-Script([string]$Script, [string[]]$Arguments, [hashtable]$Extra = @{}) {
@@ -49,9 +55,9 @@ function Invoke-Script([string]$Script, [string[]]$Arguments, [hashtable]$Extra 
     $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'
     foreach ($k in 'AICM_MIN_RELEASE_AGE_DAYS', 'AICM_VERIFY_SIGNATURES', 'AICM_ALLOW') { [Environment]::SetEnvironmentVariable($k, $null) }
     foreach ($k in $fakeEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $fakeEnv[$k]) }
-    foreach ($k in $Extra.Keys) { [Environment]::SetEnvironmentVariable($k, $Extra[$k]) }
     $env:HOME = $fakeHome; $env:CODEX_HOME = "$fakeHome\.codex"
     $env:PATH = "$fakeBin;$prefix;$solo;$runtimePath"
+    foreach ($k in $Extra.Keys) { [Environment]::SetEnvironmentVariable($k, $Extra[$k]) }
     $ErrorActionPreference = 'Continue'
     $output = & $exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root $Script) @Arguments 2>&1 | Out-String -Width 400
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
@@ -314,13 +320,24 @@ try {
   $wasVersion = (Get-Content -LiteralPath "$pkgDir\package.json" -Raw | ConvertFrom-Json).version
   Rename-Item -LiteralPath $pkgDir -NewName '.npmcli-XyZw9876'
   $installsBefore = @(Get-Calls | Where-Object { $_ -eq "install -g @fake/npmcli@$wasVersion" }).Count
+  $stateFile = Join-Path $aicmHome 'state\update-npm.json'
+  # fakenpm is not selected: recovery must not touch its backup, package or state.
   $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
-  if ($r.ExitCode -eq 0 -and $r.Output -match "restored: @fake/npmcli $([regex]::Escape($wasVersion))" -and @(Get-Calls | Where-Object { $_ -eq "install -g @fake/npmcli@$wasVersion" }).Count -eq $installsBefore + 1) { Pass 'a CLI whose install was cut off is reinstalled at the same version' } else { Fail "restore: $($r.Output)" }
+  $stateText = if (Test-Path -LiteralPath $stateFile) { Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 } else { '' }
+  if ($r.ExitCode -eq 0 -and $r.Output -notmatch "restored: @fake/npmcli" -and (Test-Path -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-XyZw9876')) -and -not (Test-Path -LiteralPath (Join-Path $npmRoot '@fake\npmcli')) -and $stateText -match '@fake/npmcli') {
+    Pass 'an unselected CLI is not recovered and its backup and state are kept'
+  } else { Fail "unselected recovery: exit $($r.ExitCode) $($r.Output)" }
+  # Explicitly named: the interrupted install is recovered at the same version.
+  $r = Invoke-Script $upd @('-Targets', 'fakeshadow,fakenpm')
+  if ($r.ExitCode -eq 0 -and $r.Output -match "restored: @fake/npmcli $([regex]::Escape($wasVersion))" -and @(Get-Calls | Where-Object { $_ -eq "install -g @fake/npmcli@$wasVersion" }).Count -eq $installsBefore + 1) { Pass 'a selected CLI whose install was cut off is reinstalled at the same version' } else { Fail "restore: $($r.Output)" }
   Remove-Item -LiteralPath (Join-Path $npmRoot '@fake\.npmcli-XyZw9876') -Recurse -Force
   Remove-Item -LiteralPath (Join-Path $npmRoot '@fake\newcli') -Recurse -Force
-  $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
-  if ($r.ExitCode -ne 0 -and $r.Output -match 'notify: .*@fake/newcli disappeared since the last update') { Pass 'a managed CLI that is gone is reported as a failure' } else { Fail "missing CLI: exit $($r.ExitCode) $($r.Output)" }
-  $r = Invoke-Script $upd @('-Targets', 'fakeshadow')
+  foreach ($launcher in 'fakenew.cmd', 'fakenew.ps1') {
+    Remove-Item -LiteralPath (Join-Path $prefix $launcher) -Force -ErrorAction SilentlyContinue
+  }
+  $r = Invoke-Script $upd @('-Targets', 'fakenew')
+  if ($r.ExitCode -ne 0 -and $r.Output -match 'notify: .*@fake/newcli disappeared since the last update') { Pass 'a selected managed CLI that is gone is reported as a failure' } else { Fail "missing CLI: exit $($r.ExitCode) $($r.Output)" }
+  $r = Invoke-Script $upd @('-Targets', 'fakenew')
   if ($r.ExitCode -eq 0 -and $r.Output -notmatch 'disappeared') { Pass 'it is reported once, then forgotten (it may have been removed on purpose)' } else { Fail "missing CLI repeated: $($r.Output)" }
 
   Write-Host '# builtin PATH ownership and inventory coverage agree with update behavior'
@@ -364,6 +381,88 @@ try {
   Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
   $r = Invoke-Script $upd @('-Targets', 'codex')
   if ($r.ExitCode -eq 0 -and $r.Output -match 'unused npm copy @openai/codex is not restored' -and -not ((Get-Calls) -match '^install -g @openai/codex')) { Pass 'recovery also leaves hidden Codex npm copy alone' } else { Fail "shadow recovery : $($r.Output)" }
+
+  Write-Host '# OpenCode V1 retains its npm owner when V2 is also installed'
+  $reg = Get-Content -LiteralPath "$work\registry.json" -Raw | ConvertFrom-Json
+  $reg | Add-Member -NotePropertyName '@opencode/cli' -NotePropertyValue ([pscustomobject]@{ latest = '2.1.0'; versions = [pscustomobject]@{
+    '2.0.0' = [pscustomobject]@{ daysAgo = 30 }; '2.1.0' = [pscustomobject]@{ daysAgo = 10 } } })
+  $reg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$work\registry.json" -Encoding ASCII
+  New-NpmCli 'opencode' '@opencode/cli' '2.0.0'
+  @('@echo off', 'echo opencode 1.0.0') | Set-Content -LiteralPath "$npmRoot\opencode-ai\opencode.cmd" -Encoding ASCII
+  '@"%~dp0node_modules\opencode-ai\opencode.cmd" %*' | Set-Content -LiteralPath "$prefix\opencode.cmd" -Encoding ASCII
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $r = Invoke-Script $upd @('-Targets', 'opencode')
+  if ($r.ExitCode -eq 0 -and (Get-Calls) -contains 'install -g opencode-ai@1.1.0' -and -not ((Get-Calls) -match '@opencode/cli@')) { Pass 'OpenCode V1 updates without switching to V2' } else { Fail "OpenCode V1 owner: $($r.Output)" }
+
+  Write-Host '# Amp uses @ampcode/cli, keeps legacy @sourcegraph/amp, and updates the PATH owner'
+  $reg = Get-Content -LiteralPath "$work\registry.json" -Raw | ConvertFrom-Json
+  $reg | Add-Member -NotePropertyName '@ampcode/cli' -NotePropertyValue ([pscustomobject]@{ latest = '1.1.0'; versions = [pscustomobject]@{
+    '1.0.0' = [pscustomobject]@{ daysAgo = 30 }; '1.1.0' = [pscustomobject]@{ daysAgo = 10 } } })
+  $reg | Add-Member -NotePropertyName '@sourcegraph/amp' -NotePropertyValue ([pscustomobject]@{ latest = '0.2.0'; versions = [pscustomobject]@{
+    '0.1.0' = [pscustomobject]@{ daysAgo = 30 }; '0.2.0' = [pscustomobject]@{ daysAgo = 10 } } })
+  $reg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$work\registry.json" -Encoding ASCII
+  function New-AmpOwned([string]$Package, [string]$Version) {
+    Invoke-FakeNpm @('install', '-g', "$Package@$Version")
+    $pkgDir = Join-Path $npmRoot ($Package -replace '/', '\')
+    @('@echo off', "echo amp $Version") | Set-Content -LiteralPath (Join-Path $pkgDir 'amp.cmd') -Encoding ASCII
+    $payload = Join-Path "$work\package-payloads" ($Package -replace '/', '\')
+    New-Item -ItemType Directory -Path $payload -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $pkgDir 'amp.cmd') -Destination $payload -Force
+    return $pkgDir
+  }
+  $ampDir = New-AmpOwned '@ampcode/cli' '1.0.0'
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $ampPath = "$ampDir;$fakeBin;$prefix;$solo;$runtimePath"
+  $r = Invoke-Script $upd @('-Targets', 'amp') -Extra @{ PATH = $ampPath }
+  if ($r.ExitCode -eq 0 -and (Get-Calls) -contains 'install -g @ampcode/cli@1.1.0') { Pass 'canonical Amp package is updated' } else { Fail "amp canonical: $($r.Output)" }
+  if (-not ((Get-Calls) -match '@sourcegraph/amp')) { Pass 'missing legacy Amp package is not the install target' } else { Fail 'legacy probed on canonical-only' }
+  $ampDir = New-AmpOwned '@sourcegraph/amp' '0.1.0'
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $ampPath = "$ampDir;$fakeBin;$prefix;$solo;$runtimePath"
+  $r = Invoke-Script $upd @('-Targets', 'amp') -Extra @{ PATH = $ampPath }
+  if ($r.ExitCode -eq 0 -and (Get-Calls) -contains 'install -g @sourcegraph/amp@0.2.0') { Pass 'legacy Amp package is updated when it owns PATH' } else { Fail "amp legacy: $($r.Output)" }
+  if (-not ((Get-Calls) -match '@ampcode/cli@')) { Pass 'canonical Amp is not updated while PATH is the legacy copy' } else { Fail 'canonical updated behind legacy' }
+  Invoke-FakeNpm @('install', '-g', '@ampcode/cli@1.0.0')
+  $ampDir = New-AmpOwned '@ampcode/cli' '1.0.0'
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $ampPath = "$ampDir;$fakeBin;$prefix;$solo;$runtimePath"
+  $r = Invoke-Script $upd @('-Targets', 'amp') -Extra @{ PATH = $ampPath }
+  if ($r.ExitCode -eq 0 -and (Get-Calls) -contains 'install -g @ampcode/cli@1.1.0') { Pass 'PATH-owning Amp package is selected when both exist' } else { Fail "amp both: $($r.Output)" }
+  if (-not ((Get-Calls) -contains 'install -g @sourcegraph/amp@0.2.0')) { Pass 'hidden Amp alternate is not updated' } else { Fail 'hidden amp updated' }
+
+  # Real npm launchers sit in the prefix, not inside either package directory.
+  New-AmpOwned '@sourcegraph/amp' '0.1.0' | Out-Null
+  '@"%~dp0node_modules\@sourcegraph\amp\amp.cmd" %*' | Set-Content -LiteralPath "$prefix\amp.cmd" -Encoding ASCII
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $r = Invoke-Script $upd @('-Targets', 'amp')
+  if ($r.ExitCode -eq 0 -and (Get-Calls) -contains 'install -g @sourcegraph/amp@0.2.0' -and -not ((Get-Calls) -match '@ampcode/cli@')) { Pass 'Windows npm shim selects the legacy Amp owner when both exist' } else { Fail "Amp shim ownership: $($r.Output)" }
+
+  Rename-Item -LiteralPath "$npmRoot\@sourcegraph\amp" -NewName '.amp-XyZw9876'
+  '{"@sourcegraph/amp":"0.2.0"}' | Set-Content -LiteralPath "$aicmHome\state\update-npm.json" -Encoding ASCII
+  Remove-Item -LiteralPath "$work\npm-calls.log" -ErrorAction SilentlyContinue
+  $r = Invoke-Script $upd @('-Targets', 'amp')
+  if ($r.ExitCode -eq 0 -and $r.Output -match 'restored: @sourcegraph/amp' -and -not ((Get-Calls) -match '@ampcode/cli@')) { Pass 'interrupted legacy Amp install is restored without switching packages' } else { Fail "Amp legacy recovery: $($r.Output)" }
+
+  Write-Host '# Copilot winget id is covered and updated on the installed channel'
+  $wingetLinks = Join-Path $work 'WinGet\Links'
+  New-Item -ItemType Directory -Path $wingetLinks -Force | Out-Null
+  @('@echo off', 'echo copilot 0.0.327') | Set-Content -LiteralPath (Join-Path $wingetLinks 'copilot.cmd') -Encoding ASCII
+  @(
+    '@echo off'
+    ('echo %*>>"{0}"' -f (Join-Path $work 'winget-calls.log'))
+    'if /i "%1"=="list" (echo GitHub.Copilot 0.0.327 & exit /b 0)'
+    'exit /b 0'
+  ) | Set-Content -LiteralPath "$fakeBin\winget.cmd" -Encoding ASCII
+  $copilotPath = "$fakeBin;$wingetLinks;$prefix;$solo;$runtimePath"
+  $r = Invoke-Script 'bin\inventory_ai_clis.ps1' @('-Offline', '-LocalCatalogFile', "$work\none.conf") -Extra @{ PATH = $copilotPath }
+  if ($r.Output -match '(?m)^GitHub Copilot CLI +winget .* yes') { Pass 'winget Copilot is covered' } else { Fail "copilot winget coverage: $($r.Output)" }
+  $r = Invoke-Script $upd @('-Targets', 'copilot') -Extra @{ PATH = $copilotPath }
+  $wg = if (Test-Path -LiteralPath "$work\winget-calls.log") { Get-Content -LiteralPath "$work\winget-calls.log" -Raw } else { '' }
+  if ($r.ExitCode -eq 0 -and $wg -match 'upgrade --id GitHub\.Copilot') { Pass 'installed winget Copilot is upgraded' } else { Fail "copilot winget update: $($r.Output)" }
+  $npmBefore = @((Get-Calls) | Where-Object { $_ -like 'install -g @github/copilot*' }).Count
+  $r = Invoke-Script $upd @('-Targets', 'copilot', '-InstallMissing') -Extra @{ PATH = $copilotPath }
+  $npmAfter = @((Get-Calls) | Where-Object { $_ -like 'install -g @github/copilot*' }).Count
+  if ($npmAfter -eq $npmBefore) { Pass 'Copilot stays on the winget channel' } else { Fail "copilot channel changed: $($r.Output)" }
 
   Write-Host '# bad catalog'
   'Bad Id | x | x |  |  |  |  |' | Set-Content -LiteralPath "$work\bad.conf" -Encoding UTF8
