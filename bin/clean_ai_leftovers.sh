@@ -138,6 +138,7 @@ home_refused() {
 }
 if [[ "$MUTATING" == true ]]; then
   aicm_claim_home || home_refused
+  aicm_contain_script "$0" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
 elif [[ "$JSON" != true && "$REPORT" != true ]]; then
   aicm_home_usable || home_refused
 fi

@@ -28,6 +28,7 @@ $ErrorActionPreference = 'Stop'
 if (-not $LogDir) { $LogDir = Join-Path (Get-AicmHome) 'logs' }
 # Claims (marks) the home; a folder this tool did not create is refused before anything is written.
 try { Confirm-AicmHome } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+Initialize-AicmProcessContainment -OwnSession
 Initialize-AicmDirectory $LogDir
 $transcript = Join-Path $LogDir ("inventory-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 Start-Transcript -Path $transcript -Force | Out-Null

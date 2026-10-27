@@ -1,0 +1,30 @@
+name: automatic maintenance
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  maintenance:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install lock inspection tool (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lsof
+      - name: Maintenance safety and containment tests
+        run: node --test tests/node/auto-maintenance.test.js
+      - name: Native Job Object and locked-file tests (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\tests\auto_maintenance_test.ps1
+      - name: Native Job Object and locked-file tests (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\tests\auto_maintenance_test.ps1

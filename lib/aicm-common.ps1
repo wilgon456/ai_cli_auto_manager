@@ -714,11 +714,10 @@ function Test-AicmHomeMarker([string]$HomeDir) {
 # A file name the tool ships in bin, lib, rules or windows (used only for copies built before the copy
 # kept its own file list in .aicm-copy). $Rel uses '/'.
 function Test-AicmAppFileShape([string]$Rel) {
-  # Exact legacy names only; an extension alone does not establish ownership.
   $known = @(
     'bin/aicm', 'bin/aicm.ps1', 'bin/clean_ai_leftovers.ps1', 'bin/clean_ai_leftovers.sh', 'bin/inventory_ai_clis.ps1', 'bin/inventory_ai_clis.sh', 'bin/update_ai_clis.ps1', 'bin/update_ai_clis.sh',
-    'lib/aicm-common.ps1', 'lib/aicm-common.sh', 'lib/aicm-file-guard.cs', 'lib/codex-host.sh', 'lib/config-drift.js', 'lib/maintenance-cli.js', 'lib/maintenance.js', 'lib/node-common.js', 'lib/npm-guard.js', 'lib/optimize.js', 'lib/processes.js', 'lib/update-policy.js', 'lib/worktrees.js',
-    'rules/ai-clis.conf', 'rules/clean-categories.conf', 'rules/clean-rules.conf',
+    'lib/aicm-common.ps1', 'lib/aicm-common.sh', 'lib/aicm-file-guard.cs', 'lib/aicm-job.cs', 'lib/aicm-process-token.cs', 'lib/auto-maintenance.js', 'lib/codex-host.sh', 'lib/config-drift.js', 'lib/maintenance-cli.js', 'lib/maintenance-files.js', 'lib/maintenance-files.ps1', 'lib/maintenance-processes.js', 'lib/maintenance.js', 'lib/node-common.js', 'lib/npm-guard.js', 'lib/optimize.js', 'lib/processes.js', 'lib/supervise.js', 'lib/update-policy.js', 'lib/worktrees.js',
+    'rules/ai-clis.conf', 'rules/clean-categories.conf', 'rules/clean-rules.conf', 'rules/maintenance.conf',
     'windows/install_scheduled_task.ps1', 'windows/run-hidden.vbs'
   )
   return $known -contains $Rel
@@ -794,8 +793,8 @@ function Test-AicmAppCopyOwned([string]$Dir, [switch]$Partial) {
 
 # Names the tool gives files in logs\ (logs, transcripts, cron/launchd output and their temp files).
 function Test-AicmLogName([string]$Name) {
-  foreach ($p in 'update-[0-9]*.log', 'clean-[0-9]*.log', 'inventory-[0-9]*.log', 'latest.log', 'notifications.log',
-    'cron.update.log', 'cron.inventory.log', 'cron.clean.log', 'launchd.*.out.log', 'launchd.*.err.log', '*.log.[0-9]*.tmp') {
+  foreach ($p in 'maintenance-[0-9]*.jsonl', 'maintenance-[0-9]*.txt', 'update-[0-9]*.log', 'clean-[0-9]*.log', 'inventory-[0-9]*.log', 'latest.log', 'notifications.log',
+    'cron.update.log', 'cron.inventory.log', 'cron.clean.log', 'cron.maintenance.log', 'launchd.*.out.log', 'launchd.*.err.log', '*.log.[0-9]*.tmp') {
     if ($Name -like $p) { return $true }
   }
   return $false
@@ -805,7 +804,7 @@ function Test-AicmLogName([string]$Name) {
 function Test-AicmStateFileName([string]$Name) {
   if ($Name -like '.weekly-due.[0-9]*' -or $Name -like '.schedule-time.[0-9]*') { return $true }
   $n = $Name -replace '\.\d+\.tmp$', ''
-  if (@('last-update.json', 'last-clean.json', 'inventory.json', 'schedule.json', 'npm-verdicts.json', 'npm-verdicts.tsv',
+  if (@('last-update.json', 'last-clean.json', 'last-maintenance.json', 'inventory.json', 'schedule.json', 'npm-verdicts.json', 'npm-verdicts.tsv',
     'update-running.json', 'update-npm.json', 'update-npm.tsv', 'update-deferred.json', 'inventory-error.json',
     'inventory.tsv', 'inventory-shadow.txt', 'config-drift.json', 'processes.json', 'worktrees.json') -contains $n) { return $true }
   foreach ($p in '*-attention.json', 'attention-*.tsv', 'attention-*.json') { if ($n -like $p) { return $true } }
@@ -814,10 +813,11 @@ function Test-AicmStateFileName([string]$Name) {
 
 # Folders the tool keeps in state\ and the names it gives files there (manifests, history, lock).
 function Test-AicmStateDirName([string]$Name) {
-  return ((@('archive-index', 'history', 'maintenance.lock') -contains $Name) -or $Name -like 'maintenance.lock.stale-*')
+  return ((@('archive-index', 'history', 'sessions', 'maintenance.lock') -contains $Name) -or $Name -like 'maintenance.lock.stale-*')
 }
 function Test-AicmStateSubfileName([string]$Dir, [string]$Name) {
   if ($Dir -eq 'archive-index' -or $Dir -eq 'history') { return ($Name -cmatch '^\.?[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.json(\.[0-9]+\.[0-9a-f]+\.tmp)?$') }
+  if ($Dir -eq 'sessions') { return ($Name -cmatch '^[a-f0-9-]{36}\.json$') }
   if ($Dir -like 'maintenance.lock*') { return ($Name -ceq 'owner.json' -or $Name -cmatch '^\.owner\.json\.[0-9]+\.[0-9a-f]+\.tmp$') }
   return $false
 }
@@ -1274,7 +1274,7 @@ function Get-AicmTaskProblems($Task, [string]$Job) {
   $code = [int64]$info.LastTaskResult
   if ($code -in @(0, 0x41301, 0x41303, 0x41325)) { return }
   if ($code -eq 1) {
-    $stateName = @{ Update = 'last-update'; Inventory = 'inventory'; Clean = 'last-clean' }[$Job]
+    $stateName = @{ Update = 'last-update'; Inventory = 'inventory'; Clean = 'last-clean'; Maintenance = 'last-maintenance' }[$Job]
     $state = if ($stateName) { Read-AicmState $stateName } else { $null }
     try { if ($state -and [datetime]::Parse($state.finishedAt) -ge $info.LastRunTime.AddMinutes(-1)) { return } } catch { }
   }
@@ -1289,7 +1289,7 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
   $problems = New-Object System.Collections.Generic.List[string]
   $sched = Read-AicmState 'schedule'
   if (-not $sched) { return $problems }
-  $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9) }
+  $limits = @{ Update = @('last-update', 3); Inventory = @('inventory', 9); Clean = @('last-clean', 9); Maintenance = @('last-maintenance', 1) }
   $installedDays = 0
   try { $installedDays = ((Get-Date).ToUniversalTime() - [datetime]::Parse($sched.installedAt).ToUniversalTime()).TotalDays } catch { }
   $launcher = if ($sched.PSObject.Properties['launcher']) { [string]$sched.launcher } else { 'wscript' }
@@ -1354,7 +1354,9 @@ function Stop-AicmProcessTree([System.Diagnostics.Process]$Process) {
   $ErrorActionPreference = 'Continue'
   $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
   if ($env:SystemRoot -and (Test-Path -LiteralPath $taskkill)) {
-    try { & $taskkill /T /F /PID $Process.Id 2>&1 | Out-Null } catch { }
+    try { & $taskkill /T /PID $Process.Id 2>&1 | Out-Null } catch { }
+    try { [void]$Process.WaitForExit(1000) } catch { }
+    try { if (-not $Process.HasExited) { & $taskkill /T /F /PID $Process.Id 2>&1 | Out-Null } } catch { }
   }
   try { if (-not $Process.HasExited) { $Process.Kill() } } catch { }
   try { [void]$Process.WaitForExit(5000) } catch { }
@@ -1386,6 +1388,7 @@ function Read-AicmChildOutput([string]$File, [string]$Encoding) {
 # Runs a command with a time limit. Returns .ExitCode (124 on timeout), .StdOut, .StdErr and .Output
 # (both streams together, for display). Parse .StdOut only: npm prints warnings on stderr.
 function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$TimeoutSeconds, [ValidateSet('', 'Utf8', 'Default')][string]$OutputEncoding = '') {
+  Initialize-AicmProcessContainment
   $exe = Resolve-AicmExecutable $Name
   if (-not $exe) { throw "command not found: $Name" }
   $encoding = if ($OutputEncoding) { $OutputEncoding } else { Get-AicmChildEncoding $Name $exe }
@@ -1395,14 +1398,27 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
   }
   $stdoutFile = [System.IO.Path]::GetTempFileName()
   $stderrFile = [System.IO.Path]::GetTempFileName()
+  $contained = $null
+  $process = $null
   try {
-    $startArgs = @{ FilePath = $exe; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $stdoutFile; RedirectStandardError = $stderrFile }
-    if (@($Arguments).Count -gt 0) { $startArgs.ArgumentList = (Join-AicmProcessArguments $Arguments) }
-    $process = Start-Process @startArgs
+    $savedSession = $env:AI_CLI_MANAGER_SESSION
+    $childSession = [guid]::NewGuid().ToString()
+    try {
+      $env:AI_CLI_MANAGER_SESSION = $childSession
+      if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $contained = [Aicm.ProcessJob]::Start($exe, (Join-AicmProcessArguments $Arguments), $stdoutFile, $stderrFile)
+        $process = $contained.Process
+      } else {
+        # Portable helper tests use native pwsh on Unix; Windows always takes the Job boundary.
+        $process = Start-Process -FilePath $exe -ArgumentList (Join-AicmProcessArguments $Arguments) -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile -PassThru -NoNewWindow
+      }
+    } finally { $env:AI_CLI_MANAGER_SESSION = $savedSession }
+    Write-AicmSessionRecord $process $childSession
     # Touch the handle now; otherwise ExitCode stays empty after a timed WaitForExit.
     $null = $process.Handle
     $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
     if ($timedOut) { Stop-AicmProcessTree $process } else { $process.WaitForExit() }
+    if ($contained) { $contained.Dispose() } # command ended: close its Job before reading output
     $stdout = Read-AicmChildOutput $stdoutFile $encoding
     $stderr = Read-AicmChildOutput $stderrFile $encoding
     if ($timedOut) {
@@ -1411,6 +1427,8 @@ function Invoke-AicmWithTimeout([string]$Name, [string[]]$Arguments, [int]$Timeo
     }
     return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = ($stdout + $stderr); StdOut = $stdout; StdErr = $stderr }
   } finally {
+    if ($contained) { $contained.Dispose(); $contained.Process.Dispose() }
+    elseif ($process) { $process.Dispose() }
     Remove-Item -LiteralPath $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
   }
 }
@@ -2066,4 +2084,28 @@ function Invoke-AicmNodeModule([string]$Module, [string[]]$Arguments = @(), [int
   $attention = @($lines | Where-Object { $_ -like 'attention: *' } | ForEach-Object { $_.Substring(11) })
   if ($r.ExitCode -ne 0) { $attention += "${Module} failed with exit code $($r.ExitCode)" }
   return [pscustomobject]@{ Lines = @($lines | Where-Object { $_ -notlike 'attention: *' }); Attention = $attention }
+}
+
+# A Job handle belongs to this PowerShell process, never to its children.
+function Initialize-AicmProcessContainment([switch]$WholeProcess, [switch]$OwnSession) {
+  if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+  if (-not ('Aicm.ProcessJob' -as [type])) { Add-Type -Path (Join-Path (Get-AicmRoot) 'lib\aicm-job.cs') }
+  if ($WholeProcess) { [Aicm.ProcessJob]::Initialize() }
+  if ($WholeProcess -or $OwnSession) { $script:AicmSessionRecording = $true }
+  if (($WholeProcess -or $OwnSession) -and -not $env:AI_CLI_MANAGER_SESSION) {
+    $env:AI_CLI_MANAGER_SESSION = [guid]::NewGuid().ToString()
+    Write-AicmSessionRecord (Get-Process -Id $PID) $env:AI_CLI_MANAGER_SESSION
+  }
+}
+
+function Write-AicmSessionRecord([System.Diagnostics.Process]$Process, [string]$Session) {
+  if (-not (Get-Variable -Name AicmSessionRecording -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { return }
+  try {
+    $owner = Get-Process -Id $PID
+    $dir = Join-Path (Get-AicmHome) 'state\sessions'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $record = @{ session = $Session; pid = $Process.Id; created = $Process.StartTime.ToUniversalTime().ToString('o')
+      ownerPid = $PID; ownerCreated = $owner.StartTime.ToUniversalTime().ToString('o'); platform = 'win32' }
+    $record | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $dir "$Session.json") -Encoding UTF8
+  } catch { } # A fast command may already have exited; its Job still guarantees containment.
 }

@@ -54,6 +54,7 @@ done
 
 "$AICM" schedule install --update-at 06:15 --inventory-day wed --inventory-at 11:40 --clean-day sun --clean-at 13:05 --targets codex,claude >/dev/null
 grep -Eq '^15 6,9,12,15,18,21 \* \* \* /bin/bash \S*\.ai-cli-auto-manager/app/bin/aicm scheduled update --scheduled --targets codex\\?,claude .*# aicm:update$' "$WORK/crontab.txt" && pass "update cron line" || fail "update cron line: $(cat "$WORK/crontab.txt")"
+grep -q '^7 \* \* \* \* .*scheduled maintenance --dry-run .*# aicm:maintenance$' "$WORK/crontab.txt" && pass "hourly maintenance defaults to dry-run" || fail "maintenance cron line"
 # cron skips missed runs, so the weekly jobs start daily and run once per week (sunday = 7).
 grep -q '^5 13 \* \* \* .*/app/bin/aicm scheduled clean --weekly 7 13:05 .*# aicm:clean$' "$WORK/crontab.txt" && pass "clean cron line (daily start, due sunday)" || fail "clean cron line"
 grep -q '^40 11 \* \* \* .*/app/bin/aicm scheduled inventory --weekly 3 11:40 .*# aicm:inventory$' "$WORK/crontab.txt" && pass "inventory cron line (daily start, due wednesday)" || fail "inventory cron line"
@@ -63,7 +64,7 @@ if command -v node >/dev/null 2>&1; then
 fi
 grep -q '# keep me' "$WORK/crontab.txt" && pass "other cron lines kept" || fail "other cron line lost"
 SCHED="$AICM_HOME/state/schedule.json"
-grep -q '"options":{"updateAt":"06:15","inventoryDay":"3","inventoryAt":"11:40","cleanDay":"7","cleanAt":"13:05","targets":"codex,claude"}' "$SCHED" && pass "schedule.json keeps the install options" || fail "options: $(cat "$SCHED")"
+grep -q '"options":{"updateAt":"06:15","inventoryDay":"3","inventoryAt":"11:40","cleanDay":"7","cleanAt":"13:05","targets":"codex,claude","maintenanceMode":"dry-run"}' "$SCHED" && pass "schedule.json keeps the install options" || fail "options: $(cat "$SCHED")"
 
 # Installing the same schedule again changes nothing; refresh re-registers stale jobs from the stored options.
 cp "$WORK/crontab.txt" "$WORK/crontab.want"
@@ -99,7 +100,7 @@ grep -q 'scheduled clean --weekly 7 13:05 --category sessions,logs ' "$WORK/cron
 ! grep -q -- '--category' "$WORK/crontab.txt" && ! grep -q cleanCategory "$SCHED" && pass "a schedule without a category stays compatible" || fail "empty category leaked: $(grep aicm:clean "$WORK/crontab.txt") $(cat "$SCHED")"
 
 "$AICM" schedule install >/dev/null
-[[ "$(grep -c '# aicm:' "$WORK/crontab.txt")" == 3 ]] && pass "reinstall does not duplicate" || fail "duplicate cron lines"
+[[ "$(grep -c '# aicm:' "$WORK/crontab.txt")" == 4 ]] && pass "reinstall does not duplicate" || fail "duplicate cron lines"
 
 # Previews and invalid clean input do not create the home marker.
 MARK="$WORK/markhome"
@@ -132,6 +133,7 @@ printf '{"finishedAt":"%s","version":"x","ok":true,"failures":"","logFile":""}\n
 out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 1 ]] && grep -q 'no inventory run' <<< "$out" && pass "doctor flags missing inventory run" || fail "doctor without inventory: $out"
 printf '{"finishedAt":"%s","version":"x","ok":true,"clis":[]}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$AICM_HOME/state/inventory.json"
+printf '{"finishedAt":"%s","ok":true}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$AICM_HOME/state/last-maintenance.json"
 out="$("$AICM" doctor 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 ]] && pass "doctor healthy after runs" || fail "doctor after runs: $out"
 grep -q "^info: installed copy $AICM_HOME/app version $(cat "$ROOT/VERSION"); source $ROOT (version $(cat "$ROOT/VERSION"))" <<< "$out" && pass "doctor shows the installed copy, its source and versions" || fail "doctor info: $out"
@@ -436,6 +438,31 @@ rm -rf "$TMPDIR/ai-cli-auto-manager-update-$(id -u).lockdir"
 mkdir -p "$OPT/foreign"; echo mine > "$OPT/foreign/notes.txt"
 out="$(AICM_HOME="$OPT/foreign" FAKE_OPTIMIZE_CALLS="$OPT/calls.jsonl" AICM_PROCESS_LIST="$OPT/procs.json" PATH="$OPTBIN:$PATH" "$AICM" optimize --apply --json 2>/dev/null)" && rc=0 || rc=$?
 [[ "$rc" == 1 && ! -e "$OPT/calls.jsonl" && ! -e "$OPT/foreign/.aicm-home" && ! -e "$OPT/foreign/state" ]] && grep -q '"status":"refused"' <<< "$out" && pass "optimize --apply refuses a foreign AICM_HOME untouched" || fail "optimize foreign home rc=$rc: $out"
+
+# Hourly apply is explicit and survives refresh; opting out does not reappear on refresh.
+"$AICM" schedule install --no-update --no-inventory --no-clean --maintenance-apply >/dev/null
+"$AICM" schedule refresh >/dev/null
+grep -q 'scheduled maintenance --apply ' "$WORK/crontab.txt" && [[ "$(grep -c '# aicm:' "$WORK/crontab.txt")" == 1 ]] && pass "hourly apply survives refresh" || fail "hourly apply refresh"
+"$AICM" schedule install --no-maintenance >/dev/null
+"$AICM" schedule refresh >/dev/null
+! grep -q '# aicm:maintenance' "$WORK/crontab.txt" && pass "maintenance opt-out survives refresh" || fail "maintenance opt-out"
+"$AICM" schedule remove >/dev/null
+# A mocked launchctl writes plists under the throwaway HOME, never the real launchd service.
+cat > "$WORK/fakebin/launchctl" <<'SH'
+#!/usr/bin/env bash
+if [[ "$1" == list ]]; then
+  for f in "$HOME/Library/LaunchAgents/"*.plist; do [[ ! -f "$f" ]] || basename "$f" .plist; done
+fi
+exit 0
+SH
+chmod +x "$WORK/fakebin/launchctl"
+AICM_OS=mac "$AICM" schedule install --no-update --no-inventory --no-clean >/dev/null
+plist="$HOME/Library/LaunchAgents/io.github.wilgon456.ai-cli-auto-manager.maintenance.plist"
+[[ "$(grep -c '<key>Hour</key>' "$plist")" == 24 ]] && grep -q '<string>--dry-run</string>' "$plist" && pass "macOS hourly plist defaults to dry-run" || fail "maintenance plist"
+AICM_OS=mac "$AICM" schedule refresh >/dev/null
+grep -q '<string>--dry-run</string>' "$plist" && pass "macOS refresh keeps maintenance mode" || fail "macOS maintenance refresh"
+AICM_OS=mac "$AICM" schedule remove >/dev/null
+[[ ! -e "$plist" ]] && pass "macOS removes its maintenance plist" || fail "macOS maintenance removal"
 
 echo
 if ((fails)); then echo "$fails check(s) failed"; exit 1; fi

@@ -20,15 +20,16 @@ Inventory your AI coding CLIs, update conservatively and keep scheduled maintena
 
 After a few months with AI coding CLIs, three things get blurry: what you have installed, whether it is current, and how much disk it eats.
 It is also common to have the same CLI installed twice (a desktop app copy and an npm copy), so updates land on one copy while the terminal keeps running the other, older one.
-This tool schedules three jobs that take care of all of that. Clone the repository, run one command to schedule it, and nothing else needs installing.
+This tool schedules inventory, updates, cleanup and an hourly maintenance preview. Clone the repository and run one command to schedule it. Node.js 22 or newer is required for process containment and maintenance.
 
 | Job | Runs (default) | What it does |
 | --- | --- | --- |
 | Inventory | weekly (Mon 12:00) | Lists the installed AI CLIs with version, latest version, install method, and whether the daily update actually reaches the copy on PATH. Compares MCP servers and skills across the CLIs. Notifies you when a CLI appears or disappears |
 | Update | daily (05:00) | Updates every installed CLI. npm-installed CLIs only get releases at least 3 days old, after red-flag and signature checks. One failure does not stop the rest. Also reports MCP servers, browsers and agent CLIs left running after their session ended |
+| Maintenance | hourly (minute 7) | Previews owned orphan/cache cleanup, writes an action log and daily summary, and warns about CLI version floors. Explicit apply enables quarantine and tagged-only termination |
 | Clean | weekly (Mon 12:30) | Deletes conversation history unused for 30 days and expired temp files and caches, and removes git worktrees and branches whose work is already merged. Never follows links and never deletes memory, credential, settings files or unpushed work |
 
-Every run checks that the other two jobs are still registered, and shows a desktop notification when a job is gone or a run fails.
+Every run checks that the other jobs are still registered, and shows a desktop notification when a job is gone or a run fails.
 
 ## Quick start
 
@@ -62,6 +63,18 @@ cd ai_cli_auto_manager
 ./bin/aicm schedule install --no-clean
 ```
 
+## Automatic maintenance
+
+`aicm maintenance` previews owned orphan-process and cache/temp cleanup. Add `--apply` to act;
+files move to quarantine for seven days first. Untagged runtime orphans are alert-only. The hourly
+Maintenance job defaults to dry-run; enable it with `aicm schedule install --maintenance-apply`.
+`aicm run -- claude` starts a tagged session whose descendants are contained with its lifetime.
+Node.js is required for Unix process containment.
+
+See [automatic maintenance](docs/automatic-maintenance.md) for Windows commands, rules, recovery,
+logs, version floors and the process safety policy. `processes --kill` now follows that policy;
+`AICM_KILL_ORPHANS=1` no longer enables name-based termination.
+
 ## Commands
 
 | Command | What it does |
@@ -75,11 +88,13 @@ cd ai_cli_auto_manager
 | `aicm history` | Local update, clean, and restore notes (at most 100; no file contents). `--limit N`, `--json` |
 | `aicm worktrees` | Worktrees and branches agent sessions left behind. Report only unless `--apply` (`-Apply`); `--days 14` |
 | `aicm config` | MCP servers and skills compared across the installed CLIs |
-| `aicm processes` | Agent processes left running after their session ended. `--kill` (`-Kill`) ends them |
+| `aicm processes` | Ownership-aware orphan scan; `--kill` (`-Kill`) applies only to verified tagged orphans. Untagged runtimes are alert-only |
+| `aicm maintenance` | Quarantine owned stale files and report orphan processes; dry-run unless `--apply` (`-Apply`) |
+| `aicm run -- command` | Run a CLI in a tagged, contained session (Windows: `run -Cli command -CliArguments @(...)`) |
 | `aicm optimize` | Opt-in cache maintenance through the package managers' own commands (`npm cache verify`, `uv cache prune`, `pnpm store prune`). Preview by default; only `--apply` (`-Apply`) runs them. `--tasks npm-verify,uv-prune,pnpm-prune`, `--dry-run`, `--json`. Needs Node.js |
 | `aicm status` | Schedules, last run results, the last inventory, disk use per rule and what can be freed |
 | `aicm doctor` | Exits 1 with a list of problems when a schedule is missing, a run is overdue or failed, the update policy is invalid (or needs a missing Node.js), or `AICM_HOME` is not usable. Also shows the installed copy, its source and versions. Changes nothing |
-| `aicm schedule install` | Registers the update, inventory and clean jobs; running it again replaces them |
+| `aicm schedule install` | Registers update, inventory, clean and hourly maintenance jobs; running it again replaces them |
 | `aicm schedule remove` | Removes the jobs |
 | `aicm uninstall` | Removes the jobs and the installed copy; `--purge` (`-Purge`) also removes the logs, state and archives the tool wrote. `--dry-run` (`-DryRun`) lists what would go and changes nothing |
 | `aicm version` | Prints the version |
@@ -162,7 +177,7 @@ Each update records the PATH-selected command's path and version before and afte
 
 ### Per-CLI update policy
 
-Create `update-policy.json` in `$AICM_HOME` (default `~/.ai-cli-auto-manager` on macOS/Linux, `%USERPROFILE%\.ai-cli-auto-manager` on Windows). Set `AICM_HOME` before a run to keep the policy at a custom location (`$AICM_HOME/update-policy.json`). Node.js is needed only when this file exists; a run without it keeps the native update paths working. The file is strict: unknown fields or CLI ids, wrong types, malformed JSON, a directory or a dangling link in its place fail the run before any log, lock or state file is created.
+Create `update-policy.json` in `$AICM_HOME` (default `~/.ai-cli-auto-manager` on macOS/Linux, `%USERPROFILE%\.ai-cli-auto-manager` on Windows). Set `AICM_HOME` before a run to keep the policy at a custom location (`$AICM_HOME/update-policy.json`). Node.js validates this file and also supplies the Unix process-containment launcher for real update runs. The file is strict: unknown fields or CLI ids, wrong types, malformed JSON, a directory or a dangling link in its place fail the run before any log, lock or state file is created.
 
 ```json
 {
@@ -212,7 +227,7 @@ member, keeps it. A lone sidecar whose database is gone is a family of one. Othe
 still removed in one batch. An explicitly selected Windows `AICM_HOME` may be a junction for installed-copy
 maintenance; user-data cleanup still refuses linked paths.
 
-`--category` limits which rules run. Names are `sessions`, `cache`, `logs`, `temp`, `other` and `all` (the default when the flag is omitted). It intersects `--rules` and does not enable a disabled rule. `gemini-tmp` and `qwen-tmp` are sessions, not cache. `--explain` is read-only: one line per rule (age, limit, action, what is protected). `--json` is one document for that same selection, not a per-file listing. Generic archive moves and purges, and `aicm archive` / `restore` / `history`, need Node.js. Ordinary age and command cleanup still runs without it. A real clean records a short local history entry (at most 100, no file contents). Previews do not. `aicm restore` never overwrites an existing path. Legacy archive files are listed for a manual move. Codex-native sessions are not generic restore ids.
+`--category` limits which rules run. Names are `sessions`, `cache`, `logs`, `temp`, `other` and `all` (the default when the flag is omitted). It intersects `--rules` and does not enable a disabled rule. `gemini-tmp` and `qwen-tmp` are sessions, not cache. `--explain` is read-only: one line per rule (age, limit, action, what is protected). `--json` is one document for that same selection, not a per-file listing. Generic archive moves and purges, and `aicm archive` / `restore` / `history`, need Node.js. Real Unix cleanup uses Node.js for session containment; read-only native previews remain available without it. A real clean records a short local history entry (at most 100, no file contents). Previews do not. `aicm restore` never overwrites an existing path. Legacy archive files are listed for a manual move. Codex-native sessions are not generic restore ids.
 
 ```sh
 aicm clean --category cache --dry-run --json
@@ -377,7 +392,12 @@ Links inside ignored folders (for example a `node_modules` junction to a shared 
 
 **Configuration across CLIs** (weekly with Inventory, or `aicm config`). Lists the user-level MCP servers of each installed CLI (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Cursor, Copilot CLI) and the skill folders (`~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`, ...): servers set up in some CLIs only, skills some CLIs cannot see, and skills with the same name but different content in two folders (which copy wins depends on folder order). Report only; the last case is notified once.
 
-**Processes left behind** (daily with Update, or `aicm processes`). Finds MCP servers, automation browsers (Chrome DevTools MCP, Playwright) and agent CLIs that have run for 2 hours or more after their parent session is gone. Daemons that run detached on purpose (Paseo, Codex app-server, sandboxes, language servers) and this tool's own processes are ignored; add more with `AICM_PROCESS_IGNORE` (a regular expression). Report only; set `AICM_KILL_ORPHANS=1` or run `aicm processes --kill` to end them with their children.
+**Processes left behind** (daily with Update, hourly with Maintenance, or `aicm processes`).
+The ownership-aware scanner reports tagged orphans and untagged node/python/bun orphans that are
+at least six hours old and hold a listening port. Apply (`maintenance --apply`, or `processes --kill`)
+can end only verified tagged orphans; untagged processes remain alert-only. Live sessions, Paseo,
+SSH/remote trees, service accounts, elevated and unverifiable processes stay. See the
+[maintenance safety policy](docs/automatic-maintenance.md).
 
 | Environment variable | Meaning |
 | --- | --- |
@@ -385,8 +405,8 @@ Links inside ignored folders (for example a `node_modules` junction to a shared 
 | `AICM_PROCESSES=0` | Skip the process check in the Update job |
 | `AICM_CODEX_RECYCLE=0` | Do not restart Codex app-servers left on a replaced Homebrew Codex |
 | `AICM_CODEX_UNQUARANTINE=0` | Do not clear the quarantine from the notarized OpenAI Codex cask build |
-| `AICM_KILL_ORPHANS=1` | End left-behind processes instead of only reporting them |
-| `AICM_ORPHAN_MIN_AGE_HOURS` | Minimum age before a process counts (default 2) |
+| `AICM_KILL_ORPHANS` | Retired; use explicit `maintenance --apply` for verified owned orphans |
+| Untagged orphan threshold | At least 6 hours plus a listening TCP port; alert-only |
 
 ## Scheduling
 
@@ -394,9 +414,9 @@ Links inside ignored folders (for example a `node_modules` junction to a shared 
 
 | OS | Where | Change times |
 | --- | --- | --- |
-| Windows | Task Scheduler folder `\AI CLI Auto Manager\`: `Update`, `Inventory`, `Clean` | `-UpdateAt 05:00 -InventoryDay Monday -InventoryAt 12:00 -CleanDay Monday -CleanAt 12:30` |
-| macOS | `~/Library/LaunchAgents/io.github.wilgon456.ai-cli-auto-manager.{update,inventory,clean}.plist` | `--update-at 05:00 --inventory-day mon --inventory-at 12:00 --clean-day mon --clean-at 12:30` |
-| Linux | user crontab (only lines tagged `# aicm:update`, `# aicm:inventory`, `# aicm:clean` are touched) | same as macOS |
+| Windows | Task Scheduler folder `\AI CLI Auto Manager\`: `Update`, `Inventory`, `Clean`, hourly `Maintenance` | `-UpdateAt 05:00 -InventoryDay Monday -InventoryAt 12:00 -CleanDay Monday -CleanAt 12:30` |
+| macOS | `~/Library/LaunchAgents/io.github.wilgon456.ai-cli-auto-manager.{update,inventory,clean,maintenance}.plist` | `--update-at 05:00 --inventory-day mon --inventory-at 12:00 --clean-day mon --clean-at 12:30` |
+| Linux | user crontab (only lines tagged `# aicm:update`, `# aicm:inventory`, `# aicm:clean`, `# aicm:maintenance` are touched) | same as macOS |
 
 `schedule install` copies the tool to `~/.ai-cli-auto-manager/app` and the jobs run that copy, so moving or deleting your git clone cannot stop them. When the clone gets a newer version (`git pull`), the next daily update refreshes the copy and then re-registers the jobs from it with the days and times you installed them with (`schedule refresh` does the same by hand; jobs that already match are left alone). An older version in the clone (an old tag checked out) never replaces the copy. The new copy is checked file by file before it is swapped in; if anything fails, the old copy stays.
 
@@ -419,6 +439,9 @@ Scheduled jobs can disappear or stop working silently. The jobs installed are re
 | `~/.ai-cli-auto-manager/inventory.md` | The last inventory as a readable table |
 | `~/.ai-cli-auto-manager/state/last-update.json`, `inventory.json`, `last-clean.json` | Last run results (read by `status` and `doctor`) |
 | `~/.ai-cli-auto-manager/state/schedule.json` | Installed jobs, their days and times, and the `PATH` the jobs get |
+| `~/.ai-cli-auto-manager/logs/maintenance-*.jsonl`, `maintenance-*.txt` | Maintenance decisions and short daily summaries |
+| `~/.ai-cli-auto-manager/state/last-maintenance.json` | Last maintenance mode, result and decisions |
+| `~/.ai-cli-auto-manager/quarantine/` | Recoverable maintenance files, retained for at least 7 days |
 | `~/.ai-cli-auto-manager/logs/notifications.log` | Every notification (last 500) |
 | `~/.ai-cli-auto-manager/archive/` | Files moved by archive rules (per rule and date) |
 
@@ -466,7 +489,7 @@ and any other file are never removed.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for compatibility rules and contribution
 checks, and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
-All tests run in a throwaway home folder and never touch your real home folder or real scheduled tasks. Inventory, update and clean tests use fake CLIs, a fake npm and a fake codex, so no real CLI is run or updated. The Node tests build throwaway git repositories and use injected process lists; nothing is ever killed.
+All tests run in a throwaway home folder and never touch your real home folder or real scheduled tasks. Inventory, update and clean tests use fake CLIs, a fake npm and a fake codex, so no real CLI is run or updated. The Node tests build throwaway repositories and inject orphan-process snapshots. Containment tests terminate only the fixture processes they create.
 
 ```bash
 shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh

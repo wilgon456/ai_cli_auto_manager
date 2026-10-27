@@ -159,7 +159,7 @@ my-agent  | myagent | My Agent  | @me/my-agent   |      |        |             |
 
 ### CLI별 업데이트 정책
 
-`$AICM_HOME`(기본값은 macOS·리눅스 `~/.ai-cli-auto-manager`, 윈도우 `%USERPROFILE%\.ai-cli-auto-manager`)에 `update-policy.json`을 만드세요. `AICM_HOME`을 실행 전에 지정하면 정책을 다른 위치(`$AICM_HOME/update-policy.json`)에 둘 수 있습니다. 이 파일이 있을 때만 Node.js가 필요하며, 없으면 네이티브 업데이트 경로는 그대로 동작합니다. 형식은 엄격합니다. 모르는 필드나 CLI id, 잘못된 타입, 깨진 JSON, 파일 자리에 디렉터리나 끊긴 링크가 있으면 로그·잠금·상태 파일을 만들기 전에 실행을 거절합니다.
+`$AICM_HOME`(기본값은 macOS·리눅스 `~/.ai-cli-auto-manager`, 윈도우 `%USERPROFILE%\.ai-cli-auto-manager`)에 `update-policy.json`을 만드세요. `AICM_HOME`을 실행 전에 지정하면 정책을 다른 위치(`$AICM_HOME/update-policy.json`)에 둘 수 있습니다. 정책 검증과 실제 Unix 업데이트의 프로세스 격리에 Node.js가 필요합니다. 형식은 엄격합니다. 모르는 필드나 CLI id, 잘못된 타입, 깨진 JSON, 파일 자리에 디렉터리나 끊긴 링크가 있으면 로그·잠금·상태 파일을 만들기 전에 실행을 거절합니다.
 
 ```json
 {
@@ -517,3 +517,19 @@ CLI별 pin·제외·대기 기간 정책, 캐시 용량 한도(`budget`) 규칙,
 ## License
 
 MIT License. 자세한 내용은 [LICENSE](LICENSE)를 보세요.
+
+
+## 자동 유지 관리
+
+`aicm maintenance`는 관리자 소유의 고아 프로세스와 캐시·임시 파일을 점검합니다.
+기본값은 dry-run이며 `--apply`(Windows: `-Apply`)를 지정해야 처리합니다.
+파일은 격리 폴더로 옮기고 7일 뒤 다음 apply 실행 때 삭제합니다.
+태그 없는 node/python/bun 고아 프로세스는 6시간 이상 실행 중이고 수신 포트가 있어도 알림만 남깁니다.
+
+`aicm schedule install`은 매시간 dry-run 점검도 등록합니다.
+자동 처리는 `--maintenance-apply`(Windows: `-MaintenanceApply`),
+등록 제외는 `--no-maintenance`(Windows: `-NoMaintenance`)로 선택합니다.
+`aicm run -- claude`(Windows: `aicm.ps1 run -Cli claude`)는 태그와 프로세스 수명 관리를 적용해 실행합니다.
+Unix 실행에는 Node.js가 필요합니다. 기존 `processes --kill`도 소유권 검증을 적용하며,
+`AICM_KILL_ORPHANS=1`의 이름 기반 종료는 더 이상 지원하지 않습니다.
+설정·복구·제약 사항은 [자동 유지 관리 문서](docs/automatic-maintenance.md)를 참고하세요.

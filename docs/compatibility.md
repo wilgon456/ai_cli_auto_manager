@@ -32,18 +32,18 @@ fails, nothing is deleted by a budget. On Windows they use the same FileGuard ha
 rules. Their scan is bounded to the rule folder (200000 files, depth 32, 300 seconds by default); an
 incomplete scan deletes nothing. Sizes are logical bytes and stay exact above 2 GiB.
 
-`aicm optimize` (opt-in) needs Node.js; update, inventory and ordinary cleanup do not. It runs only
+`aicm optimize` (opt-in) needs Node.js; real Unix update, inventory and cleanup also use Node.js for process containment. It runs only
 `npm cache verify`, `uv cache prune` and `pnpm store prune`, each when that tool is on PATH, offline,
 with a time limit, and never while that package manager runs or when the process table cannot be
 read (`ps` on Unix, explicit UTF-8 `Get-CimInstance Win32_Process` JSON on Windows). Package-manager
 ancestors count as busy; unreadable Node/Bun command lines hold npm/pnpm tasks. Corepack project
 selection and env-files and pnpm project-version bootstrap are disabled as well as network access. On Windows `.cmd`/`.bat` shims run
 through `%SystemRoot%\System32\cmd.exe` with a quoted path; a path with cmd.exe metacharacters is
-refused. Native runs of budget deletion and optimize on Windows and Linux are configured in CI but
-were not run for this checkout.
+refused. Native budget deletion and optimize checks on Windows and Linux are release gates in CI.
+See the release notes for the exact commit and workflow results.
 
 A real cleanup takes the maintenance lease through Node.js (`lib/maintenance.js`).
-Without Node, ordinary age and command cleanup still runs, and no lease is recorded. With Node, a real cleanup uses the shared maintenance lock. Generic
+Without Node, read-only native previews remain available; real Unix runs require the containment launcher. With Node, a real cleanup uses the shared maintenance lock. Generic
 archive move and purge, restore, and history need Node. Those operations accept a management
 directory only when it sits below the home directory or an approved temp directory,
 and only when the directory and its components are real directories and files.
@@ -51,9 +51,8 @@ A link anywhere on that path is refused.
 
 The Windows exception that allows a junction at the installed app copy, used by
 schedule install and the app copy, does not extend to the maintenance lock, archive,
-history, or other management data. This checkout does not claim a native Windows
-or Linux run of those operations. Configured Windows CI covers PowerShell fixtures and the Node
-adapter, not a full native maintenance pass.
+history, or other management data. Windows CI covers PowerShell fixtures, Job Object containment and the Node adapter. Passing these
+checks is not a full maintenance pass against every vendor installer or a real user profile.
 
 ## Installation channels
 
@@ -79,7 +78,7 @@ An optional `update-policy.json` in the management home
 on Windows) can exclude a CLI, pin an exact npm release, or set a per-CLI waiting
 period. Schema version 1 uses `tools.<catalog-id>`. Validation is strict and runs
 before logs, locks or state. Node.js is required only when the file exists;
-without it, native update paths behave as before.
+real Unix updates require Node.js for process containment even without a policy file.
 
 `exclude` wins over explicit targets, `--install-missing`, interrupted-install
 recovery, and Codex cask work. Pins are exact stable npm releases only (plus Amp's

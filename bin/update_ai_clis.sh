@@ -20,6 +20,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aicm-common.sh
 . "$SCRIPT_DIR/../lib/aicm-common.sh"
+ORIG_ARGS=("$@")
 # shellcheck source=lib/codex-host.sh
 . "$SCRIPT_DIR/../lib/codex-host.sh"
 
@@ -225,7 +226,10 @@ trim_schedule_logs() {
 
 # A real run claims (marks) the home; a dry run only checks it. A folder this tool did not create is
 # refused before any log, lock or state is written into it.
-if [[ "$DRY_RUN" == true ]]; then aicm_home_usable || exit 1; else aicm_claim_home || exit 1; fi
+if [[ "$DRY_RUN" == true ]]; then aicm_home_usable || exit 1; else
+  aicm_claim_home || exit 1
+  aicm_contain_script "$0" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
+fi
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/update-$(date +%Y%m%d-%H%M%S).log"
 LATEST_LOG="$LOG_DIR/latest.log"
@@ -1394,7 +1398,7 @@ classify_results
 # Optional user hook. A broken or missing after probe never runs it.
 POST_UPDATE_HOOK="$AICM_HOME/hooks/post-update.sh"
 if [[ -x "$POST_UPDATE_HOOK" ]]; then
-  if version_changed; then run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
+  if version_changed; then AI_CLI_MANAGER_SESSION="" run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
   else echo; echo "post-update hook skipped: no CLI version changed"; fi
 fi
 

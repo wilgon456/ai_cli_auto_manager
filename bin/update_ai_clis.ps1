@@ -130,6 +130,7 @@ function Test-StuckRun {
 # refused before any log, lock or state is written into it.
 try { if ($DryRun) { Assert-AicmHomeUsable } else { Confirm-AicmHome } }
 catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+if (-not $DryRun) { Initialize-AicmProcessContainment -OwnSession }
 Ensure-Directory $LogDir
 $logFile = Join-Path $LogDir ("update-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $latestLog = Join-Path $LogDir 'latest.log'
@@ -1077,12 +1078,14 @@ try {
     if (-not $DryRun -and $versionsChanged -and (Test-Path -LiteralPath $hook)) {
       Write-Host ""
       Write-Host "== post-update hook =="
+      $hookSession = $env:AI_CLI_MANAGER_SESSION
       try {
+        $env:AI_CLI_MANAGER_SESSION = $null # intentional daemon hooks are not orphan-cleanup targets
         & $hook
         Write-Host "ok: post-update hook"
       } catch {
         Write-Host "warn: post-update hook failed: $($_.Exception.Message)"
-      }
+      } finally { $env:AI_CLI_MANAGER_SESSION = $hookSession }
     }
 
     Write-Host ""

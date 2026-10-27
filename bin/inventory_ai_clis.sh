@@ -11,6 +11,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/aicm-common.sh
 . "$SCRIPT_DIR/../lib/aicm-common.sh"
+ORIG_ARGS=("$@")
 
 OFFLINE=false
 CATALOG_FILE="$AICM_ROOT/rules/ai-clis.conf"
@@ -31,6 +32,7 @@ done
 
 # Claims (marks) the home after the arguments are valid; a folder this tool did not create is refused.
 aicm_claim_home || exit 1
+aicm_contain_script "$0" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
 mkdir -p "$LOG_DIR" "$AICM_HOME/state"
 LOG_FILE="$LOG_DIR/inventory-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1

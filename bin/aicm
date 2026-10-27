@@ -19,14 +19,16 @@ AI CLI Auto Manager $(aicm_version)
   aicm history   [--limit N] [--json]
   aicm worktrees [--apply] [--days 14]   worktrees and branches agents left behind (report unless --apply)
   aicm config    MCP servers and skills compared across the installed CLIs
-  aicm processes [--kill] [--min-age-hours 2]   agent processes left running after their session ended
+  aicm maintenance [--dry-run|--apply] [--json]   owned orphan/cache maintenance (dry-run by default)
+  aicm run -- command [args...]   run a CLI in a contained, tagged session
+  aicm processes [--kill]   owned orphans; untagged runtimes remain alert-only
   aicm optimize  [--dry-run | --apply] [--tasks npm-verify,uv-prune,pnpm-prune] [--json]
                  preview by default; --apply runs npm cache verify, uv cache prune, pnpm store prune (needs Node.js)
   aicm status    disk use per cleanup rule, schedules, last runs
   aicm doctor    exit 1 when a schedule is missing, a run is overdue or failed, or a setting is invalid
   aicm schedule  install|remove|show|refresh [--update-at 05:00] [--inventory-day mon] [--inventory-at 12:00]
                                              [--clean-day mon] [--clean-at 12:30] [--clean-category list] [--targets list]
-                                             [--no-update] [--no-inventory] [--no-clean]
+                                             [--no-update] [--no-inventory] [--no-clean] [--no-maintenance] [--maintenance-apply]
   aicm uninstall [--purge] [--dry-run]   --dry-run lists what would be removed and changes nothing
   aicm version
 EOF
@@ -38,8 +40,8 @@ LOG_DIR="$AICM_HOME/logs"
 state_age_text() { # name
   local file="$STATE_DIR/$1.json" when result
   [[ -f "$file" ]] || { echo never; return; }
-  when="$(sed -n 's/.*"finishedAt":"\([^"]*\)".*/\1/p' "$file")"
-  if grep -q '"ok":true' "$file"; then result=ok; else result=FAILED; fi
+  when="$(sed -n 's/.*"finishedAt":[[:space:]]*"\([^"]*\)".*/\1/p' "$file")"
+  if grep -q '"ok":[[:space:]]*true' "$file"; then result=ok; else result=FAILED; fi
   echo "${when:-unknown} UTC ($result)"
 }
 
@@ -196,14 +198,28 @@ scheduled_run() { # job [--weekly day HH:MM] args...
     update) exec "$BIN_DIR/update_ai_clis.sh" "$@" ;;
     inventory) exec "$BIN_DIR/inventory_ai_clis.sh" "$@" ;;
     clean) exec "$BIN_DIR/clean_ai_leftovers.sh" "$@" ;;
+    maintenance) maintenance_run "$@" ;;
     *) echo "unknown scheduled job: $job" >&2; exit 2 ;;
   esac
+}
+
+# Preserve JSON output and failures; human-mode attention lines use the existing notification log.
+maintenance_run() {
+  local out rc=0 line
+  command -v node >/dev/null 2>&1 || { echo 'maintenance needs Node.js' >&2; return 1; }
+  aicm_claim_home || return 1
+  out="$(node "$AICM_ROOT/lib/auto-maintenance.js" "$@")" || rc=$?
+  [[ -z "$out" ]] || printf '%s\n' "$out"
+  while IFS= read -r line; do
+    [[ "$line" != 'attention: '* ]] || aicm_notify 'AI CLI Auto Manager' "${line#attention: }"
+  done <<< "$out"
+  return "$rc"
 }
 
 # Schedule options (set by schedule_install from the command line, by schedule_refresh from schedule.json).
 S_UPDATE_AT=05:00 S_INVENTORY_DAY=mon S_INVENTORY_AT=12:00 S_CLEAN_DAY=mon S_CLEAN_AT=12:30 S_TARGETS=""
 S_CLEAN_CATEGORY=""
-S_NO_UPDATE=false S_NO_INVENTORY=false S_NO_CLEAN=false
+S_NO_UPDATE=false S_NO_INVENTORY=false S_NO_CLEAN=false S_NO_MAINTENANCE=false S_MAINTENANCE_APPLY=false
 SCHEDULE_CHANGED=false
 
 plist_content() { # label script hour minute weekday(or empty) args...
@@ -300,6 +316,8 @@ schedule_install() {
       --targets) shift; S_TARGETS="${1:-}" ;;
       --no-update) S_NO_UPDATE=true ;;
       --no-clean) S_NO_CLEAN=true ;;
+      --no-maintenance) S_NO_MAINTENANCE=true ;;
+      --maintenance-apply) S_MAINTENANCE_APPLY=true ;;
       *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -382,6 +400,8 @@ schedule_refresh() {
   grep -qx update <<< "$jobs" || S_NO_UPDATE=true
   grep -qx inventory <<< "$jobs" || S_NO_INVENTORY=true
   grep -qx clean <<< "$jobs" || S_NO_CLEAN=true
+  grep -qx maintenance <<< "$jobs" || S_NO_MAINTENANCE=true
+  [[ "$(aicm_json_field "$file" maintenanceMode)" == apply ]] && S_MAINTENANCE_APPLY=true
   schedule_apply refresh
 }
 
@@ -401,7 +421,9 @@ schedule_apply() {
   fi
   # 6:5 read back from a crontab line is stored as 06:05.
   S_UPDATE_AT="$(hm_text "$S_UPDATE_AT")"; S_INVENTORY_AT="$(hm_text "$S_INVENTORY_AT")"; S_CLEAN_AT="$(hm_text "$S_CLEAN_AT")"
-  [[ "$S_NO_UPDATE" == true && "$S_NO_INVENTORY" == true && "$S_NO_CLEAN" == true ]] && { echo "nothing to install" >&2; exit 2; }
+  [[ "$S_NO_UPDATE" == true && "$S_NO_INVENTORY" == true && "$S_NO_CLEAN" == true && "$S_NO_MAINTENANCE" == true ]] && { echo "nothing to install" >&2; exit 2; }
+  local maintenance_mode=dry-run
+  [[ "$S_MAINTENANCE_APPLY" == true ]] && maintenance_mode=apply
   # Options are valid. Only then claim the home (a bad time or category must not create or mark it).
   aicm_claim_home || exit 1
   local wd iwd jobs="" update_args=()
@@ -443,6 +465,8 @@ schedule_apply() {
       write_plist clean "$app/bin/clean_ai_leftovers.sh" "$(hm_hour "$S_CLEAN_AT")" "$(hm_minute "$S_CLEAN_AT")" "$wd" "${clean_args[@]+"${clean_args[@]}"}"
       jobs+='"clean",'
     fi
+    if [[ "$S_NO_MAINTENANCE" == true ]]; then remove_plist maintenance
+    else write_plist maintenance "$app/bin/aicm" '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23' 7 "" scheduled maintenance "--$maintenance_mode"; jobs+='"maintenance",'; fi
     if [[ "$SCHEDULE_MODE" != refresh && -f "$HOME/Library/LaunchAgents/com.example.ai-cli-auto-update.plist" ]]; then
       echo "note: the old template job com.example.ai-cli-auto-update is still installed; remove it with:"
       echo "  launchctl unload ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist && rm ~/Library/LaunchAgents/com.example.ai-cli-auto-update.plist"
@@ -471,6 +495,10 @@ schedule_apply() {
       lines+="$(hm_minute "$S_CLEAN_AT") $(hm_hour "$S_CLEAN_AT") * * * /bin/bash $q_aicm scheduled clean --weekly $wd $S_CLEAN_AT$q_category >> $(printf '%q' "$LOG_DIR/cron.clean.log") 2>&1 # aicm:clean"$'\n'
       jobs+='"clean",'
     fi
+    if [[ "$S_NO_MAINTENANCE" != true ]]; then
+      lines+="7 * * * * /bin/bash $q_aicm scheduled maintenance --$maintenance_mode >> $(printf '%q' "$LOG_DIR/cron.maintenance.log") 2>&1 # aicm:maintenance"$'\n'
+      jobs+='"maintenance",'
+    fi
     if [[ "$(cron_aicm_lines)" == "${lines%$'\n'}" ]]; then
       [[ "$SCHEDULE_MODE" == refresh ]] || printf '%s' "$lines" | sed 's/^/unchanged:  /'
     else
@@ -491,7 +519,7 @@ schedule_apply() {
   options_json="{\"updateAt\":\"$S_UPDATE_AT\",\"inventoryDay\":\"$iwd\",\"inventoryAt\":\"$S_INVENTORY_AT\",\"cleanDay\":\"$wd\",\"cleanAt\":\"$S_CLEAN_AT\",\"targets\":\"$(aicm_json_escape "$S_TARGETS")\""
   # Omit an empty category so schedules written before this field still match.
   [[ -n "$S_CLEAN_CATEGORY" ]] && options_json+=",\"cleanCategory\":\"$(aicm_json_escape "$S_CLEAN_CATEGORY")\""
-  options_json+="}"
+  options_json+=",\"maintenanceMode\":\"$maintenance_mode\"}"
   aicm_state_write schedule "{\"installedAt\":\"$installed_at\",\"version\":\"$(aicm_version)\",\"app\":\"$(aicm_json_escape "$app")\",\"source\":\"$(aicm_json_escape "$(schedule_source)")\",\"jobs\":[${jobs%,}],\"options\":$options_json,\"path\":\"$(aicm_json_escape "$JOB_PATH")\",\"tools\":{$JOB_TOOLS}}"
   if [[ -n "$ref" ]]; then touch -r "$ref" "$file"; rm -f "$ref"; fi
   if [[ "$SCHEDULE_MODE" == refresh ]]; then
@@ -503,7 +531,7 @@ schedule_apply() {
 
 schedule_remove() {
   if [[ "$(aicm_os)" == mac ]]; then
-    remove_plist update; remove_plist inventory; remove_plist clean
+    remove_plist update; remove_plist inventory; remove_plist clean; remove_plist maintenance
   elif command -v "${AICM_CRONTAB:-crontab}" >/dev/null 2>&1; then
     local current
     current="$(cron_without_aicm)"
@@ -515,7 +543,7 @@ schedule_remove() {
 
 schedule_show() {
   local job
-  for job in update inventory clean; do
+  for job in update inventory clean maintenance; do
     if aicm_job_exists "$job"; then printf '%-10s registered\n' "$job"; else printf '%-10s not registered\n' "$job"; fi
   done
   if [[ "$(aicm_os)" != mac ]] && command -v "${AICM_CRONTAB:-crontab}" >/dev/null 2>&1; then
@@ -534,6 +562,9 @@ doctor() {
   fi
   if grep -qx inventory <<< "$jobs" && state_older_than_days inventory 9; then
     problems+=("no inventory run in the last 9 days")
+  fi
+  if grep -qx maintenance <<< "$jobs" && state_older_than_days last-maintenance 1; then
+    problems+=("no maintenance run in the last day")
   fi
   if ! (aicm_load_catalog "" "") 2>/dev/null; then problems+=("catalog error in rules/ai-clis.conf or ai-clis.local.conf"); fi
   if [[ -s "$STATE_DIR/inventory-shadow.txt" ]]; then
@@ -842,6 +873,11 @@ case "$cmd" in
     [[ -f "$AICM_ROOT/lib/maintenance-cli.js" && -f "$AICM_ROOT/lib/maintenance.js" ]] || { echo "aicm $cmd: lib/maintenance.js is missing from this copy" >&2; exit 1; }
     exec node "$AICM_ROOT/lib/maintenance-cli.js" "$cmd" "$@"
     ;;
+  run)
+    [[ "${1:-}" == -- ]] || { echo 'usage: aicm run -- command [args...]' >&2; exit 2; }
+    aicm_claim_home || exit 1
+    exec node "$AICM_ROOT/lib/supervise.js" "$@" ;;
+  maintenance) maintenance_run "$@" ;;
   worktrees|config|processes)
     command -v node >/dev/null 2>&1 || { echo "aicm $cmd needs Node.js" >&2; exit 1; }
     # These record their results in state/: claim the home first (not for --help).
@@ -873,6 +909,10 @@ case "$cmd" in
     echo "update     $(state_age_text last-update)"
     echo "inventory  $(state_age_text inventory)"
     echo "clean      $(state_age_text last-clean)"
+    echo "maintenance $(state_age_text last-maintenance)"
+    if [[ -f "$STATE_DIR/last-maintenance.json" ]]; then
+      sed -n 's/.*"summary":[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE_DIR/last-maintenance.json"
+    fi
     if [[ -d "$AICM_HOME/archive" ]]; then
       echo "archive    $(aicm_format_size "$(find "$AICM_HOME/archive" -type f -print0 | aicm_sizes_stdin | aicm_sum_lines)") in $AICM_HOME/archive (move files back to restore)"
     fi

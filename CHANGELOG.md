@@ -1,6 +1,12 @@
 # Changelog
 
-## 2.8.3 - Unreleased
+## 2.10.0 - 2026-10-27
+
+### Integration with v2.9.0
+- Preserve contained CLI sessions and hourly report-only automatic maintenance from upstream.
+- Share the maintenance lease across automatic maintenance, cleanup, archive, restore and optimize.
+- Validate arguments and management-home ownership before containment writes session records; previews
+  keep their no-write behavior. Actual contained Unix CLI commands require Node.js.
 
 ### Final compatibility review
 - Legacy installed copies without a file roster accept only exact known file names as a fallback,

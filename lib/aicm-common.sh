@@ -545,11 +545,11 @@ aicm_marker_valid() { # home
 
 # A file name the tool ships in bin/, lib/, rules/ or windows/ (used only for copies built before the
 # copy kept its own file list in .aicm-copy).
-aicm_app_file_shape() { # explicit legacy file names; extensions alone prove nothing
+aicm_app_file_shape() { # exact legacy file names only
   case "$1" in
     bin/aicm|bin/aicm.ps1|bin/clean_ai_leftovers.ps1|bin/clean_ai_leftovers.sh|bin/inventory_ai_clis.ps1|bin/inventory_ai_clis.sh|bin/update_ai_clis.ps1|bin/update_ai_clis.sh) return 0 ;;
-    lib/aicm-common.ps1|lib/aicm-common.sh|lib/aicm-file-guard.cs|lib/codex-host.sh|lib/config-drift.js|lib/maintenance-cli.js|lib/maintenance.js|lib/node-common.js|lib/npm-guard.js|lib/optimize.js|lib/processes.js|lib/update-policy.js|lib/worktrees.js) return 0 ;;
-    rules/ai-clis.conf|rules/clean-categories.conf|rules/clean-rules.conf) return 0 ;;
+    lib/aicm-common.ps1|lib/aicm-common.sh|lib/aicm-file-guard.cs|lib/aicm-job.cs|lib/aicm-process-token.cs|lib/auto-maintenance.js|lib/codex-host.sh|lib/config-drift.js|lib/maintenance-cli.js|lib/maintenance-files.js|lib/maintenance-files.ps1|lib/maintenance-processes.js|lib/maintenance.js|lib/node-common.js|lib/npm-guard.js|lib/optimize.js|lib/processes.js|lib/supervise.js|lib/update-policy.js|lib/worktrees.js) return 0 ;;
+    rules/ai-clis.conf|rules/clean-categories.conf|rules/clean-rules.conf|rules/maintenance.conf) return 0 ;;
     windows/install_scheduled_task.ps1|windows/run-hidden.vbs) return 0 ;;
     *) return 1 ;;
   esac
@@ -603,8 +603,8 @@ aicm_app_copy_owned() { # dir [partial]
 # Names the tool gives files in logs/ (logs, transcripts, cron/launchd output and their temp files).
 aicm_log_name_owned() {
   case "$1" in
-    update-[0-9]*.log|clean-[0-9]*.log|inventory-[0-9]*.log|latest.log|notifications.log) return 0 ;;
-    cron.update.log|cron.inventory.log|cron.clean.log|launchd.*.out.log|launchd.*.err.log) return 0 ;;
+    maintenance-[0-9]*.jsonl|maintenance-[0-9]*.txt|update-[0-9]*.log|clean-[0-9]*.log|inventory-[0-9]*.log|latest.log|notifications.log) return 0 ;;
+    cron.update.log|cron.inventory.log|cron.clean.log|cron.maintenance.log|launchd.*.out.log|launchd.*.err.log) return 0 ;;
     *.log.[0-9]*.tmp) return 0 ;;
   esac
   return 1
@@ -615,7 +615,7 @@ aicm_state_file_owned() {
   local n="${1%.[0-9]*.tmp}"
   case "$1" in .weekly-due.[0-9]*|.schedule-time.[0-9]*) return 0 ;; esac
   case "$n" in
-    last-update.json|last-clean.json|inventory.json|schedule.json|npm-verdicts.json|npm-verdicts.tsv) return 0 ;;
+    last-update.json|last-clean.json|last-maintenance.json|inventory.json|schedule.json|npm-verdicts.json|npm-verdicts.tsv) return 0 ;;
     update-running.json|update-npm.json|update-npm.tsv|update-deferred.json|inventory-error.json) return 0 ;;
     inventory.tsv|inventory-shadow.txt|config-drift.json|processes.json|worktrees.json|*-attention.json) return 0 ;;
     attention-*.tsv|attention-*.json) return 0 ;;
@@ -624,10 +624,11 @@ aicm_state_file_owned() {
 }
 
 # Folders the tool keeps in state/ and the names it gives files there (manifests, history, lock).
-aicm_state_dir_owned() { case "$1" in archive-index|history|maintenance.lock|maintenance.lock.stale-*) return 0 ;; esac; return 1; }
+aicm_state_dir_owned() { case "$1" in archive-index|history|sessions|maintenance.lock|maintenance.lock.stale-*) return 0 ;; esac; return 1; }
 aicm_state_subfile_owned() { # dir file
   case "$1" in
     archive-index|history) [[ "$2" =~ ^\.?[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.json(\.[0-9]+\.[0-9a-f]+\.tmp)?$ ]] ;;
+    sessions) [[ "$2" =~ ^[a-f0-9-]{36}\.json$ ]] ;;
     maintenance.lock*) [[ "$2" == owner.json || "$2" =~ ^\.owner\.json\.[0-9]+\.[0-9a-f]+\.tmp$ ]] ;;
     *) return 1 ;;
   esac
@@ -887,7 +888,7 @@ aicm_json_field() { # file key
 aicm_scheduled_jobs() {
   local file="$AICM_HOME/state/schedule.json"
   [[ -f "$file" ]] || return 0
-  sed -n 's/.*"jobs":\[\([^]]*\)\].*/\1/p' "$file" | tr ',' '\n' | tr -d '" ' | grep -E '^(update|clean|inventory)$' || true
+  sed -n 's/.*"jobs":\[\([^]]*\)\].*/\1/p' "$file" | tr ',' '\n' | tr -d '" ' | grep -E '^(update|clean|inventory|maintenance)$' || true
 }
 
 aicm_job_exists() {
@@ -942,7 +943,7 @@ aicm_schedule_problems() {
     [[ "$job" == "$skip" ]] && continue
     if ! aicm_job_exists "$job"; then echo "scheduled job '$job' is missing; run: aicm schedule install"; continue; fi
     [[ "$nostale" == nostale ]] && continue
-    case "$job" in update) state="last-update"; limit=3 ;; inventory) state="inventory"; limit=9 ;; *) state="last-clean"; limit=9 ;; esac
+    case "$job" in update) state="last-update"; limit=3 ;; inventory) state="inventory"; limit=9 ;; maintenance) state="last-maintenance"; limit=1 ;; *) state="last-clean"; limit=9 ;; esac
     # schedule.json older than the limit and the job's state missing or older than the limit.
     if [[ -n "$(find "$file" -mmin +"$((limit * 1440))" 2>/dev/null)" ]] &&
        { [[ ! -f "$AICM_HOME/state/$state.json" ]] || [[ -n "$(find "$AICM_HOME/state/$state.json" -mmin +"$((limit * 1440))" 2>/dev/null)" ]]; }; then
@@ -983,7 +984,9 @@ exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
 AICM_TIMEOUT_GNU=""
 aicm_timeout() {
   local secs="$1"; shift
-  if [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]] && command -v timeout >/dev/null 2>&1; then
+  if command -v node >/dev/null 2>&1 && [[ "${AICM_TIMEOUT_TOOL:-}" != perl && "${AICM_CONTAINED:-}" == 1 && "${AI_CLI_MANAGER_SESSION:-}" =~ ^[a-f0-9-]{36}$ ]]; then
+    node "$AICM_ROOT/lib/supervise.js" --timeout "$secs" -- "$@"
+  elif [[ "${AICM_TIMEOUT_TOOL:-}" != perl ]] && command -v timeout >/dev/null 2>&1; then
     # -k: KILL 10 seconds after TERM when the command ignores TERM (GNU coreutils only).
     if [[ -z "$AICM_TIMEOUT_GNU" ]]; then
       if timeout --version 2>/dev/null | grep -q GNU; then AICM_TIMEOUT_GNU=yes; else AICM_TIMEOUT_GNU=no; fi
@@ -1651,4 +1654,12 @@ aicm_node_module() { # module args...
     [[ "$line" == "attention: "* ]] && AICM_NODE_ATTENTION+=("${line#attention: }")
   done <<< "$out"
   return 0
+}
+
+# Place the whole manager invocation in a guarded session; direct CLI calls inherit its marker.
+# Version/help/scheduler commands do not launch AI CLIs and need no boundary.
+aicm_contain_script() {
+  [[ "${AICM_CONTAINED:-}" == 1 && "${AI_CLI_MANAGER_SESSION:-}" =~ ^[a-f0-9-]{36}$ ]] && return 0
+  command -v node >/dev/null 2>&1 || { echo "AI CLI process containment needs Node.js" >&2; exit 1; }
+  exec node "$AICM_ROOT/lib/supervise.js" -- /bin/bash "$@"
 }
