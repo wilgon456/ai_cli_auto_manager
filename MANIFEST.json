@@ -1,7 +1,7 @@
 {
   ".gitattributes": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
   ".github/workflows/auto-maintenance.yml": "87eba1fff7027f59a88ce3cb34bfc1c4cebbe847dec7a4a81aff0881a2831c77",
-  ".github/workflows/ci.yml": "a55c0dc3b25389a1a3dab3e848cc37f604c7005855f6b43908228f18663326f1",
+  ".github/workflows/ci.yml": "336b8c9556dff68d7d9b5fbf380412ab2940a1848cbce03a2093b77d2c762ae6",
   ".gitignore": "2cfa7c944f39fefbc77b13bd1e7120b228c54325aa35ba4dc2b15308fd376a43",
   "CHANGELOG.md": "04cc43d153614f3e6a5fce36e31e69f1d29df77627a87c9087baf2533f9833c2",
   "CONTRIBUTING.md": "9905528fcde4f2b60d29c8362e5b1a2195828b5a75562e272f80b32fbc4888b8",
@@ -48,7 +48,7 @@
   "rules/maintenance.conf": "cf5f66db67c4148ec28249a799c09f25112bfdbb022537d38c214d164e1595eb",
   "scripts/build_release.py": "81f794e382c65f57e9e1e98f865ed695aee648a7458183960d6a8108d3912be8",
   "scripts/check_manifest.py": "8ae17bedd0dd281f64703d4d96c686bc4cde84016416d171a5ba1711c8494004",
-  "tests/aicm_test.ps1": "ee65886ce92d65b03e4bf5230b5036ab3ad6c1ab06530959556c45b2975f2715",
+  "tests/aicm_test.ps1": "1bd9e5144383fa7c2efe4158af4d7728694f568e9b958ade1dddf3cf895af7f5",
   "tests/aicm_test.sh": "21d9d1c5729a81ae56092c91c457476be9544ce81a539624dc7f0f6020cca043",
   "tests/auto_maintenance_test.ps1": "18b8dd09aa502fe0525f874e684bd593360fcb5904b00f132dabf2fc51a6f4bf",
   "tests/cache_budget_test.ps1": "f99a4b965e9b1b5659bc694630b5cbeb9ca8f62323155c9dbeaafc2f461b40fe",
@@ -84,7 +84,7 @@
   "tests/unicode_paths_test.ps1": "bee796f532ed9b5e7809486084f7e16bac73c5ea4f28c5c8e15742206649d383",
   "tests/update_policy_test.ps1": "a01ce383d30e6df7c215bc7b43d17511b98de9dbf30d0a98049d2efc7315c8b0",
   "tests/update_policy_test.sh": "f360f5f2839c895568e94a8d43ea0c0a5f256747ca0834f45fc67a09b60d2f17",
-  "tests/update_verify_test.sh": "5d4a47b4f728905fde155d7e358f2f07d2e6a3b67b699511edc162afa2da921e",
+  "tests/update_verify_test.sh": "fcf65e9d6e749ea6ffcf46b570bfa42c4f490d05d572e58cf82495239fc96922",
   "windows/install_scheduled_task.ps1": "6477d040bc50a8db4cf74d80d50ebafa8ce9a231d7029f3cec5f016cd94e2c08",
   "windows/run-hidden.vbs": "ff3acc41769acc2d896fd9b236bea3c33901ac5eb19567b26ac5c8acb5ef8836"
 }

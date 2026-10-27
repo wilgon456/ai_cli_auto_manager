@@ -5,7 +5,8 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
-export AICM_TEST_NODE_RUNTIME="$(command -v node)"
+AICM_TEST_NODE_RUNTIME="$(command -v node)"
+export AICM_TEST_NODE_RUNTIME
 trap 'rm -rf "$WORK"' EXIT
 
 export HOME="$WORK/home" TMPDIR="$WORK/tmp" AICM_HOME="$WORK/home/.ai-cli-auto-manager"

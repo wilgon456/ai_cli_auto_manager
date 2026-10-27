@@ -197,9 +197,9 @@ try {
   $policyFile = Join-Path $aicmHome 'update-policy.json'
   foreach ($bad in '{"schemaVersion":1,"tools":{"codex":{"exclude":"yes"}}}', '{"schemaVersion":1,"tools":{"gpt":{"exclude":true},"codex":{"exclude":false}}}', 'not json') {
     [System.IO.File]::WriteAllText($policyFile, $bad)
-    $before = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Where-Object { $_.Name -notlike '*.log' } | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+    $before = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Where-Object { $_.Name -notlike '*.log' } | Sort-Object FullName | ForEach-Object { if ($_ -is [IO.FileInfo]) { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } else { "directory|$($_.FullName)" } }) -join ';'
     $r = Invoke-Aicm @('doctor')
-    $after = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Where-Object { $_.Name -notlike '*.log' } | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+    $after = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Where-Object { $_.Name -notlike '*.log' } | Sort-Object FullName | ForEach-Object { if ($_ -is [IO.FileInfo]) { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } else { "directory|$($_.FullName)" } }) -join ';'
     if ($r.ExitCode -eq 1 -and $r.Output -match 'problem: update policy: .*refuses to run until it is fixed' -and $r.Output -notmatch 'healthy:' -and $after -eq $before) { Pass "doctor fails on an invalid policy and changes nothing: $bad" } else { Fail "doctor with policy $bad : $($r.ExitCode) $($r.Output)" }
   }
   [System.IO.File]::WriteAllText($policyFile, '{"schemaVersion":1,"tools":{"codex":{"exclude":true}}}')
@@ -307,7 +307,7 @@ try {
   Set-Content -LiteralPath "$proj\app\personal.txt" -Value 'mine'
   Set-Content -LiteralPath "$proj\app\SOURCE" -Value 'mine'
   Set-Content -LiteralPath "$proj\logs\build.log" -Value 'mine'
-  $projBefore = (Get-ChildItem -LiteralPath $proj -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  $projBefore = (Get-ChildItem -LiteralPath $proj -Recurse -Force | Sort-Object FullName | ForEach-Object { if ($_ -is [IO.FileInfo]) { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } else { "directory|$($_.FullName)" } }) -join ';'
   $savedHome = $aicmHome
   $aicmHome = $proj
   try {
@@ -315,7 +315,7 @@ try {
       @('uninstall', '-Purge', '-DryRun'), @('schedule', 'install', '-CleanAt', '99:99', '-KeepLegacyTask'), @('schedule', 'install', '-KeepLegacyTask'),
       @('update', '-Targets', 'none'), @('clean'), @('uninstall', '-Purge'))) { $null = Invoke-Aicm $a }
   } finally { $aicmHome = $savedHome }
-  $projAfter = (Get-ChildItem -LiteralPath $proj -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  $projAfter = (Get-ChildItem -LiteralPath $proj -Recurse -Force | Sort-Object FullName | ForEach-Object { if ($_ -is [IO.FileInfo]) { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } else { "directory|$($_.FullName)" } }) -join ';'
   if (-not (Test-Path -LiteralPath "$proj\.aicm-home") -and $projAfter -eq $projBefore) { Pass 'help, previews and refused commands leave an existing project untouched' } else { Fail "project changed: $projAfter" }
   if (-not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'no task is registered for a foreign home' } else { Fail 'task registered for a foreign home' }
 
@@ -324,9 +324,9 @@ try {
   $null = Invoke-Aicm @('schedule', 'install', '-KeepLegacyTask')
   New-Item -ItemType Directory -Path "$aicmHome\logs" -Force | Out-Null
   Set-Content -LiteralPath "$aicmHome\logs\personal.txt" -Value 'mine'
-  $homeBefore = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  $homeBefore = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Sort-Object FullName | ForEach-Object { if ($_ -is [IO.FileInfo]) { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } else { "directory|$($_.FullName)" } }) -join ';'
   $r = Invoke-Aicm @('uninstall', '-Purge', '-DryRun')
-  $homeAfter = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  $homeAfter = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Sort-Object FullName | ForEach-Object { if ($_ -is [IO.FileInfo]) { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } else { "directory|$($_.FullName)" } }) -join ';'
   $tasks = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)
   if ($r.ExitCode -eq 0 -and $homeAfter -eq $homeBefore -and $tasks.Count -eq 3 -and $r.Output -match 'would remove: ' -and $r.Output -match 'would remove installed copy' -and $r.Output -match 'logs\\personal\.txt') { Pass 'uninstall -Purge -DryRun lists everything and changes nothing' } else { Fail "purge dry run: $($r.ExitCode) tasks=$($tasks.Count) $($r.Output)" }
   Set-Content -LiteralPath "$aicmHome\app\personal.txt" -Value 'mine'
