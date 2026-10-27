@@ -5,6 +5,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
+export AICM_TEST_NODE_RUNTIME="$(command -v node)"
 trap 'rm -rf "$WORK"' EXIT
 
 export HOME="$WORK/home" TMPDIR="$WORK/tmp" AICM_HOME="$WORK/home/.ai-cli-auto-manager"
@@ -49,6 +50,11 @@ EOF
 chmod +x "$WORK/fake-npm" "$WORK/fake-brew"
 cat > "$WORK/bin/node" <<'EOF'
 #!/bin/sh
+# Use the real runtime for the manager's containment/history infrastructure; registry selection
+# stays stubbed and every vendor executable remains a disposable fake.
+case "${1:-}" in
+  */lib/supervise.js|*/lib/maintenance.js|*/lib/maintenance-cli.js) exec "$AICM_TEST_NODE_RUNTIME" "$@" ;;
+esac
 if [ "${2:-}" = "candidates" ]; then echo 1.2.3; exit 0; fi
 exit 0
 EOF

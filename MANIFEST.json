@@ -84,7 +84,7 @@
   "tests/unicode_paths_test.ps1": "bee796f532ed9b5e7809486084f7e16bac73c5ea4f28c5c8e15742206649d383",
   "tests/update_policy_test.ps1": "a01ce383d30e6df7c215bc7b43d17511b98de9dbf30d0a98049d2efc7315c8b0",
   "tests/update_policy_test.sh": "f360f5f2839c895568e94a8d43ea0c0a5f256747ca0834f45fc67a09b60d2f17",
-  "tests/update_verify_test.sh": "cfd02b81d549e1b9f575c70289e66f25d2f4d7356ece186de2e5750e7bee0f8a",
+  "tests/update_verify_test.sh": "5d4a47b4f728905fde155d7e358f2f07d2e6a3b67b699511edc162afa2da921e",
   "windows/install_scheduled_task.ps1": "6477d040bc50a8db4cf74d80d50ebafa8ce9a231d7029f3cec5f016cd94e2c08",
   "windows/run-hidden.vbs": "ff3acc41769acc2d896fd9b236bea3c33901ac5eb19567b26ac5c8acb5ef8836"
 }
