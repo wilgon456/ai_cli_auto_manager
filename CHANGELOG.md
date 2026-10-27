@@ -1,5 +1,147 @@
 # Changelog
 
+## 2.8.3 - Unreleased
+
+### Final compatibility review
+- Legacy installed copies without a file roster accept only exact known file names as a fallback,
+  never arbitrary script extensions or a SOURCE pointer back to the copy itself. User scripts remain
+  untouched when sync refuses such a copy; Bash and PowerShell have matching regressions.
+- Buffer npm candidate-name readers in install-owner detection and interrupted-install recovery,
+  plus pending-state and scheduler-health output. Repeated fast process substitutions in captured
+  Bash 3.2 updater runs reproduced AST/memory faults and CPU spins; the buffered variant passed 40
+  isolated repetitions and 40 repetitions asserting the Homebrew route. The precise Bash runtime
+  defect remains unconfirmed. Candidate producers return success after emitting legacy aliases,
+  preserving Amp/OpenCode ordering; inventory tests repeat captured updates and assert brew routing.
+- Budget depth probes and candidate enumeration now retain errors and time limits. Failed or partial
+  candidate enumeration deletes nothing, including when the command emitted some candidates first.
+  New independent boundary regressions cover these cases.
+
+### Cache budgets and opt-in optimize (phase 2)
+- **`budget` cleanup kind** (Bash and PowerShell). Keeps one independent-file cache folder at or below
+  `limit` MiB of logical bytes; `days` (at least 1) is the minimum age, `limit` at least 1 (zero, empty
+  or malformed values are refused). No default rule uses it and default schedules are unchanged; switch
+  `npm-cache`/`pip-cache` in `clean-rules.local.conf` to use it. Every ordinary file counts toward the
+  total (protected, recent, hard-linked, SQLite and open ones too); candidates match the pattern, are
+  older than `days`, have one link and are neither protected nor SQLite files/sidecars. They go oldest
+  modification time first (not LRU) until the total is within budget. Each one is checked again
+  (identity, size, time, no link below the root, root not moved or linked) and must not be open:
+  `lsof` on Unix (missing/failing means nothing is deleted), an exclusive single-link FileGuard handle on
+  Windows. A read error, a `stat` failure or a scan bound (`AICM_BUDGET_MAX_FILES` 200000,
+  `AICM_BUDGET_MAX_DEPTH` 32, `AICM_BUDGET_SCAN_SECONDS` 300) makes the scan `partial` and nothing is
+  deleted by that rule; other rules still run. JSON rows add `totalBytes`, `budgetBytes`,
+  `remainingBytes`, `projectedRemainingBytes`, `budgetUnmetBytes`, `scanStatus`. A budget is per cache
+  folder, not per CLI. `cap` stays per file.
+- **Byte sums above 2 GiB.** `aicm_sum_lines` printed with awk `%d`, which mawk clamps at 2147483647;
+  it now prints exact whole numbers up to 2^53 (status totals, cleanup counts).
+- **`aicm optimize` / `aicm.ps1 optimize`.** Opt-in, preview by default (also `--dry-run`/`-DryRun`);
+  `--apply`/`-Apply` runs only `npm cache verify`, `uv cache prune`, `pnpm store prune`
+  (`--tasks npm-verify,uv-prune,pnpm-prune` / `-Tasks`), `--json`/`-Json` one document. Invalid task
+  lists and `--apply` with `--dry-run` are refused before anything is written. The preview only looks
+  tools up on PATH. Apply claims `AICM_HOME`, refuses during an update/cleanup/archive/restore, holds
+  the maintenance lock until the last command has stopped (also on failure or interruption), skips a
+  task while that package manager runs or when the process table cannot be read, runs offline (Corepack
+  network/project selection/env-file off, npm/pnpm offline, pnpm bootstrap off, uv offline) with a time limit that stops the whole process group, and
+  never counts a missing, failed, timed-out or skipped task as success. Windows `.cmd`/`.bat` shims go
+  through `%SystemRoot%\System32\cmd.exe` with a quoted path; cmd.exe metacharacters in the path are
+  refused. Needs Node.js (`lib/optimize.js`); update, inventory and ordinary cleanup still do not.
+  Package-manager ancestors and unreadable Node/Bun command lines also hold affected tasks. Child
+  guards override inherited environment keys case-insensitively; Windows process JSON uses UTF-8.
+  SIGINT/SIGTERM stop owned children before releasing the lease. No schedule runs it.
+- **Release tooling.** `scripts/build_release.py` builds reproducible `.tar.gz`/`.zip` source archives
+  and `SHA256SUMS` from `MANIFEST.json` only; `scripts/check_manifest.py` now also reports new files that
+  are not ignored and not in the manifest. New `docs/release-checklist.md`.
+- Tests: `tests/cache_budget_test.sh`, `tests/cache_budget_test.ps1` (Windows PowerShell 5.1, PowerShell
+  7, and the portable checks on PowerShell 7 for macOS/Linux), a real open file and live SQLite case in
+  `tests/cleanup_safety_test.py`, `tests/node/optimize.test.js` with fake tools and process tables,
+  dispatcher cases in `tests/aicm_test.sh`/`.ps1`, `tests/release_packaging_test.py`; CI runs them.
+- Follow-up, not in this release: OS DNS cache flush, macOS QuickLook reset, SQLite `VACUUM`.
+
+### Public release hardening (phase 1)
+- **Management folder ownership.** An existing folder is used as `AICM_HOME` only when it is new or
+  empty, carries a valid `.aicm-home` marker, or is an unmarked older install recognized by its
+  installed copy (`app` with `SOURCE`/`VERSION`) with nothing but the tool's and the user's known
+  entries. A folder name, a reserved folder alone (`archive/<rule>/<date>`), a marker with other content
+  or the home/profile folder itself is never ownership. Help, bad arguments and previews never create
+  the marker (`aicm update --help` used to mark an existing folder). `update`, `inventory`, `clean`,
+  `worktrees`, `config`, `processes` and `schedule install` refuse a foreign folder before writing into it.
+- **No blind whitelist.** The installed copy records its file list in `app/.aicm-copy`; a sync, uninstall
+  or purge refuses (and keeps) an `app`, `app.new` or `app.old` that holds anything a copy does not
+  (`app/personal.txt`, `app/lib/notes.txt`) or a link. Copies from older versions without the list are
+  checked against their source checkout and the tool's file names.
+- **Purge.** `uninstall --purge` removes only log and state files under the names the tool uses and
+  archived files the archive index lists (same size). Unindexed and personal files in `logs/`, `state/`
+  and `archive/` (also in a dated folder) and linked entries are kept and listed. Everything is checked
+  before any job or file is removed. New `uninstall --purge --dry-run` / `-Purge -DryRun` changes
+  nothing: no jobs, copy or data removed, no marker, log or state written. A Windows `AICM_HOME` chosen
+  as a junction still works; links inside it are never followed.
+- **SQLite families in date rules (macOS/Linux).** `age` and `age-files` now treat `*.sqlite`,
+  `*.sqliteN` and `*.db` with `-wal`/`-shm`/`-journal` as one unit, like the cap rule and Windows did:
+  every member must be eligible (age, pattern, protection), regular and proven idle with `lsof`. A fresh
+  WAL, an open connection, a missing or failing `lsof`, or a linked/unexpected sidecar keeps the whole
+  family. Other cache files are still removed in one batch. This was a gap in the date rules only; the
+  cap rule (Codex trace databases) already grouped families.
+- **Archive index at scale.** `archive list` reads the index newest first and pages it (`--limit`,
+  `--offset`, JSON `index.nextOffset`). A file is called legacy only when every manifest (up to 100000)
+  and the bounded archive walk were read; otherwise `legacy.complete` is `false` and nothing is guessed.
+  Before, 10000 old records hid newer ones and their files were shown as legacy. New `archive gc`
+  (`--dry-run`, `--json`; Windows `archive gc -DryRun -Json`) drops records whose dated archive folder
+  retention already removed and records restored more than 30 days ago, oldest first, at most 10000 per
+  run, under the maintenance lock or the cleanup's lease. A real clean that ran an archive rule runs it.
+  Pending, still-restorable, malformed records and other files are never removed. Direct restore by id
+  is unchanged.
+- **Windows encoding.** SOURCE, VERSION, `.aicm-copy`, the marker and state JSON are read and written
+  as UTF-8 without a BOM on PowerShell 5.1 and 7; Node.js/npm child output is decoded as UTF-8, other
+  programs keep the PowerShell default. A Korean clone or npm prefix no longer looks "gone" or
+  standalone on Windows PowerShell 5.1. If npm lists packages but its prefix cannot be a folder, the
+  update stops with an error rather than update through a guessed owner.
+- **doctor.** Fails on an invalid `update-policy.json` (wrong type, alias conflict, unknown id, bad JSON)
+  or one that needs a missing Node.js, on a foreign `AICM_HOME`, and on jobs whose installed copy is
+  gone; shows the installed copy, its source and both versions, and Node.js. It changes nothing. Windows
+  task failures were already reported through `LastTaskResult`.
+- Tests: `tests/home_ownership_test.ps1`, `tests/unicode_paths_test.ps1` (CI: Windows PowerShell 5.1 and
+  PowerShell 7), `tests/node/archive-index.test.js`, live-SQLite cases in `tests/cleanup_safety_test.py`,
+  ownership/doctor cases in `tests/aicm_test.sh`/`.ps1`. Fixtures that pre-populate a home before its
+  first run now write the marker, as an existing install would have.
+
+### Cleanup categories, JSON and local history
+- `aicm clean --category sessions,cache,logs,temp,other` (or `all`). A subset does not enable disabled rules and does not purge unrelated archives. `--rules id,id` still enables only those ids. PowerShell: `-Category cache,logs` or `-Category 'cache,logs'`.
+- `--explain` prints one line per selected rule (category, age, limit, action, protection, reason). It does not list files. `--json` prints one document with the same per-rule fields plus counts from that pass. Previews do not write state, logs or the home marker.
+- A real clean stores `scopeCategories` and `scopeRules` on `last-clean.json`. A cache-only or rule-only run does not satisfy a weekly full clean or a different category. A last-clean file with no scope is treated as a full clean.
+- Generic archive moves need Node.js and `lib/maintenance.js` (`archive-put`). Without Node the file stays and old generic archive folders are not purged. Codex's own archive/delete path is unchanged. Restore never overwrites an existing file.
+- `aicm archive list [--json]`, `aicm restore ID [--dry-run] [--json]`, `aicm history [--limit N] [--json]`. Windows: `archive list -Json`, `restore ID -DryRun -Json`, `history -Limit N -Json`. Legacy files are listed for a manual move. Codex-native sessions are not generic restore ids. Local history keeps 100 entries for update, clean, and restore, and does not store file contents.
+- Schedule: `--clean-category sessions,logs` / `-CleanCategory cache,logs`. Quoted strings and arrays are normalized. An empty `--category=` or a missing `--clean-category` value is rejected. Invalid schedule options do not create the home marker.
+
+### Update verification
+- Record the PATH-selected command path and version before and after, plus a bounded exit. A command that was present and is then missing, failed, empty, or timed out is a failure. A reported install success with no command is a failure. An unchanged version is not proof of the latest release. A previously failing command that works afterward is repaired. Hooks run only after a healthy change. Local update history needs Node.js. No automatic rollback; optional per-CLI pins are described below.
+
+### Per-CLI update policy
+- Optional `update-policy.json` (`schemaVersion: 1`) in the management home: `tools.<id>.{exclude,pin,minReleaseAgeDays}`. Validation is strict and runs before any log, lock or state file; a directory, dangling link or truncated reader output fails closed. Node.js is required only when the file exists.
+- Exclusion wins over explicit targets, install-missing, interrupted-install recovery, and Codex cask quarantine/recycle, including the same-day fast path. Excluded CLIs are not probed, so a broken `--version` cannot fail the run.
+- Pins are exact stable npm releases only (plus Amp's timestamp/hash train), must be published, not deprecated and past the effective waiting period, never fall back to latest, and never downgrade. Pins and positive per-tool ages hold non-npm routes; an explicit `0` permits them. Interrupted recovery under a pin is held for manual install with the backup and known state kept.
+- Per-tool ages override the global waiting period. Dry runs print effective rules and hold reasons. The stored fingerprint covers the normalized policy and global age, so a changed or removed policy reruns the same day. Post-update hooks fire only for rows that actually updated.
+- npm backup housekeeping is suspended while any rule is configured.
+
+### Follow-up
+- Cache capacity limits that keep busy and protected data landed as `budget` rules (phase 2 above). Optional TUI later.
+- Design references only; no code was copied: [topgrade](https://github.com/topgrade-rs/topgrade), [agent-session-cleaner](https://github.com/haowang02/agent-session-cleaner), [codex-clean](https://github.com/Merlin-Arthur05/codex-clean), [ClaudeCode-Project-Cleaner](https://github.com/cherlix/ClaudeCode-Project-Cleaner), [bleachbit](https://github.com/bleachbit/bleachbit).
+
+### Compatibility and cleanup fixes
+- Recognize Amp's current npm package while preserving legacy installation ownership.
+- Accept Amp's timestamp/hash release train only for its two known npm package names,
+  retaining release-age checks and excluding unrelated prereleases.
+- Keep the selected OpenCode major version when V1 and V2 npm packages coexist.
+- Read OpenCode V1 and V2 MCP configuration, including JSONC files.
+- Add Copilot's official Homebrew and WinGet channels to the shared catalog.
+- Select CLI update channels from resolved ownership when Homebrew and npm share a prefix.
+- Reject linked archive ancestors and destinations before moving or purging user data.
+
+### Public distribution preparation
+- Start the README examples with update/inventory schedules only; explain permanent
+  history deletion before enabling the cleanup schedule.
+- Document supported installation channels, runtime requirements, testing limits,
+  contribution checks, and vulnerability reporting.
+- Verify the release manifest in CI so missing files and stale checksums fail validation.
+
 ## 2.8.2 - 2026-10-11
 
 ### Fixed: cleanup boundaries and running files

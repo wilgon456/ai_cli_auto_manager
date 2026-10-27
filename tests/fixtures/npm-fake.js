@@ -118,6 +118,7 @@ function main() {
         if (!info.unpublished) versions.push(v);
       }
       const out = { time, 'dist-tags': { latest: pkg.latest } };
+      if (fields.includes('name')) out.name = name;
       if (fields.includes('versions')) out.versions = versions;
       console.log(JSON.stringify(out));
       return 0;

@@ -10,6 +10,10 @@
   .\bin\clean_ai_leftovers.ps1 -DryRun
 .EXAMPLE
   .\bin\clean_ai_leftovers.ps1 -Rules codex-sessions,claude-transcripts
+.EXAMPLE
+  .\bin\clean_ai_leftovers.ps1 -Category sessions,cache -DryRun
+.EXAMPLE
+  .\bin\clean_ai_leftovers.ps1 -Explain -Category temp
 #>
 [CmdletBinding()]
 param(
@@ -17,6 +21,9 @@ param(
   [switch]$DryRun,
   [switch]$Report,
   [string[]]$Rules = @(),
+  [string[]]$Category = @(),
+  [switch]$Json,
+  [switch]$Explain,
   [string]$RulesFile = '',
   [string]$LocalRulesFile = '',
   [string]$LogDir = '',
@@ -33,6 +40,125 @@ if (-not $LogDir) { $LogDir = Join-Path (Get-AicmHome) 'logs' }
 if ($Report) { $DryRun = $true }
 
 $selected = @(($Rules -join ',') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$script:CleanSelected = @($selected)
+$catJoined = @($Category | ForEach-Object { "$_" }) -join ','
+if ($PSBoundParameters.ContainsKey('Category') -and -not "$catJoined".Trim()) {
+  [Console]::Error.WriteLine('-Category needs a value')
+  exit 2
+}
+try {
+  $script:CleanCategories = @(ConvertTo-AicmCategoryList $catJoined)
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 2
+}
+# A named subset limits the run. "all" and an omitted flag keep the full cleanup.
+$script:CleanCategoryFilter = ($script:CleanCategories.Count -gt 0 -and -not ($script:CleanCategories.Count -eq 1 -and $script:CleanCategories[0] -eq 'all'))
+if ($Explain) { $DryRun = $true }
+
+function Test-CleanRuleIncluded([string]$Id) {
+  if ($script:CleanCategoryFilter) {
+    $cat = Get-AicmRuleCategory $Id
+    if ($script:CleanCategories -notcontains $cat) { return $false }
+  }
+  if ($script:CleanSelected.Count -gt 0 -and $script:CleanSelected -notcontains $Id) { return $false }
+  return $true
+}
+
+function ConvertTo-CleanJsonText([string]$Value) {
+  if ([string]::IsNullOrEmpty($Value)) { return '' }
+  $encoded = ConvertTo-Json -InputObject $Value -Compress
+  $sb = New-Object System.Text.StringBuilder ($encoded.Length)
+  foreach ($ch in $encoded.ToCharArray()) {
+    $code = [int]$ch
+    if ($code -gt 127) {
+      [void]$sb.Append('\u')
+      [void]$sb.Append($code.ToString('x4'))
+    } else {
+      [void]$sb.Append($ch)
+    }
+  }
+  $encoded = $sb.ToString()
+  if ($encoded.Length -ge 2 -and $encoded.StartsWith('"') -and $encoded.EndsWith('"')) {
+    return $encoded.Substring(1, $encoded.Length - 2)
+  }
+  return $encoded
+}
+
+function ConvertTo-CleanJson([bool]$IsDry, $RuleRows, $Errs, [int64]$Planned, [int64]$Freed, [int64]$Archived) {
+  # Nested copy so an AST extract of this function still escapes without the script helper.
+  function ConvertTo-CleanJsonText([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value)) { return '' }
+    $encoded = ConvertTo-Json -InputObject $Value -Compress
+    $sb = New-Object System.Text.StringBuilder ($encoded.Length)
+    foreach ($ch in $encoded.ToCharArray()) {
+      $code = [int]$ch
+      if ($code -gt 127) {
+        [void]$sb.Append('\u')
+        [void]$sb.Append($code.ToString('x4'))
+      } else {
+        [void]$sb.Append($ch)
+      }
+    }
+    $encoded = $sb.ToString()
+    if ($encoded.Length -ge 2 -and $encoded.StartsWith('"') -and $encoded.EndsWith('"')) {
+      return $encoded.Substring(1, $encoded.Length - 2)
+    }
+    return $encoded
+  }
+  $catParts = New-Object System.Collections.Generic.List[string]
+  if ($null -ne $script:CleanCategories) {
+    foreach ($cat in $script:CleanCategories) {
+      $catParts.Add('"' + (ConvertTo-CleanJsonText ([string]$cat)) + '"')
+    }
+  }
+  $catJson = '[' + ($catParts -join ',') + ']'
+  $rulesJson = New-Object System.Collections.Generic.List[string]
+  if ($null -ne $RuleRows) {
+    foreach ($row in $RuleRows) {
+      $cand = if ($row.direct) { [int64]$row.purge } else { [int64]$row.files }
+      $candBytes = if ($row.direct) { [int64]$row.purgeBytes } else { [int64]$row.bytes }
+      $en = if ($row.enabled) { 'true' } else { 'false' }
+      $days = if ($null -ne $row.days) { [int]$row.days } else { 0 }
+      $limit = if ($null -ne $row.limit) { [int]$row.limit } else { 0 }
+      # Budget rules add their totals; a rule that was not scanned reports scanStatus "unavailable".
+      $budgetJson = ''
+      if ($row.PSObject.Properties['kind'] -and $row.kind -eq 'budget') {
+        $b = if ($row.PSObject.Properties['budget']) { $row.budget } else { $null }
+        if ($null -eq $b) { $b = @{ totalBytes = 0L; remainingBytes = 0L; projectedRemainingBytes = 0L; budgetUnmetBytes = 0L; scanStatus = 'unavailable' } }
+        $budgetJson = ',"totalBytes":{0},"budgetBytes":{1},"remainingBytes":{2},"projectedRemainingBytes":{3},"budgetUnmetBytes":{4},"scanStatus":"{5}"' -f `
+          [int64]$b.totalBytes, ([int64]$limit * 1048576), [int64]$b.remainingBytes, [int64]$b.projectedRemainingBytes, [int64]$b.budgetUnmetBytes, (ConvertTo-CleanJsonText ([string]$b.scanStatus))
+      }
+      $rulesJson.Add(('{{"id":"{0}","category":"{1}","path":"{2}","action":"{3}","reason":"{4}","days":{5},"limit":{6},"protection":"{7}","status":"{8}","enabled":{9},"candidates":{10},"candidateBytes":{11},"purgeCandidates":{12},"purgeCandidateBytes":{13},"removed":{14},"removedBytes":{15},"purged":{16},"purgedBytes":{17},"inUse":{18}{19}}}' -f `
+        (ConvertTo-CleanJsonText ([string]$row.id)), (ConvertTo-CleanJsonText ([string]$row.category)), (ConvertTo-CleanJsonText ([string]$row.path)), (ConvertTo-CleanJsonText ([string]$row.action)), (ConvertTo-CleanJsonText ([string]$row.reason)), $days, $limit, (ConvertTo-CleanJsonText ([string](Get-AicmProtectionPolicy))), (ConvertTo-CleanJsonText ([string]$row.status)), $en, `
+        $cand, $candBytes, [int64]$row.purge, [int64]$row.purgeBytes, [int64]$row.removed, [int64]$row.removedBytes, [int64]$row.purged, [int64]$row.purgedBytes, [int64]$row.inUse, $budgetJson))
+    }
+  }
+  $errParts = New-Object System.Collections.Generic.List[string]
+  if ($null -ne $Errs) {
+    foreach ($err in $Errs) {
+      $errParts.Add('"' + (ConvertTo-CleanJsonText ([string]$err)) + '"')
+    }
+  }
+  $dry = if ($IsDry) { 'true' } else { 'false' }
+  return ('{{"schemaVersion":1,"dryRun":{0},"categories":{1},"rules":[{2}],"summary":{{"plannedBytes":{3},"freedBytes":{4},"archivedBytes":{5}}},"errors":[{6}]}}' -f `
+    $dry, $catJson, ($rulesJson -join ','), $Planned, $Freed, $Archived, ($errParts -join ','))
+}
+
+function Write-CleanJsonBail([string]$Status, [string]$Message) {
+  if (-not $Json) { return }
+  $dry = if ($DryRun) { 'true' } else { 'false' }
+  $esc = ConvertTo-CleanJsonText $Message
+  $statusEsc = ConvertTo-CleanJsonText $Status
+  $catParts = New-Object System.Collections.Generic.List[string]
+  if ($null -ne $script:CleanCategories) {
+    foreach ($cat in $script:CleanCategories) {
+      $catParts.Add('"' + (ConvertTo-CleanJsonText ([string]$cat)) + '"')
+    }
+  }
+  $catJson = '[' + ($catParts -join ',') + ']'
+  Write-Output -NoEnumerate (('{{"schemaVersion":1,"dryRun":{0},"status":"{1}","categories":{2},"rules":[],"summary":{{"plannedBytes":0,"freedBytes":0,"archivedBytes":0}},"errors":["{3}"]}}' -f $dry, $statusEsc, $catJson, $esc))
+}
 
 function Get-DisplayPath([string]$Path) {
   $userHome = Get-AicmUserHome
@@ -186,6 +312,20 @@ function Invoke-CapRule($Rule, [string]$Root) {
   return $result
 }
 
+# Budget rule (Invoke-AicmBudget in lib\aicm-common.ps1). Each chosen file is deleted through FileGuard:
+# opened without sharing (so a file open elsewhere is kept), with a single link, then marked for deletion.
+function Invoke-BudgetRule($Rule, [string]$Root) {
+  $delete = {
+    param([System.IO.FileInfo]$File)
+    if ((Test-AicmProtected $File) -or (Test-AicmPathHasLink $File.FullName)) { return $false }
+    if (-not ('Aicm.FileGuard' -as [type])) { Add-Type -Path (Join-Path (Get-AicmRoot) 'lib\aicm-file-guard.cs') }
+    return [Aicm.FileGuard]::TryDelete([string[]]@($File.FullName), [string[]]@($File.FullName), $true)
+  }
+  $r = Invoke-AicmBudget $Rule $Root ([bool]$DryRun) $delete
+  if ($DryRun -and $r.files -gt 0 -and -not $r.detail) { $r.detail = 'projection assumes the candidates are not in use (a preview opens no files)' }
+  return $r
+}
+
 function Invoke-KeepLatestRule($Rule, [string]$Root) {
   $result = [ordered]@{ files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; folders = @() }
   $groups = @{}
@@ -223,10 +363,12 @@ function New-ArchiveResult {
 
 # Archive date folders (archive\<rule>\yyyyMMdd) older than $Days are removed.
 function Invoke-ArchivePurge($Result, [string]$ArchiveDir, [int]$Days, [bool]$PurgeDry) {
+  if (-not (Test-AicmArchiveDest $ArchiveDir)) { return }
   if (-not (Test-Path -LiteralPath $ArchiveDir -PathType Container)) { return }
   $cutoff = (Get-Date).Date.AddDays(-$Days)
   foreach ($d in ([System.IO.DirectoryInfo]::new($ArchiveDir)).GetDirectories()) {
     if (Test-AicmLink $d) { continue }
+    if (-not (Test-AicmArchiveDest $d.FullName)) { continue }
     $when = [datetime]::MinValue
     if (-not [datetime]::TryParseExact($d.Name, 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, 'None', [ref]$when)) { continue }
     if ($when -ge $cutoff) { continue }
@@ -252,21 +394,48 @@ function Invoke-ArchiveRule($Rule, [string]$Root, [bool]$PurgeDry) {
   $archiveDir = Join-Path (Get-AicmArchiveRoot) $Rule.Id
   if (-not $DryRun -and $candidates.Count -gt 0) {
     $dest = Join-Path $archiveDir (Get-Date -Format 'yyyyMMdd')
+    if (-not (Test-AicmArchiveDest $dest)) {
+      throw "archive destination escapes $(Get-AicmArchiveRoot)"
+    }
     $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
     foreach ($f in $candidates) {
       $target = Join-Path $dest $f.FullName.Substring($rootFull.Length + 1)
       try {
-        Initialize-AicmDirectory (Split-Path -Parent $target)
+        $parent = Split-Path -Parent $target
+        if (-not (Test-AicmArchiveDest $parent)) { $result.inUse++; continue }
+        Initialize-AicmDirectory $parent
+        if (-not (Test-AicmArchiveDest $parent)) { $result.inUse++; continue }
         if (Test-Path -LiteralPath $target) { $target = $target + '.' + [guid]::NewGuid().ToString('N').Substring(0, 6) }
         $len = $f.Length
-        [System.IO.File]::Move($f.FullName, $target)
-        $result.removed++
-        $result.removedBytes += $len
+        $node = Get-Command node -ErrorAction SilentlyContinue
+        $js = Join-Path (Get-AicmRoot) 'lib\maintenance.js'
+        if (-not $node) { $result.detail = 'Node.js is required to archive files; left in place'; $result.inUse++; continue }
+        if (-not (Test-Path -LiteralPath $js)) { $result.detail = 'lib/maintenance.js is missing from this copy; files were not moved'; $result.inUse++; continue }
+        $outFile = Join-Path ([IO.Path]::GetTempPath()) ("aicm-put-" + [guid]::NewGuid().ToString('N') + '.json')
+        $errFile = $outFile + '.err'
+        & node $js 'archive-put' '--rule' $Rule.Id '--root' $Root '--source' $f.FullName '--dest' $target '--json' 1>$outFile 2>$errFile
+        $okPut = $false
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $outFile) -and (Select-String -LiteralPath $outFile -Pattern '"ok":true' -Quiet)) { $okPut = $true }
+        if ($okPut) { $result.removed++; $result.removedBytes += $len }
+        else {
+          $result.inUse++
+          if (-not $result.detail) {
+            $err = if (Test-Path -LiteralPath $errFile) { (Get-Content -LiteralPath $errFile -TotalCount 1) } else { '' }
+            $result.detail = if ($err) { $err } else { "archive-put did not move $($f.Name)" }
+          }
+        }
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
       } catch {
         $result.inUse++
       }
     }
     [void](Remove-AicmEmptyDirs $Root)
+  }
+  $nodeOk = [bool](Get-Command node -ErrorAction SilentlyContinue)
+  $jsOk = Test-Path -LiteralPath (Join-Path (Get-AicmRoot) 'lib\maintenance.js')
+  if ((-not $nodeOk -or -not $jsOk) -and -not $PurgeDry) {
+    if (-not $result.detail) { $result.detail = 'Node.js and lib/maintenance.js are required to purge generic archives; old archive folders were left in place' }
+    return $result
   }
   Invoke-ArchivePurge $result $archiveDir $Rule.Limit $PurgeDry
   return $result
@@ -397,8 +566,77 @@ if ($selected.Count -gt 0) {
   }
 }
 
+if ($Explain -and -not $Json) {
+  foreach ($rule in $allRules) {
+    if (-not (Test-CleanRuleIncluded $rule.Id)) { continue }
+    $enabled = [bool]$rule.Enabled
+    if ($script:CleanSelected -contains $rule.Id) { $enabled = $true }
+    $shown = if ($rule.Kind -eq 'command') { $rule.Path } else { Get-DisplayPath (Expand-AicmPath $rule.Path) }
+    $en = if ($enabled) { 'true' } else { 'false' }
+    Write-Host ("{0}`tcategory={1}`tenabled={2}`tage={3}`tlimit={4}`taction={5}`tprotection={6}`tpath={7}`treason={8}" -f $rule.Id, (Get-AicmRuleCategory $rule.Id), $en, $rule.Days, $rule.Limit, (Get-AicmRuleAction $rule.Kind ([int]$rule.Limit)), (Get-AicmProtectionPolicy), $shown, (Get-AicmRuleReason $rule))
+  }
+  exit 0
+}
+
+$mutating = -not $DryRun
+# A real cleanup claims (marks) the home before anything, the maintenance lock included, is written into
+# it; a folder this tool did not create is refused untouched. A preview that writes a log only checks it.
+# JSON previews and reports write nothing there.
+try {
+  if ($mutating) { Confirm-AicmHome }
+  elseif (-not $Report -and -not $Json) { Assert-AicmHomeUsable }
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  Write-CleanJsonBail 'error' "AICM_HOME: $($script:AicmHomeProblem)"
+  exit 1
+}
+function Test-MaintenanceLeaseReady {
+  $js = Join-Path (Get-AicmRoot) 'lib\maintenance.js'
+  if (-not (Get-Command node -ErrorAction SilentlyContinue)) { return $false }
+  if (-not (Test-Path -LiteralPath $js)) { return $false }
+  $text = [IO.File]::ReadAllText($js)
+  if ($text -notlike '*run-clean*') { return $false }
+  & node -e "const m=require(process.argv[1]); process.exit(typeof m.leaseValid==='function'?0:1)" $js
+  return ($LASTEXITCODE -eq 0)
+}
+if ($mutating -and (Test-MaintenanceLeaseReady)) {
+  & node -e "process.exit(require(process.argv[1]).leaseValid()?0:1)" (Join-Path (Get-AicmRoot) 'lib\maintenance.js')
+  if ($LASTEXITCODE -ne 0) {
+    $engine = (Get-Process -Id $PID).Path
+    if ($engine -match '\.(cmd|bat)$') {
+      $name = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' }
+      $engine = Join-Path $PSHOME $name
+    }
+    $reArgs = @('-NoProfile', '-NonInteractive', '-File', $PSCommandPath)
+    foreach ($key in @($PSBoundParameters.Keys)) {
+      $val = $PSBoundParameters[$key]
+      $on = $false
+      if ($val -is [switch]) { $on = $val.IsPresent } elseif ($val -is [bool]) { $on = $val }
+      if ($val -is [switch] -or $val -is [bool]) { if ($on) { $reArgs += "-$key" }; continue }
+      $reArgs += "-$key"
+      if ($val -is [System.Array]) { $reArgs += (($val | ForEach-Object { "$_" }) -join ',') }
+      else { $reArgs += "$val" }
+    }
+    & node (Join-Path (Get-AicmRoot) 'lib\maintenance.js') 'run-clean' '--' $engine @reArgs
+    exit $LASTEXITCODE
+  }
+}
+$script:CleanJsonLog = $null
+if ($Json) {
+  if ($mutating) {
+    Initialize-AicmDirectory $LogDir
+    $script:CleanJsonLog = Join-Path $LogDir ("clean-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+  }
+  function Write-Host {
+    param([Parameter(ValueFromRemainingArguments = $true)][object[]]$Parts)
+    $text = if ($Parts) { ($Parts | ForEach-Object { "$_" }) -join ' ' } else { '' }
+    [Console]::Error.WriteLine($text)
+    if ($script:CleanJsonLog) { [System.IO.File]::AppendAllText($script:CleanJsonLog, $text + [Environment]::NewLine) }
+  }
+}
+
 $transcript = $null
-if (-not $Report) {
+if (-not $Report -and -not $Json) {
   Initialize-AicmDirectory $LogDir
   $transcript = Join-Path $LogDir ("clean-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
   Start-Transcript -Path $transcript -Force | Out-Null
@@ -411,6 +649,7 @@ try {
   $hasLock = $mutex.WaitOne(0)
   if (-not $hasLock) {
     Write-Host "[$(Get-AicmTimestamp)] another cleanup run is already active"
+    Write-CleanJsonBail 'skipped' 'another cleanup run is already active'
     exit 0
   }
 
@@ -422,15 +661,15 @@ try {
   if ($clockProblem) {
     Write-Host "problem: $clockProblem"
     # No state is written, so the guard keeps comparing with the last good run.
-    if (-not $DryRun) { Send-AicmAttention 'clean' @("cleanup: $clockProblem"); exit 1 }
+    if (-not $DryRun) { Send-AicmAttention 'clean' @("cleanup: $clockProblem"); Write-CleanJsonBail 'error' $clockProblem; exit 1 }
   }
 
   $rows = New-Object System.Collections.Generic.List[object]
   $errors = New-Object System.Collections.Generic.List[string]
   foreach ($rule in $allRules) {
-    $explicit = $selected -contains $rule.Id
-    if ($selected.Count -gt 0 -and -not $explicit) { continue }
-    $row = [ordered]@{ id = $rule.Id; kind = $rule.Kind; enabled = ($rule.Enabled -or $explicit); path = $rule.Path; status = ''; files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; purge = 0; purgeBytes = 0L; purged = 0; purgedBytes = 0L; detail = ''; direct = $false; totalBytes = $null; note = $rule.Note }
+    if (-not (Test-CleanRuleIncluded $rule.Id)) { continue }
+    $explicit = $script:CleanSelected -contains $rule.Id
+    $row = [ordered]@{ id = $rule.Id; kind = $rule.Kind; enabled = ($rule.Enabled -or $explicit); path = $rule.Path; status = ''; files = 0; bytes = 0L; removed = 0; removedBytes = 0L; inUse = 0; purge = 0; purgeBytes = 0L; purged = 0; purgedBytes = 0L; detail = ''; direct = $false; budget = $null; totalBytes = $null; note = $rule.Note; days = [int]$rule.Days; limit = [int]$rule.Limit; category = (Get-AicmRuleCategory $rule.Id); action = (Get-AicmRuleAction $rule.Kind ([int]$rule.Limit)); reason = (Get-AicmRuleReason $rule) }
     $archiving = @('archive', 'codex') -contains $rule.Kind
     # A codex rule with limit 0 deletes directly; show it as a deletion, not an archive.
     $direct = ($rule.Kind -eq 'codex' -and $rule.Limit -eq 0)
@@ -459,6 +698,7 @@ try {
               'age' { Invoke-AgeRule $rule $root }
               'age-files' { Invoke-AgeFilesRule $rule $root }
               'cap' { Invoke-CapRule $rule $root }
+              'budget' { Invoke-BudgetRule $rule $root }
               'keep-latest' { Invoke-KeepLatestRule $rule $root }
               'archive' { Invoke-ArchiveRule $rule $root $wasDry }
               'codex' { Invoke-CodexRule $rule $root }
@@ -466,6 +706,7 @@ try {
           } finally { $DryRun = $wasDry }
           foreach ($k in 'files', 'bytes', 'removed', 'removedBytes', 'inUse') { $row[$k] = $r[$k] }
           if ($archiving) { foreach ($k in 'purge', 'purgeBytes', 'purged', 'purgedBytes', 'detail') { $row[$k] = $r[$k] } }
+          if ($rule.Kind -eq 'budget') { $row.budget = $r; $row.detail = $r.detail }
           if (-not $row.enabled) { $row.status = 'off' }
           elseif ($direct -and $DryRun) { $row.status = 'would remove' }
           elseif ($direct) { $row.status = 'removed' }
@@ -484,7 +725,7 @@ try {
 
   Write-Host ''
   foreach ($row in $rows) {
-    $age = switch ($row.kind) { 'age' { 'age' } 'age-files' { 'age' } 'cap' { 'cap' } 'keep-latest' { 'keep' } 'archive' { 'arch' } 'codex' { if ($row.direct) { 'del' } else { 'arch' } } default { 'cmd' } }
+    $age = switch ($row.kind) { 'age' { 'age' } 'age-files' { 'age' } 'cap' { 'cap' } 'budget' { 'bdgt' } 'keep-latest' { 'keep' } 'archive' { 'arch' } 'codex' { if ($row.direct) { 'del' } else { 'arch' } } default { 'cmd' } }
     $unit = if ($row.kind -eq 'keep-latest') { 'dirs ' } else { 'files' }
     $done = @('removed', 'archived') -contains $row.status
     $size = if ($row.kind -eq 'command') { '' } elseif ($row.direct -and $done) { "{0,6} {1} {2,10}" -f $row.purged, $unit, (Format-AicmSize $row.purgedBytes) } elseif ($row.direct) { "{0,6} {1} {2,10}" -f $row.purge, $unit, (Format-AicmSize $row.purgeBytes) } elseif ($done) { "{0,6} {1} {2,10}" -f $row.removed, $unit, (Format-AicmSize $row.removedBytes) } else { "{0,6} {1} {2,10}" -f $row.files, $unit, (Format-AicmSize $row.bytes) }
@@ -495,6 +736,11 @@ try {
       $purgeText = if ($done) { "; deleted from archive: $($row.purged) ($(Format-AicmSize $row.purgedBytes))" } else { "; would delete from archive: $($row.purge) ($(Format-AicmSize $row.purgeBytes))" }
     }
     Write-Host ("{0,-22} {1,-4} {2,-22}{3}  {4}{5}{6}  {7}" -f $row.id, $age, $size, $total, $row.status, $purgeText, $busy, $row.path)
+    if ($row.kind -eq 'budget' -and $null -ne $row.budget) {
+      $b = $row.budget
+      $after = if ($DryRun -or -not $row.enabled) { "projected $(Format-AicmSize $b.projectedRemainingBytes)" } else { "now $(Format-AicmSize $b.remainingBytes)" }
+      Write-Host ("{0,-22} {1}" -f '', "budget $(Format-AicmSize $b.budgetBytes): total $(Format-AicmSize $b.totalBytes), $after (scan $($b.scanStatus), logical bytes)")
+    }
     if ($row.detail) { Write-Host ("{0,-22} {1}" -f '', $row.detail) }
   }
 
@@ -503,7 +749,8 @@ try {
   foreach ($row in $rows) {
     $isArchive = @('archive', 'codex') -contains $row.kind
     if (-not $row.enabled) {
-      if ($isArchive) { $freedBytes += $row.purgedBytes } else { $offBytes += $row.bytes }
+      # An off archive rule still purges expired date folders. Plan those bytes the same way a live rule does.
+      if ($isArchive) { $plannedBytes += $row.purgeBytes; $freedBytes += $row.purgedBytes } else { $offBytes += $row.bytes }
       continue
     }
     if ($isArchive) {
@@ -523,6 +770,18 @@ try {
     Write-Host "also reclaimable by rules that are off: $(Format-AicmSize $offBytes) (turn on in $(Get-DisplayPath $LocalRulesFile))"
   }
 
+  # Index records of archives the retention purge removed (or restored long ago) are dropped under the
+  # same maintenance lease, so the index does not grow without bound. Only after a real run that
+  # included an archive rule. Housekeeping: a failure is reported, not counted as a cleanup error.
+  $indexDir = Join-Path (Join-Path (Get-AicmHome) 'state') 'archive-index'
+  $maintenanceJs = Join-Path (Get-AicmRoot) 'lib\maintenance.js'
+  if (-not $DryRun -and @($rows | Where-Object { $_.kind -eq 'archive' }).Count -gt 0 -and (Test-Path -LiteralPath $indexDir) -and
+      (Resolve-AicmExecutable 'node') -and (Test-Path -LiteralPath $maintenanceJs)) {
+    $gc = Invoke-AicmWithTimeout 'node' @($maintenanceJs, 'archive-gc') 300
+    if ($gc.ExitCode -eq 0) { Write-Host ([string]$gc.StdOut).Trim() }
+    else { Write-Host "warning: archive index cleanup failed: $(([string]$gc.Output).Trim())" }
+  }
+
   if (-not $DryRun) {
     Write-AicmState 'last-clean' ([ordered]@{
       finishedAt = Get-AicmTimestamp
@@ -531,14 +790,41 @@ try {
       freedBytes = [int64]$freedBytes
       errors = $errors.ToArray()
       archivedBytes = [int64]$archivedBytes
+      scopeCategories = (($script:CleanCategories | ForEach-Object { "$_" }) -join ',')
+      scopeRules = (($script:CleanSelected | ForEach-Object { "$_" }) -join ',')
       rules = @($rows | ForEach-Object { [ordered]@{ id = $_.id; status = $_.status; removed = $_.removed; removedBytes = [int64]$_.removedBytes; purged = $_.purged; purgedBytes = [int64]$_.purgedBytes; inUse = $_.inUse } })
     })
+    $histRows = @($rows | ForEach-Object {
+      $hact = 'kept'
+      if ($_.status -eq 'archived') { $hact = 'archived' }
+      elseif ($_.status -eq 'removed') { $hact = 'deleted' }
+      elseif ($_.status -eq 'off') { $hact = 'skipped' }
+      elseif ("$($_.status)".StartsWith('error')) { $hact = 'error' }
+      [ordered]@{ rule = $_.id; action = $hact; status = $hact; path = $_.path; bytes = [int64]$_.removedBytes }
+    })
+    $hist = [ordered]@{ summary = [ordered]@{ files = 0; bytes = [int64]$freedBytes; removed = 0; archived = [int64]$archivedBytes; restored = 0; purged = 0; errors = $errors.Count; conflicts = 0 }; results = @($histRows) }
+    $histFile = Join-Path ([IO.Path]::GetTempPath()) ("aicm-hist-" + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+      [IO.File]::WriteAllText($histFile, ($hist | ConvertTo-Json -Compress -Depth 6))
+      if (Get-Command node -ErrorAction SilentlyContinue) {
+        $js = Join-Path (Get-AicmRoot) 'lib\maintenance.js'
+        if (Test-Path -LiteralPath $js) {
+          & node $js 'history-add' '--kind' 'clean' '--file' $histFile '--json' 1>$null 2>$null
+          if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine('warning: history was not recorded') }
+        } else { [Console]::Error.WriteLine('warning: history was not recorded (lib/maintenance.js is missing)') }
+      } else { [Console]::Error.WriteLine('warning: history was not recorded (Node.js is not available)') }
+    } catch {
+      [Console]::Error.WriteLine('warning: history was not recorded')
+    } finally {
+      if (Test-Path -LiteralPath $histFile) { Remove-Item -LiteralPath $histFile -Force -ErrorAction SilentlyContinue }
+    }
     Remove-OldCleanLogs
   }
 
   # Worktrees and branches agents left behind (lib\worktrees.js). Skipped when single rules are run.
   $wtAttention = @()
-  if ($env:AICM_WORKTREES -ne '0' -and -not $Report -and $selected.Count -eq 0) {
+  $runWorktrees = ($env:AICM_WORKTREES -ne '0' -and -not $Report -and -not $Explain -and $script:CleanSelected.Count -eq 0 -and -not $script:CleanCategoryFilter -and -not ($Json -and $DryRun))
+  if ($runWorktrees) {
     Write-Host ''
     Write-Host '== worktrees and branches =='
     $wtArgs = @()
@@ -554,6 +840,9 @@ try {
   if ($errors.Count -gt 0) { $exitCode = 1 }
   if (-not $Report) {
     Write-Host "[$(Get-AicmTimestamp)] AI leftover cleanup finished (exit=$exitCode)"
+  }
+  if ($Json) {
+    Write-Output -NoEnumerate (ConvertTo-CleanJson $DryRun $rows $errors $plannedBytes $freedBytes $archivedBytes)
   }
 } finally {
   if ($hasLock) { $mutex.ReleaseMutex() | Out-Null }

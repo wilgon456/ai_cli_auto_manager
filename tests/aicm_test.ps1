@@ -118,6 +118,22 @@ try {
   if ($r.Output -match 'already match' -and $s.options.updateAt -eq '06:15' -and $s.options.inventoryDay -eq 'Wednesday' -and $s.options.cleanDay -eq 'Sunday' -and $s.options.targets -eq 'codex,claude') { Pass 'refresh of an older schedule keeps its days and times' } else { Fail "old refresh: $($r.Output) $($s | ConvertTo-Json -Compress)" }
   if ($s.installedAt -eq $installedBefore) { Pass 'refresh keeps installedAt' } else { Fail 'installedAt changed' }
 
+  $beforeTasks = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName })
+  $r = Invoke-Aicm @('schedule', 'install', '-CleanCategory', 'sessions,nope', '-KeepLegacyTask')
+  $afterBad = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName })
+  if ($r.ExitCode -ne 0 -and ($beforeTasks -join ',') -eq ($afterBad -join ',')) { Pass 'bad clean category changes no tasks' } else { Fail "bad category mutated tasks: $($r.Output)" }
+  $r = Invoke-Aicm @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-CleanCategory', 'sessions,logs', '-KeepLegacyTask')
+  $sched = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
+  $cleanTask = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Clean'
+  if ($sched.options.cleanCategory -eq 'sessions,logs' -and $cleanTask.Actions[0].Arguments -match '-Category sessions,logs') { Pass 'schedule keeps clean category on the task' } else { Fail "category schedule: $($sched.options.cleanCategory) $($cleanTask.Actions[0].Arguments)" }
+  $stale = $cleanTask.Actions[0].Arguments -replace '-Category sessions,logs', ''
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -Action (New-ScheduledTaskAction -Execute $cleanTask.Actions[0].Execute -Argument $stale) | Out-Null
+  $null = Invoke-Aicm @('schedule', 'refresh')
+  $cleanTask = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Clean'
+  $sched = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
+  if ($cleanTask.Actions[0].Arguments -match '-Category sessions,logs' -and $sched.options.cleanCategory -eq 'sessions,logs') { Pass 'refresh puts the clean category back' } else { Fail "category refresh: $($cleanTask.Actions[0].Arguments)" }
+  $null = Invoke-Aicm @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')
+
   # The installed copy: never downgraded, swapped only when complete, the old copy kept on any failure.
   $appDir = Join-Path $aicmHome 'app'
   Set-Content -LiteralPath "$appDir\VERSION" -Value '99.0.0'
@@ -128,16 +144,19 @@ try {
   $r = Invoke-Lib $appDir 'Update-AicmAppCopy'
   if ((Get-Content -LiteralPath "$appDir\VERSION" -TotalCount 1) -eq $version -and $r.Output -match 'updated 0\.0\.1 -> ') { Pass 'a newer version in the clone refreshes the copy' } else { Fail "upgrade: $($r.Output)" }
   if ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0].Arguments -match 'inventory_ai_clis\.ps1') { Pass 'after the copy is refreshed the tasks are re-registered' } else { Fail "re-register after update: $($r.Output)" }
-  Set-Content -LiteralPath "$appDir\MARKER" -Value 'old'
+  # The old copy is recognized by the content of a file every copy has: any file a copy never has
+  # (app\MARKER, app\bin\MARKER) now makes the sync refuse to touch the copy at all (tested in
+  # home_ownership_test.ps1), so it would no longer exercise the rollback paths.
+  Set-Content -LiteralPath "$appDir\LICENSE" -Value 'old copy marker'
   $r = Invoke-Lib $root 'function Copy-Item { throw "disk full" }; Sync-AicmAppCopy (Get-AicmRoot)'
-  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'a failed copy keeps the old copy' } else { Fail "failed copy: $($r.ExitCode) $($r.Output)" }
+  if ($r.ExitCode -ne 0 -and ((Get-Content -LiteralPath "$appDir\LICENSE" -Raw) -match 'old copy marker') -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'a failed copy keeps the old copy' } else { Fail "failed copy: $($r.ExitCode) $($r.Output)" }
   $r = Invoke-Lib $root 'function Copy-Item { param([string]$LiteralPath, [string]$Destination, [switch]$Recurse, [switch]$Force, $ErrorAction) Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Recurse:$Recurse -Force; if ($Destination -like "*\lib") { Remove-Item -LiteralPath (Join-Path $Destination "aicm-common.ps1") } }; Sync-AicmAppCopy (Get-AicmRoot)'
-  if ($r.ExitCode -ne 0 -and $r.Output -match 'incomplete' -and (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'an incomplete copy is not swapped in' } else { Fail "incomplete copy: $($r.ExitCode) $($r.Output)" }
+  if ($r.ExitCode -ne 0 -and $r.Output -match 'incomplete' -and ((Get-Content -LiteralPath "$appDir\LICENSE" -Raw) -match 'old copy marker') -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'an incomplete copy is not swapped in' } else { Fail "incomplete copy: $($r.ExitCode) $($r.Output)" }
   $r = Invoke-Lib $root 'function Move-Item { param([string]$LiteralPath, [string]$Destination, $ErrorAction) if ($LiteralPath -like "*.new") { throw "locked by a scanner" }; Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination }; function Start-Sleep { }; Sync-AicmAppCopy (Get-AicmRoot)'
-  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.old") -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'a failed swap puts the old copy back' } else { Fail "failed swap: $($r.ExitCode) $($r.Output)" }
+  if ($r.ExitCode -ne 0 -and ((Get-Content -LiteralPath "$appDir\LICENSE" -Raw) -match 'old copy marker') -and -not (Test-Path -LiteralPath "$appDir.old") -and -not (Test-Path -LiteralPath "$appDir.new")) { Pass 'a failed swap puts the old copy back' } else { Fail "failed swap: $($r.ExitCode) $($r.Output)" }
   Rename-Item -LiteralPath $appDir -NewName 'app.old'
   $r = Invoke-Lib $root 'Sync-AicmAppCopy (Get-AicmRoot)'
-  if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath "$appDir\bin\update_ai_clis.ps1") -and -not (Test-Path -LiteralPath "$appDir\MARKER") -and -not (Test-Path -LiteralPath "$appDir.old")) { Pass 'a copy left half-swapped is completed by the next sync' } else { Fail "recovery: $($r.ExitCode) $($r.Output)" }
+  if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath "$appDir\bin\update_ai_clis.ps1") -and -not ((Get-Content -LiteralPath "$appDir\LICENSE" -Raw) -match 'old copy marker') -and -not (Test-Path -LiteralPath "$appDir.old")) { Pass 'a copy left half-swapped is completed by the next sync' } else { Fail "recovery: $($r.ExitCode) $($r.Output)" }
 
   # Explicit AICM_HOME aliases are management roots; stale app.old must not brick the next sync.
   $managed = Join-Path $work 'managed-target'
@@ -147,9 +166,9 @@ try {
   try {
     $r = Invoke-Lib $root "`$env:AICM_HOME = '$alias\.manager'; foreach (`$attempt in 1,2,3,4) { Sync-AicmAppCopy (Get-AicmRoot) }"
     if ($r.ExitCode -eq 0 -and (Test-Path -LiteralPath "$managed\.manager\app\bin\aicm.ps1") -and -not (Test-Path -LiteralPath "$managed\.manager\app.old")) { Pass 'repeated app-copy sync through a selected home junction completes and removes stale copies' } else { Fail "home junction sync: $($r.Output)" }
-    Set-Content -LiteralPath "$managed\.manager\app\MARKER" -Value 'old'
+    Set-Content -LiteralPath "$managed\.manager\app\LICENSE" -Value 'old copy marker'
     $r = Invoke-Lib $root "`$env:AICM_HOME = '$alias\.manager'; function Copy-Item { throw 'disk full' }; Sync-AicmAppCopy (Get-AicmRoot)"
-    if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$managed\.manager\app\MARKER") -and -not (Test-Path -LiteralPath "$managed\.manager\app.new")) { Pass 'failed app-copy sync under a home junction keeps the previous copy' } else { Fail "home junction rollback: $($r.Output)" }
+    if ($r.ExitCode -ne 0 -and ((Get-Content -LiteralPath "$managed\.manager\app\LICENSE" -Raw) -match 'old copy marker') -and -not (Test-Path -LiteralPath "$managed\.manager\app.new")) { Pass 'failed app-copy sync under a home junction keeps the previous copy' } else { Fail "home junction rollback: $($r.Output)" }
   } finally { [IO.Directory]::Delete($alias, $false) }
 
   $r = Invoke-Aicm @('doctor')
@@ -170,6 +189,22 @@ try {
   "{`"finishedAt`":`"$stamp`",`"version`":`"x`",`"ok`":true,`"clis`":[]}" | Set-Content -LiteralPath "$aicmHome\state\inventory.json" -Encoding UTF8
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 0) { Pass 'doctor healthy after runs' } else { Fail "doctor after runs: $($r.Output)" }
+  if ($r.Output -match [regex]::Escape("info: installed copy $aicmHome\app version $version")) { Pass 'doctor shows the installed copy and its version' } else { Fail "doctor info: $($r.Output)" }
+  # Healthy tasks and recent runs, but an update policy the updater would refuse: not healthy.
+  $policyFile = Join-Path $aicmHome 'update-policy.json'
+  foreach ($bad in '{"schemaVersion":1,"tools":{"codex":{"exclude":"yes"}}}', '{"schemaVersion":1,"tools":{"gpt":{"exclude":true},"codex":{"exclude":false}}}', 'not json') {
+    [System.IO.File]::WriteAllText($policyFile, $bad)
+    $before = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Where-Object { $_.Name -notlike '*.log' } | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+    $r = Invoke-Aicm @('doctor')
+    $after = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Where-Object { $_.Name -notlike '*.log' } | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+    if ($r.ExitCode -eq 1 -and $r.Output -match 'problem: update policy: .*refuses to run until it is fixed' -and $r.Output -notmatch 'healthy:' -and $after -eq $before) { Pass "doctor fails on an invalid policy and changes nothing: $bad" } else { Fail "doctor with policy $bad : $($r.ExitCode) $($r.Output)" }
+  }
+  [System.IO.File]::WriteAllText($policyFile, '{"schemaVersion":1,"tools":{"codex":{"exclude":true}}}')
+  $savedRuntime = $runtimePath
+  $runtimePath = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+  try { $r = Invoke-Aicm @('doctor') } finally { $runtimePath = $savedRuntime }
+  if ($r.ExitCode -eq 1 -and $r.Output -match 'Node\.js is required to read it') { Pass 'doctor fails when the policy needs a missing Node.js' } else { Fail "doctor without node: $($r.Output)" }
+  Remove-Item -LiteralPath $policyFile -Force
 
   # A registered task that cannot work: turned off, its script gone, or its last run failed.
   Disable-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' | Out-Null
@@ -260,6 +295,42 @@ try {
   $aicmHome = $notOurs
   try { $r = Invoke-Aicm @('uninstall', '-Purge') } finally { $aicmHome = $savedHome }
   if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$notOurs\state\other-app.json") -and (Test-Path -LiteralPath "$notOurs\app\x")) { Pass 'uninstall -Purge refuses a folder without the marker' } else { Fail "unmarked purge: $($r.ExitCode) $($r.Output)" }
+
+  # An existing project used as AICM_HOME: help, previews and refused commands never mark or change it.
+  $proj = Join-Path $work 'project'
+  New-Item -ItemType Directory -Path "$proj\src", "$proj\app", "$proj\logs" -Force | Out-Null
+  Set-Content -LiteralPath "$proj\src\main.c" -Value 'int main(void) { return 0; }'
+  Set-Content -LiteralPath "$proj\app\personal.txt" -Value 'mine'
+  Set-Content -LiteralPath "$proj\app\SOURCE" -Value 'mine'
+  Set-Content -LiteralPath "$proj\logs\build.log" -Value 'mine'
+  $projBefore = (Get-ChildItem -LiteralPath $proj -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  $savedHome = $aicmHome
+  $aicmHome = $proj
+  try {
+    foreach ($a in @(@('help'), @('update', '-DryRun', '-Targets', 'none'), @('clean', '-DryRun'), @('clean', '-Json', '-DryRun'),
+      @('uninstall', '-Purge', '-DryRun'), @('schedule', 'install', '-CleanAt', '99:99', '-KeepLegacyTask'), @('schedule', 'install', '-KeepLegacyTask'),
+      @('update', '-Targets', 'none'), @('clean'), @('uninstall', '-Purge'))) { $null = Invoke-Aicm $a }
+  } finally { $aicmHome = $savedHome }
+  $projAfter = (Get-ChildItem -LiteralPath $proj -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  if (-not (Test-Path -LiteralPath "$proj\.aicm-home") -and $projAfter -eq $projBefore) { Pass 'help, previews and refused commands leave an existing project untouched' } else { Fail "project changed: $projAfter" }
+  if (-not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'no task is registered for a foreign home' } else { Fail 'task registered for a foreign home' }
+
+  # uninstall -Purge -DryRun lists what would go and changes nothing, tasks included.
+  New-Item -ItemType Directory -Path $aicmHome -Force | Out-Null
+  $null = Invoke-Aicm @('schedule', 'install', '-KeepLegacyTask')
+  New-Item -ItemType Directory -Path "$aicmHome\logs" -Force | Out-Null
+  Set-Content -LiteralPath "$aicmHome\logs\personal.txt" -Value 'mine'
+  $homeBefore = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  $r = Invoke-Aicm @('uninstall', '-Purge', '-DryRun')
+  $homeAfter = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName)|$($_.Length)" }) -join ';'
+  $tasks = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)
+  if ($r.ExitCode -eq 0 -and $homeAfter -eq $homeBefore -and $tasks.Count -eq 3 -and $r.Output -match 'would remove: ' -and $r.Output -match 'would remove installed copy' -and $r.Output -match 'logs\\personal\.txt') { Pass 'uninstall -Purge -DryRun lists everything and changes nothing' } else { Fail "purge dry run: $($r.ExitCode) tasks=$($tasks.Count) $($r.Output)" }
+  Set-Content -LiteralPath "$aicmHome\app\personal.txt" -Value 'mine'
+  $r = Invoke-Aicm @('uninstall')
+  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$aicmHome\app\personal.txt") -and @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue).Count -eq 3) { Pass 'uninstall refuses a copy holding personal files before changing anything' } else { Fail "uninstall with personal app file: $($r.Output)" }
+  Remove-Item -LiteralPath "$aicmHome\app\personal.txt"
+  $r = Invoke-Aicm @('uninstall', '-Purge')
+  if ((Test-Path -LiteralPath "$aicmHome\logs\personal.txt") -and -not (Test-Path -LiteralPath "$aicmHome\app") -and -not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'uninstall -Purge keeps a personal log file' } else { Fail "purge personal log: $($r.Output)" }
   New-Item -ItemType Directory -Path $aicmHome -Force | Out-Null
 
   $r = Invoke-Aicm @('status')
@@ -283,6 +354,53 @@ try {
     if ($u -and $i -and $c -and ([datetime]$u.Triggers[0].StartBoundary).ToString('HH:mm') -eq '04:45' -and $i.Triggers[0].DaysOfWeek -eq 8 -and ([datetime]$i.Triggers[0].StartBoundary).ToString('HH:mm') -eq '11:40' -and @($s.jobs).Count -eq 3 -and $s.options.inventoryDay -eq 'Wednesday' -and $s.options.updateAt -eq '04:45') {
       Pass 'legacy installer keeps Inventory and Clean as they were'
     } else { Fail "legacy installer with all jobs: $($r.Output)" }
+  }
+
+  # optimize: fake npm/uv/pnpm .cmd shims (tests\fixtures\optimize-fake.js) in a folder with a space,
+  # so the cmd.exe launch path runs for real. No real package manager is reached.
+  $optBin = Join-Path $work 'opt bin'
+  New-Item -ItemType Directory -Path $optBin -Force | Out-Null
+  $nodeExe = (Get-Command node -CommandType Application | Select-Object -First 1).Source
+  $fakeJs = Join-Path $root 'tests\fixtures\optimize-fake.js'
+  foreach ($t in 'npm', 'uv', 'pnpm') { ('@"{0}" "{1}" {2} %*' -f $nodeExe, $fakeJs, $t) | Set-Content -LiteralPath (Join-Path $optBin "$t.cmd") -Encoding ASCII }
+  $optCalls = Join-Path $work 'opt-calls.jsonl'
+  $env:FAKE_OPTIMIZE_CALLS = $optCalls
+  $procList = Join-Path $work 'procs.json'
+  '[{"pid":4,"ppid":0,"name":"System","cmd":""}]' | Set-Content -LiteralPath $procList -Encoding ASCII
+  $env:AICM_PROCESS_LIST = $procList
+  $savedRuntime = $runtimePath
+  $runtimePath = "$optBin;$savedRuntime"
+  $optHome = Join-Path $fakeHome 'opt-home'
+  $savedAicmHome = $aicmHome
+  $aicmHome = $optHome
+  try {
+    $r = Invoke-Aicm @('help')
+    if ($r.Output -match 'aicm.ps1 optimize') { Pass 'help lists optimize' } else { Fail "help: $($r.Output)" }
+    $r = Invoke-Aicm @('optimize', '-Json')
+    $d = $r.Output | ConvertFrom-Json
+    if ($r.ExitCode -eq 0 -and $d.mode -eq 'preview' -and @($d.tasks | Where-Object { $_.status -eq 'would-run' }).Count -eq 3 -and -not (Test-Path -LiteralPath $optCalls) -and -not (Test-Path -LiteralPath $optHome)) {
+      Pass 'optimize previews by default: no tool runs, no AICM_HOME is created'
+    } else { Fail "optimize preview: $($r.Output)" }
+    foreach ($bad in @(@('optimize', '-Tasks', 'bogus', '-Apply'), @('optimize', '-Apply', '-DryRun'))) {
+      $r = Invoke-Aicm $bad
+      if ($r.ExitCode -eq 2 -and -not (Test-Path -LiteralPath $optCalls) -and -not (Test-Path -LiteralPath $optHome)) { Pass "optimize $($bad[1..($bad.Count - 1)] -join ' ') is refused with no side effects" } else { Fail "optimize bad args: $($r.ExitCode) $($r.Output)" }
+    }
+    $r = Invoke-Aicm @('optimize', '-Apply', '-Json')
+    $calls = @(if (Test-Path -LiteralPath $optCalls) { Get-Content -LiteralPath $optCalls | ForEach-Object { $_ | ConvertFrom-Json } })
+    $seen = ($calls | ForEach-Object { (@($_.name) + @($_.args)) -join ' ' }) -join ';'
+    if ($r.ExitCode -eq 0 -and $seen -eq 'npm cache verify;uv cache prune;pnpm store prune' -and @($calls | Where-Object { $_.env.npm_config_offline -ne 'true' -or $_.env.COREPACK_ENABLE_NETWORK -ne '0' }).Count -eq 0) {
+      Pass 'optimize -Apply runs exactly the three allowlisted commands through cmd.exe, offline'
+    } else { Fail "optimize apply: $seen $($r.Output)" }
+    if (-not (Test-Path -LiteralPath (Join-Path $optHome 'state\maintenance.lock'))) { Pass 'optimize releases the maintenance lock' } else { Fail 'maintenance lock left behind' }
+    Remove-Item -LiteralPath $optCalls -Force
+    $env:AICM_PROCESS_LIST = Join-Path $work 'missing-procs.json'
+    $r = Invoke-Aicm @('optimize', '-Apply', '-Json')
+    $d = $r.Output | ConvertFrom-Json
+    if ($r.ExitCode -eq 1 -and @($d.tasks | Where-Object { $_.status -eq 'skipped' }).Count -eq 3 -and -not (Test-Path -LiteralPath $optCalls)) { Pass 'an unreadable process table skips every optimize task' } else { Fail "process table: $($r.Output)" }
+  } finally {
+    $runtimePath = $savedRuntime
+    $aicmHome = $savedAicmHome
+    Remove-Item Env:\FAKE_OPTIMIZE_CALLS, Env:\AICM_PROCESS_LIST -ErrorAction SilentlyContinue
   }
 } finally {
   Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false

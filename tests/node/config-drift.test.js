@@ -16,8 +16,9 @@ function write(file, text) {
   fs.writeFileSync(file, text);
 }
 
-function run(home, args = []) {
-  const env = { ...process.env, HOME: home, USERPROFILE: home, AICM_HOME: path.join(home, '.aicm'), AICM_ASSUME_INSTALLED: '1' };
+function run(home, args = [], extraEnv = {}) {
+  const env = { ...process.env, HOME: home, USERPROFILE: home, AICM_HOME: path.join(home, '.aicm'), AICM_ASSUME_INSTALLED: '1', ...extraEnv };
+  if (!Object.prototype.hasOwnProperty.call(extraEnv, 'XDG_CONFIG_HOME')) delete env.XDG_CONFIG_HOME;
   const r = spawnSync(process.execPath, [MODULE, ...args], { encoding: 'utf8', env });
   assert.strictEqual(r.status, 0, r.stderr);
   return r.stdout;
@@ -53,5 +54,72 @@ test('reports MCP gaps, skills some CLIs cannot see, and conflicting skill copie
     assert.match(out, /attention: skill "review" differs/);
     assert.doesNotMatch(run(home), /attention:/, 'announced once');
     assert.match(run(home, ['--markdown']), /### MCP servers per CLI/);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('OpenCode JSONC, V2 servers, and metadata are not treated as server names', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aicm-cfg-oc-'));
+  try {
+    write(path.join(home, '.config', 'opencode', 'opencode.jsonc'), `{
+  // native v2
+  "mcp": {
+    "timeout": 30,
+    "servers": {
+      "github": { "type": "local", "command": ["x"] },
+    },
+  }
+}
+`);
+    const out = run(home);
+    assert.match(out, /OpenCode: github/);
+    assert.doesNotMatch(out, /OpenCode:.*servers/);
+    assert.doesNotMatch(out, /OpenCode:.*timeout/);
+    assert.equal((out.match(/OpenCode:/g) || []).length, 1);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a V1 MCP server named servers remains valid and an empty V2 map stays empty', () => {
+  const { opencodeMcp } = require(MODULE);
+  assert.deepStrictEqual(opencodeMcp({ mcp: { servers: { type: 'local', command: ['x'], environment: { TOKEN: 'fixture' } } } }), ['servers']);
+  assert.deepStrictEqual(opencodeMcp({ mcp: { servers: {}, timeout: 30 } }), []);
+});
+
+test('OpenCode V2 nested servers take precedence over V1 sibling keys', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aicm-cfg-oc2-'));
+  try {
+    write(path.join(home, '.config', 'opencode', 'opencode.json'), JSON.stringify({
+      mcp: {
+        legacy: { command: 'old' },
+        timeout: 15,
+        servers: { playwright: { type: 'local', command: ['pw'] } },
+      },
+    }));
+    const out = run(home);
+    assert.match(out, /OpenCode: playwright/);
+    assert.doesNotMatch(out, /legacy/);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('OpenCode V1 direct map still works; jsonc wins over json; XDG_CONFIG_HOME is honored', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'aicm-cfg-oc3-'));
+  try {
+    write(path.join(home, '.config', 'opencode', 'opencode.json'), JSON.stringify({
+      mcp: { github: { command: 'gh' } },
+    }));
+    write(path.join(home, '.config', 'opencode', 'opencode.jsonc'), `{
+      "mcp": { "playwright": { "command": "pw" } }
+    }`);
+    let out = run(home);
+    assert.match(out, /OpenCode: playwright/);
+    assert.doesNotMatch(out, /OpenCode: github/);
+
+    const xdg = path.join(home, 'xdg-config');
+    write(path.join(xdg, 'opencode', 'opencode.json'), JSON.stringify({
+      mcp: { notion: { command: 'n' } },
+    }));
+    out = run(home, [], { XDG_CONFIG_HOME: xdg });
+    assert.match(out, /OpenCode: notion/);
+    assert.doesNotMatch(out, /playwright/);
+    assert.equal((out.match(/OpenCode:/g) || []).length, 1);
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });

@@ -41,7 +41,6 @@ INSTALL_TIMEOUT_SECONDS="${AICM_INSTALL_TIMEOUT_SECONDS:-1800}"
 [[ "$INSTALL_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] && ((INSTALL_TIMEOUT_SECONDS > 0)) || INSTALL_TIMEOUT_SECONDS=1800
 STUCK_HOURS=3
 DRY_RUN=false
-VERSION_TEXT=""
 SCHEDULED=false
 MIN_RELEASE_AGE_DAYS="$(aicm_min_release_age_days)"
 VERSION_TIMEOUT_SECONDS="${VERSION_TIMEOUT_SECONDS:-10}"
@@ -75,6 +74,36 @@ while (($#)); do
   esac
   shift
 done
+
+# Update policy preflight. A policy file needs Node.js and must be valid before this run creates a
+# log directory, lock or state file; a broken policy never starts a run.
+if [[ -f "$AICM_HOME/update-policy.json" ]]; then
+  aicm_load_catalog "" "" >/dev/null || { echo "update policy: cannot read the CLI catalog" >&2; exit 1; }
+fi
+if ! aicm_policy_load "$MIN_RELEASE_AGE_DAYS"; then
+  echo "update policy: refusing to run" >&2
+  exit 1
+fi
+
+# Codex cask quarantine/recycle is a local fix, but a pinned, excluded, or age-held Codex must not be
+# touched at all (including the same-day fast path below).
+policy_codex_local_fix_allowed() {
+  aicm_policy_excluded codex && return 1
+  [[ -n "$(aicm_policy_pin codex)" ]] && return 1
+  local age
+  age="$(aicm_policy_explicit_age codex)"
+  [[ -n "$age" && "$age" -gt 0 ]] && return 1
+  return 0
+}
+
+# A pin or a positive explicit age holds the Homebrew route: no metadata refresh or upgrade for it.
+policy_brew_update_allowed() { # id
+  [[ -n "$(aicm_policy_pin "$1")" ]] && return 1
+  local age
+  age="$(aicm_policy_explicit_age "$1")"
+  [[ -n "$age" && "$age" -gt 0 ]] && return 1
+  return 0
+}
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
@@ -148,10 +177,14 @@ run_targets() {
 # failures or pending work and covered every target of this run. A partial manual run
 # (aicm update --targets claude) therefore does not stop the full scheduled run.
 done_today() {
-  local file="$AICM_HOME/state/last-update.json" state day covered want t
+  local file="$AICM_HOME/state/last-update.json" state day covered want t fingerprint
   [[ -f "$file" ]] || return 1
   state="$(cat "$file")"
   [[ "$state" == *'"ok":true'* && "$state" != *'"pending":true'* ]] || return 1
+  # State from before policy fingerprints is not trusted for a same-day skip: a policy may have
+  # appeared, changed or been removed, and a conservative run is cheap.
+  fingerprint="$(printf '%s' "$state" | sed -n 's/.*"policyFingerprint":"\([^"]*\)".*/\1/p')"
+  [[ -n "$fingerprint" && "$fingerprint" == "$AICM_POLICY_FINGERPRINT" ]] || return 1
   day="$(printf '%s' "$state" | sed -n 's/.*"localDate":"\([0-9-]*\)".*/\1/p')"
   [[ -n "$day" && "$day" == "$(date +%Y-%m-%d)" ]] || return 1
   covered="$(printf '%s' "$state" | sed -n 's/.*"targets":"\([^"]*\)".*/\1/p')"
@@ -190,6 +223,9 @@ trim_schedule_logs() {
   done
 }
 
+# A real run claims (marks) the home; a dry run only checks it. A folder this tool did not create is
+# refused before any log, lock or state is written into it.
+if [[ "$DRY_RUN" == true ]]; then aicm_home_usable || exit 1; else aicm_claim_home || exit 1; fi
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/update-$(date +%Y%m%d-%H%M%S).log"
 LATEST_LOG="$LOG_DIR/latest.log"
@@ -217,8 +253,9 @@ trap 'rm -f "$LOCK_DIR/pid" "$LOCK_DIR/started" 2>/dev/null || true; rmdir "$LOC
 
 # The scheduled job retries during the day; after a complete success today there is nothing to do.
 if [[ "$SCHEDULED" == true && "$DRY_RUN" != true ]] && done_today; then
-  # A Codex cask upgraded by hand after today's run is still unquarantined (lib/codex-host.sh).
-  if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 && "$(uname -s)" == Darwin ]]; then
+  # A Codex cask upgraded by hand after today's run is still unquarantined (lib/codex-host.sh), unless
+  # the policy excludes Codex or holds it by pin/age.
+  if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 && "$(uname -s)" == Darwin ]] && policy_codex_local_fix_allowed; then
     release_codex_cask_quarantine_quiet | sed "s/^/[$(ts)] /" || true
   fi
   echo "[$(ts)] already updated today; nothing to retry"
@@ -320,31 +357,353 @@ record_version_failure() {
   version_failures+=("$item")
 }
 
-version_of() {
-  local cmd="$1"
-  if command -v "$cmd" >/dev/null 2>&1; then
-    printf '%s: ' "$cmd"
-    local version_output version_rc first_line
-    version_rc=0
-    version_output="$(command_with_timeout "$VERSION_TIMEOUT_SECONDS" "$cmd" --version 2>&1)" || version_rc=$?
-    first_line="${version_output%%$'\n'*}"
-    VERSION_TEXT+="$cmd=$first_line;"
-    if ((version_rc == 124)); then
-      echo "TIMEOUT after ${VERSION_TIMEOUT_SECONDS}s"
-      echo "warn: $cmd --version timed out; continuing updater"
-      record_version_failure "$cmd version timeout"
-    elif ((version_rc != 0)); then
-      echo "ERROR rc=$version_rc${first_line:+: $first_line}"
-      echo "warn: $cmd --version failed rc=$version_rc; continuing updater"
-      record_version_failure "$cmd version rc=$version_rc"
+# Per selected CLI: before/after --version of the PATH-selected executable (not an npm package
+# hidden behind it). A bad probe before the update is not a failure once the after probe is healthy.
+V_ID=(); V_CMD=(); V_IDX=()
+V_BP=(); V_BV=(); V_BR=()
+V_AP=(); V_AV=(); V_AR=()
+V_STATUS=(); V_REASON=()
+TFAIL_ID=(); TFAIL_REASON=()
+POLICY_HOLD_ID=(); POLICY_HOLD_REASON=()
+NPM_PENDING_PKGS=""
+INSTALL_OK_PKGS=" "
+INSTALL_OK_IDS=" "
+PROBE_PATH=""; PROBE_VER=""; PROBE_RC=""
+
+note_policy_hold() { # instrument-id reason
+  local id="$1" reason="$2"
+  [[ -n "$id" && -n "$reason" ]] || return 0
+  POLICY_HOLD_ID+=("$id")
+  POLICY_HOLD_REASON+=("$reason")
+}
+
+policy_hold_reason() { # id -> joined reasons
+  local id="$1" i out=""
+  for ((i = 0; i < ${#POLICY_HOLD_ID[@]}; i++)); do
+    [[ "${POLICY_HOLD_ID[$i]}" == "$id" ]] || continue
+    [[ -n "$out" ]] && out+="; "
+    out+="${POLICY_HOLD_REASON[$i]}"
+  done
+  printf '%s' "$out"
+}
+
+# Prints and records a non-npm route hold. Returns 0 when the route must not be touched.
+policy_hold_for_route() { # id method
+  local id="$1" method="$2" why
+  why="$(aicm_policy_route_hold "$id" "$method")"
+  [[ -n "$why" ]] || return 1
+  echo "hold: $why"
+  note_policy_hold "$id" "$why"
+  return 0
+}
+
+# Effective policy and the holds every route would take, printed outside run_step so dry-run shows it.
+report_update_policy() {
+  [[ "$AICM_POLICY_PRESENT" == true ]] || return 0
+  local i id pin age eff hold method pkg installed
+  echo
+  echo "== update policy =="
+  echo "file: $AICM_HOME/update-policy.json"
+  echo "fingerprint: $AICM_POLICY_FINGERPRINT"
+  echo "global_min_release_age_days: $MIN_RELEASE_AGE_DAYS"
+  for ((i = 0; i < ${#AICM_POLICY_ID[@]}; i++)); do
+    id="${AICM_POLICY_ID[$i]}"; pin="${AICM_POLICY_PIN[$i]}"; age="${AICM_POLICY_AGE[$i]}"; eff="${AICM_POLICY_EFF[$i]}"
+    if [[ "${AICM_POLICY_EXCLUDE[$i]}" == 1 ]]; then
+      echo "$id: excluded by update policy"
     else
-      echo "${first_line:-unknown}"
+      echo "$id: pin=${pin:--} minReleaseAgeDays=${age:--} effectiveMinReleaseAgeDays=$eff"
     fi
-    printf '  path: '
-    command -v "$cmd" || true
-  else
+  done
+  for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
+    id="${AICM_CLI_ID[$i]}"
+    cli_is_selected "$id" || continue
+    aicm_policy_excluded "$id" && continue
+    pin="$(aicm_policy_pin "$id")"
+    age="$(aicm_policy_explicit_age "$id")"
+    [[ -n "$pin" || ( -n "$age" && "$age" -gt 0 ) ]] || continue
+    active_install "$id" || continue
+    [[ "$CLI_INSTALLED" == true ]] || continue
+    method="$CLI_METHOD"
+    hold="$(aicm_policy_route_hold "$id" "$method")"
+    if [[ -n "$hold" ]]; then echo "hold: $hold"; continue; fi
+    if [[ -n "$pin" && "$method" == npm ]]; then
+      pkg="${CLI_NPMPKG:-${AICM_CLI_NPM[$i]}}"
+      installed="$(npm_installed_version "$pkg")"
+      if [[ -n "$installed" && "$installed" != "$pin" ]] && aicm_version_older "$pin" "$installed"; then
+        echo "hold: installed $pkg $installed is newer than the pinned version $pin; no automatic downgrade"
+      fi
+    fi
+  done
+}
+
+note_npm_pending() {
+  local pkg="$1"
+  PENDING=true
+  [[ -n "$pkg" ]] || return 0
+  case " $NPM_PENDING_PKGS " in
+    *" $pkg "*) ;;
+    *) NPM_PENDING_PKGS+=" $pkg " ;;
+  esac
+}
+
+# Set only after an installer command itself exits 0. A hold or a skipped registry check is not an install.
+note_install_pkg() {
+  case "$INSTALL_OK_PKGS" in *" $1 "*) ;; *) INSTALL_OK_PKGS+="$1 " ;; esac
+}
+note_install_id() {
+  case "$INSTALL_OK_IDS" in *" $1 "*) ;; *) INSTALL_OK_IDS+="$1 " ;; esac
+}
+cli_install_succeeded() {
+  local idx="$1" id="$2" cand npm_names
+  case "$INSTALL_OK_IDS" in *" $id "*) return 0 ;; esac
+  npm_names="$(aicm_cli_npm_names "$idx" 2>/dev/null)" || true
+  while IFS= read -r cand || [[ -n "$cand" ]]; do
+    [[ -n "$cand" ]] || continue
+    case "$INSTALL_OK_PKGS" in *" $cand "*) return 0 ;; esac
+  done <<< "$npm_names"
+  return 1
+}
+
+take_target_failures() {
+  local id="$1" mark="$2" i
+  for ((i = mark; i < ${#failures[@]}; i++)); do
+    TFAIL_ID+=("$id")
+    TFAIL_REASON+=("${failures[$i]}")
+  done
+}
+
+target_fail_reason() {
+  local id="$1" i out=""
+  for ((i = 0; i < ${#TFAIL_ID[@]}; i++)); do
+    [[ "${TFAIL_ID[$i]}" == "$id" ]] || continue
+    [[ -n "$out" ]] && out+="; "
+    out+="${TFAIL_REASON[$i]}"
+  done
+  printf '%s' "$out"
+}
+
+# "pending" when this CLI's npm package was skipped for a run-wide network hold.
+# No per-CLI reason is invented for a hold that never named the package.
+cli_pending_reason() {
+  local idx="$1" pkg names
+  # Finish the producer before reading: avoid nested asynchronous process substitutions
+  # in this captured function on Bash 3.2. Read the buffered output in the same shell.
+  names="$(aicm_cli_npm_names "$idx")" || true
+  while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    case " $NPM_PENDING_PKGS " in
+      *" $pkg "*) printf 'pending'; return 0 ;;
+    esac
+  done <<< "$names"
+  return 1
+}
+
+cli_is_selected() {
+  local id="$1"
+  if [[ "$id" == codex ]]; then gpt_target_enabled; return; fi
+  target_enabled "$id"
+}
+
+build_verify_rows() {
+  local i id
+  V_ID=(); V_CMD=(); V_IDX=()
+  V_BP=(); V_BV=(); V_BR=()
+  V_AP=(); V_AV=(); V_AR=()
+  V_STATUS=(); V_REASON=()
+  ((${#AICM_CLI_ID[@]})) || aicm_load_catalog "" "" >/dev/null 2>&1 || return 0
+  for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
+    id="${AICM_CLI_ID[$i]}"
+    cli_is_selected "$id" || continue
+    V_ID+=("$id")
+    V_CMD+=("${AICM_CLI_CMD[$i]}")
+    V_IDX+=("$i")
+    V_BP+=(""); V_BV+=(""); V_BR+=("")
+    V_AP+=(""); V_AV+=(""); V_AR+=("")
+    V_STATUS+=(""); V_REASON+=("")
+  done
+}
+
+probe_cli() {
+  local cmd="$1" path output rc line
+  PROBE_PATH=""; PROBE_VER=""; PROBE_RC=""
+  hash -r 2>/dev/null || true
+  [[ -n "$cmd" ]] || return 0
+  path="$(command -v -- "$cmd" 2>/dev/null || true)"
+  [[ -n "$path" ]] || return 0
+  PROBE_PATH="$path"
+  rc=0
+  output="$(command_with_timeout "$VERSION_TIMEOUT_SECONDS" "$cmd" --version 2>&1)" || rc=$?
+  PROBE_RC="$rc"
+  line="$(printf '%s\n' "$output" | sed -n '/[^[:space:]]/{p;q;}')"
+  PROBE_VER="${line%$'\r'}"
+}
+
+print_probe() {
+  local cmd="$1"
+  if [[ -z "$PROBE_PATH" ]]; then
     echo "$cmd: not installed"
+    return 0
   fi
+  printf '%s: ' "$cmd"
+  if [[ "$PROBE_RC" == 124 ]]; then
+    echo "TIMEOUT after ${VERSION_TIMEOUT_SECONDS}s"
+  elif [[ "$PROBE_RC" != 0 ]]; then
+    echo "ERROR rc=$PROBE_RC${PROBE_VER:+: $PROBE_VER}"
+  elif [[ -z "$PROBE_VER" ]]; then
+    echo "ERROR empty version"
+  else
+    echo "$PROBE_VER"
+  fi
+  printf '  path: %s\n' "$PROBE_PATH"
+}
+
+capture_versions() {
+  local side="$1" i
+  for ((i = 0; i < ${#V_ID[@]}; i++)); do
+    if aicm_policy_excluded "${V_ID[$i]}"; then
+      echo "${V_ID[$i]}: excluded by update policy; version is not checked"
+      continue
+    fi
+    if [[ -z "${V_CMD[$i]}" ]]; then
+      echo "${V_ID[$i]}: no command; version is not checked"
+      continue
+    fi
+    probe_cli "${V_CMD[$i]}"
+    print_probe "${V_CMD[$i]}"
+    if [[ "$side" == before ]]; then
+      V_BP[i]="$PROBE_PATH"; V_BV[i]="$PROBE_VER"; V_BR[i]="$PROBE_RC"
+    else
+      V_AP[i]="$PROBE_PATH"; V_AV[i]="$PROBE_VER"; V_AR[i]="$PROBE_RC"
+    fi
+  done
+}
+
+# Healthy means exit 0 and a non-empty version line. Same text => unchanged; a different healthy
+# line => updated. This never asks the registry which release is latest.
+classify_results() {
+  local i id cmd idx bp bv br ap av ar fail_reason defer_reason hold_reason
+  for ((i = 0; i < ${#V_ID[@]}; i++)); do
+    id="${V_ID[$i]}"; cmd="${V_CMD[$i]}"; idx="${V_IDX[$i]}"
+    bp="${V_BP[$i]}"; bv="${V_BV[$i]}"; br="${V_BR[$i]}"
+    ap="${V_AP[$i]}"; av="${V_AV[$i]}"; ar="${V_AR[$i]}"
+    # Excluded rows are reported, but never probed or failed: exclusion wins over every route.
+    if aicm_policy_excluded "$id"; then
+      V_STATUS[i]=skipped
+      V_REASON[i]="update policy excludes this CLI"
+      continue
+    fi
+    fail_reason="$(target_fail_reason "$id")"
+    defer_reason=""
+    if defer_reason="$(cli_pending_reason "$idx")"; then :; else defer_reason=""; fi
+    hold_reason="$(policy_hold_reason "$id")"
+    if [[ -n "$bp" && -z "$ap" ]]; then
+      V_STATUS[i]=verifyFailed
+      V_REASON[i]="command missing after update"
+      record_version_failure "$cmd missing after update"
+      continue
+    fi
+    if [[ -n "$ap" && ( "$ar" != 0 || -z "$av" ) ]]; then
+      V_STATUS[i]=verifyFailed
+      if [[ "$ar" == 124 ]]; then
+        V_REASON[i]="version timed out"
+        record_version_failure "$cmd version timeout"
+      elif [[ "$ar" != 0 ]]; then
+        V_REASON[i]="version failed"
+        record_version_failure "$cmd version rc=${ar:-unknown}"
+      else
+        V_REASON[i]="empty version"
+        record_version_failure "$cmd version empty"
+      fi
+      continue
+    fi
+    if [[ -n "$fail_reason" ]]; then
+      V_STATUS[i]=updateFailed
+      V_REASON[i]="$fail_reason"
+      continue
+    fi
+    if [[ -z "$cmd" ]]; then
+      V_STATUS[i]=unsupported
+      V_REASON[i]="unsupported verification"
+      continue
+    fi
+    if [[ -n "$hold_reason" ]]; then
+      V_STATUS[i]=skipped
+      V_REASON[i]="$hold_reason"
+      continue
+    fi
+    if [[ -n "$defer_reason" ]]; then
+      V_STATUS[i]=deferred
+      V_REASON[i]="$defer_reason"
+      continue
+    fi
+    if [[ -z "$bp" && -z "$ap" ]]; then
+      if cli_install_succeeded "$idx" "$id"; then
+        V_STATUS[i]=verifyFailed
+        V_REASON[i]="command missing after update"
+        record_version_failure "${cmd:-$id} missing after update"
+        continue
+      fi
+      V_STATUS[i]=skipped
+      V_REASON[i]="not installed"
+      continue
+    fi
+    if [[ "$br" == 0 && -n "$bv" && "$bv" == "$av" ]]; then
+      V_STATUS[i]=unchanged
+      V_REASON[i]=""
+    else
+      V_STATUS[i]=updated
+      V_REASON[i]=""
+    fi
+  done
+}
+
+# After last-update.json is on disk. Stdout is discarded. A history failure is a warning only.
+# Dry-run, already-updated-today, and lock refusal return before this is reached.
+record_update_history() {
+  local js err rc=0
+  command -v node >/dev/null 2>&1 || return 0
+  js="$AICM_ROOT/lib/maintenance.js"
+  [[ -f "$js" ]] || return 0
+  err="$(aicm_timeout 60 node "$js" history-add --kind update --file "$AICM_HOME/state/last-update.json" 2>&1 >/dev/null)" || rc=$?
+  if [[ "$rc" != 0 ]]; then
+    echo "warn: update history failed: ${err:-exit $rc}" >&2
+  fi
+  return 0
+}
+
+# True when some targeted CLI has a healthy after probe whose version differs from a healthy before
+# probe, or whose before probe was missing or unhealthy. A broken or missing after probe never counts.
+version_changed() {
+  local i bv br av ar
+  for ((i = 0; i < ${#V_ID[@]}; i++)); do
+    # Only a row that actually reached "updated" may fire the hook. Excluded/held rows can show a
+    # different --version text between probes (a nonstable version output) without any update.
+    [[ "${V_STATUS[$i]}" == updated ]] || continue
+    bv="${V_BV[$i]}"; br="${V_BR[$i]}"; av="${V_AV[$i]}"; ar="${V_AR[$i]}"
+    [[ "$ar" == 0 && -n "$av" ]] || continue
+    if [[ "$br" != 0 || -z "$bv" || "$bv" != "$av" ]]; then return 0; fi
+  done
+  return 1
+}
+
+json_rc() {
+  if [[ "$1" =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf 'null'; fi
+}
+
+verify_results_json() {
+  local i out="" brj arj
+  out="["
+  for ((i = 0; i < ${#V_ID[@]}; i++)); do
+    ((i > 0)) && out+=","
+    brj="$(json_rc "${V_BR[$i]}")"
+    arj="$(json_rc "${V_AR[$i]}")"
+    out+="{\"id\":\"$(aicm_json_escape "${V_ID[$i]}")\",\"command\":\"$(aicm_json_escape "${V_CMD[$i]}")\""
+    out+=",\"before\":{\"path\":\"$(aicm_json_escape "${V_BP[$i]}")\",\"version\":\"$(aicm_json_escape "${V_BV[$i]}")\",\"exitCode\":$brj}"
+    out+=",\"after\":{\"path\":\"$(aicm_json_escape "${V_AP[$i]}")\",\"version\":\"$(aicm_json_escape "${V_AV[$i]}")\",\"exitCode\":$arj}"
+    out+=",\"status\":\"$(aicm_json_escape "${V_STATUS[$i]}")\",\"reason\":\"$(aicm_json_escape "${V_REASON[$i]}")\"}"
+  done
+  out+="]"
+  printf '%s' "$out"
 }
 
 is_brew_cask_installed() {
@@ -371,13 +730,6 @@ is_npm_global_package_writable() {
   pkg_path="$(npm_global_package_path "$pkg")" || return 1
   pkg_parent="$(dirname "$pkg_path")"
   [[ -w "$pkg_path" && -w "$pkg_parent" ]]
-}
-
-active_path_contains() {
-  local cmd="$1" needle="$2"
-  local p
-  p="$(command -v "$cmd" 2>/dev/null || true)"
-  [[ "$p" == *"$needle"* ]]
 }
 
 update_brew_package() {
@@ -447,39 +799,125 @@ npm_global_install() { # spec [extra args]
   return "$rc"
 }
 
-update_npm_package() {
-  local pkg="$1" installed target before
-  if ! registry_ok; then PENDING=true; return 0; fi
+update_npm_package() { # pkg [pin] [age] [id]
+  local pkg="$1" pin="${2:-}" age="${3:-$MIN_RELEASE_AGE_DAYS}" id="${4:-}" installed target before hold amp="" existing
+  # A hold recorded earlier in this run (for example an interrupted install kept for manual repair)
+  # must not be bypassed by the normal npm update path.
+  if [[ -n "$id" ]]; then
+    existing="$(policy_hold_reason "$id")"
+    if [[ -n "$existing" ]]; then echo "hold: $existing"; return 0; fi
+  fi
+  [[ "$age" =~ ^[0-9]+$ ]] || age="$MIN_RELEASE_AGE_DAYS"
+  case "$pkg" in @ampcode/cli|@sourcegraph/amp) amp=1 ;; esac
+  if ! registry_ok; then note_npm_pending "$pkg"; return 0; fi
   if is_npm_global_installed "$pkg"; then
     remember_npm "$pkg"
     installed="$(npm_installed_version "$pkg")"
-    target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS" "$installed" skip-deprecated)" || { echo "could not read the release list of $pkg"; return 1; }
+    if [[ -n "$pin" ]]; then
+      if [[ -n "$installed" && "$installed" == "$pin" ]]; then
+        echo "already at the pinned version: $pkg $installed"
+        return 0
+      fi
+      # Two Amp commit builds with the same timestamp have no trustworthy order.
+      if [[ "$amp" == 1 && "$installed" == 0.0.*-g* && "$pin" == 0.0.*-g* && "${installed%%-*}" == "${pin%%-*}" ]]; then
+        hold="cannot order installed $pkg $installed against the pinned Amp build $pin (same timestamp); nothing was installed"
+        echo "hold: $hold"
+        note_policy_hold "$id" "update policy: $hold"
+        return 0
+      fi
+      # Exact pins never fall back to latest and never downgrade. Amp's timestamp-hash versions can
+      # only be ordered by their timestamp, so equal timestamps with different hashes are ambiguous.
+      if [[ -n "$installed" ]] && aicm_version_older "$pin" "$installed"; then
+        hold="installed $pkg $installed is newer than the pinned version $pin; no automatic downgrade"
+        echo "hold: $hold"
+        note_policy_hold "$id" "update policy: $hold"
+        return 0
+      fi
+      if [[ -n "$installed" ]] && ! aicm_version_older "$installed" "$pin"; then
+        hold="cannot order installed $pkg $installed against the pinned version $pin; no downgrade or upgrade was attempted"
+        echo "hold: $hold"
+        note_policy_hold "$id" "update policy: $hold"
+        return 0
+      fi
+      hold="$(aicm_policy_validate_pin "$pkg" "$pin" "$age" "$amp")" || { echo "$hold"; return 1; }
+      if [[ -n "$hold" ]]; then
+        echo "hold: $hold"
+        note_policy_hold "$id" "update policy: $hold"
+        return 0
+      fi
+      echo "candidate: $pkg $installed -> $pin (pinned)"
+      aicm_npm_check "$pkg" "$installed" "$pin" "$age" || return 1
+      before="$(aicm_npm_before "$age")"
+      if npm_global_install "$pkg@$pin" ${before:+"$before"}; then
+        note_install_pkg "$pkg"
+      else
+        return $?
+      fi
+      return 0
+    fi
+    target="$(aicm_npm_target "$pkg" "$age" "$installed" skip-deprecated)" || { echo "could not read the release list of $pkg"; return 1; }
     if [[ -z "$target" ]]; then
-      echo "hold: no release of $pkg is $MIN_RELEASE_AGE_DAYS days old yet"
+      echo "hold: no release of $pkg is $age days old yet"
+      if [[ -n "$id" && -n "$(aicm_policy_explicit_age "$id")" ]]; then
+        note_policy_hold "$id" "update policy: no release of $pkg is $age days old yet"
+      fi
       return 0
     fi
     if [[ -n "$installed" ]] && ! aicm_version_older "$installed" "$target"; then
-      echo "already current: $pkg $installed (newest release at least $MIN_RELEASE_AGE_DAYS days old: $target)"
+      echo "already current: $pkg $installed (newest release at least $age days old: $target)"
       return 0
     fi
     echo "candidate: $pkg $installed -> $target"
-    aicm_npm_check "$pkg" "$installed" "$target" "$MIN_RELEASE_AGE_DAYS" || return 1
-    before="$(aicm_npm_before "$MIN_RELEASE_AGE_DAYS")"
-    npm_global_install "$pkg@$target" ${before:+"$before"}
+    aicm_npm_check "$pkg" "$installed" "$target" "$age" || return 1
+    before="$(aicm_npm_before "$age")"
+    if npm_global_install "$pkg@$target" ${before:+"$before"}; then
+      note_install_pkg "$pkg"
+    else
+      return $?
+    fi
   else
     echo "npm global package not installed: $pkg"
   fi
 }
 
-install_npm_package() {
-  local pkg="$1" target before
+install_npm_package() { # pkg [pin] [age] [id]
+  local pkg="$1" pin="${2:-}" age="${3:-$MIN_RELEASE_AGE_DAYS}" id="${4:-}" target before hold amp="" rc=0 existing
+  # Same guard as update_npm_package: an earlier recovery hold blocks a fresh install too.
+  if [[ -n "$id" ]]; then
+    existing="$(policy_hold_reason "$id")"
+    if [[ -n "$existing" ]]; then echo "hold: $existing"; return 0; fi
+  fi
+  [[ "$age" =~ ^[0-9]+$ ]] || age="$MIN_RELEASE_AGE_DAYS"
+  case "$pkg" in @ampcode/cli|@sourcegraph/amp) amp=1 ;; esac
   command -v "$NPM" >/dev/null 2>&1 || { echo "npm is not installed"; return 1; }
   remember_npm "$pkg"
-  target="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS" "" skip-deprecated)" || { echo "could not read the release list of $pkg"; return 1; }
-  [[ -n "$target" ]] || { echo "hold: no release of $pkg is $MIN_RELEASE_AGE_DAYS days old yet"; return 0; }
-  aicm_npm_check "$pkg" "" "$target" "$MIN_RELEASE_AGE_DAYS" || return 1
-  before="$(aicm_npm_before "$MIN_RELEASE_AGE_DAYS")"
-  npm_global_install "$pkg@$target" ${before:+"$before"}
+  if [[ -n "$pin" ]]; then
+    hold="$(aicm_policy_validate_pin "$pkg" "$pin" "$age" "$amp")" || { echo "$hold"; return 1; }
+    if [[ -n "$hold" ]]; then
+      echo "hold: $hold"
+      note_policy_hold "$id" "update policy: $hold"
+      return 0
+    fi
+    echo "installing pinned version: $pkg $pin"
+    aicm_npm_check "$pkg" "" "$pin" "$age" || return 1
+    before="$(aicm_npm_before "$age")"
+    npm_global_install "$pkg@$pin" ${before:+"$before"} || rc=$?
+    if [[ "$rc" == 0 ]]; then note_install_pkg "$pkg"; fi
+    return "$rc"
+  fi
+  target="$(aicm_npm_target "$pkg" "$age" "" skip-deprecated)" || { echo "could not read the release list of $pkg"; return 1; }
+  [[ -n "$target" ]] || {
+    echo "hold: no release of $pkg is $age days old yet"
+    if [[ -n "$id" && -n "$(aicm_policy_explicit_age "$id")" ]]; then
+      note_policy_hold "$id" "update policy: no release of $pkg is $age days old yet"
+    fi
+    return 0
+  }
+  aicm_npm_check "$pkg" "" "$target" "$age" || return 1
+  before="$(aicm_npm_before "$age")"
+  npm_global_install "$pkg@$target" ${before:+"$before"} || rc=$?
+  if [[ "$rc" == 0 ]]; then note_install_pkg "$pkg"; fi
+  return "$rc"
 }
 
 # npm CLIs this updater managed before. One that is gone now was either removed on purpose or lost to
@@ -487,11 +925,102 @@ install_npm_package() {
 # such a backup it is reinstalled at the same version; otherwise it is reported once and forgotten,
 # so an intentional uninstall is not fought every day.
 restore_missing_npm() {
-  local pkg version backup
+  local pkg version backup i cand skip_restore npm_shim real_bin real_cmd owner_id pin age why amp npm_names
   [[ -f "$NPM_STATE" ]] && command -v "$NPM" >/dev/null 2>&1 || return 0
+  if ((${#AICM_CLI_ID[@]} == 0)); then aicm_load_catalog "" "" >/dev/null 2>&1 || true; fi
   while IFS=$'\t' read -r pkg version; do
     [[ -n "$pkg" ]] || continue
     if [[ -n "$(aicm_npm_pkg_version "$pkg")" ]]; then KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'; continue; fi
+    skip_restore=false
+    owner_id=""
+    for ((i = 0; i < ${#AICM_CLI_ID[@]}; i++)); do
+      npm_names="$(aicm_cli_npm_names "$i")" || true
+      while IFS= read -r cand; do
+        [[ "$cand" == "$pkg" ]] || continue
+        owner_id="${AICM_CLI_ID[$i]}"
+        aicm_cli_install "$i"
+        # A regular npm launcher can remain after its package was moved to a backup.
+        # Its old managed state and location identify a recovery candidate, rather than
+        # an unrelated standalone install. Resolved targets outside prefix/bin stay excluded.
+        npm_shim=false
+        if [[ "$CLI_METHOD" == standalone && -n "$AICM_NPM_PREFIX_CACHE" && -n "$CLI_PATH" ]]; then
+          real_bin="$(aicm_realpath "$AICM_NPM_PREFIX_CACHE/bin")"
+          real_cmd="$(aicm_realpath "$CLI_PATH")"
+          if [[ -n "$real_bin" && "$real_cmd" == "$real_bin/"* && "$(head -c 2 "$CLI_PATH" 2>/dev/null)" == '#!' ]]; then
+            if grep -Fq -- "$AICM_NPM_ROOT_CACHE/$pkg" "$CLI_PATH" || grep -Fq -- "node_modules/$pkg/" "$CLI_PATH"; then npm_shim=true; fi
+          fi
+        fi
+        if [[ "$CLI_INSTALLED" == true && "$npm_shim" != true && ( "$CLI_METHOD" != npm || "$CLI_NPMPKG" != "$pkg" ) ]]; then
+          echo "pass: unused npm copy $pkg is not restored while PATH selects ${CLI_PATH:-another package}"
+          skip_restore=true
+        fi
+      done <<< "$npm_names"
+    done
+    [[ "$skip_restore" == true ]] && {
+      # Keep the old entry while policy or target selection can still matter: removing the policy later
+      # may need it to repair an interrupted install. With every target selected and no policy rule this
+      # entry is dropped, so an intentionally removed hidden package is not revived.
+      local held_age=""
+      [[ -n "$owner_id" ]] && held_age="$(aicm_policy_explicit_age "$owner_id")"
+      if [[ -n "$owner_id" ]] && {
+        aicm_policy_excluded "$owner_id" ||
+        [[ -n "$(aicm_policy_pin "$owner_id")" ]] ||
+        [[ -n "$held_age" ]] ||
+        ! cli_is_selected "$owner_id"
+      }; then
+        KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+      fi
+      continue
+    }
+    # Recovery follows target selection and policy. A skipped package keeps its old entry so removing
+    # the policy later can still repair an interrupted install.
+    if [[ -n "$owner_id" ]]; then
+      if ! cli_is_selected "$owner_id"; then
+        echo "pass: $pkg is not restored because $owner_id is not selected for this run"
+        KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+        continue
+      fi
+      if aicm_policy_excluded "$owner_id"; then
+        echo "pass: $pkg is not restored because update policy excludes $owner_id"
+        KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+        continue
+      fi
+      pin="$(aicm_policy_pin "$owner_id")"
+      if [[ -n "$pin" ]]; then
+        # A configured pin may be age-guarded by the inherited global age, and recovery
+        # cannot safely rerun the full release/security guards here. Keep the backup and state so a
+        # manual install (or removing the pin) can still repair it; never reinstall unchecked.
+        if [[ "$version" == "$pin" ]]; then
+          why="update policy pins $owner_id to $pin; automatic recovery is held to keep the release guards, so restore it manually with: npm install -g $pkg@$pin"
+        else
+          why="update policy pins $owner_id to $pin, so the interrupted $pkg $version install is not restored"
+        fi
+        echo "hold: $why"
+        note_policy_hold "$owner_id" "$why"
+        KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+        continue
+      fi
+      age="$(aicm_policy_explicit_age "$owner_id")"
+      if [[ -n "$age" && "$age" -gt 0 ]]; then
+        amp=""
+        case "$pkg" in @ampcode/cli|@sourcegraph/amp) amp=1 ;; esac
+        if ! why="$(aicm_policy_validate_pin "$pkg" "$version" "$age" "$amp")"; then
+          echo "hold: could not check the release age of $pkg $version, so the interrupted install is not restored: $why"
+          KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+          continue
+        fi
+        if [[ -n "$why" ]]; then
+          echo "hold: update policy: $why; the interrupted $pkg install is not restored"
+          note_policy_hold "$owner_id" "update policy: $why"
+          KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+          continue
+        fi
+      fi
+    elif [[ "$(run_targets)" != all ]]; then
+      echo "pass: $pkg is not restored because it is not selected for this run"
+      KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
+      continue
+    fi
     echo
     echo "== missing npm CLI: $pkg =="
     if ! backup="$(aicm_npm_backup "$pkg")"; then
@@ -501,7 +1030,7 @@ restore_missing_npm() {
     fi
     echo "found npm's backup of an interrupted install: $backup"
     KNOWN_NPM+="$pkg"$'\t'"$version"$'\n'
-    if ! registry_ok; then PENDING=true; continue; fi
+    if ! registry_ok; then note_npm_pending "$pkg"; continue; fi
     if npm_global_install "$pkg@$version"; then
       echo "restored: $pkg $version"
     else
@@ -556,37 +1085,47 @@ shadow_warning() {
 }
 
 update_claude_cli() {
+  local pin age
+  pin="$(aicm_policy_pin claude)"
+  age="$(aicm_policy_effective_age claude "$MIN_RELEASE_AGE_DAYS")"
   if active_install claude && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == standalone ]]; then
+    policy_hold_for_route claude standalone && return 0
     command_with_timeout 300 "$CLI_PATH" update || return $?
     shadow_warning claude
   elif active_brew_install claude claude-code; then
+    policy_hold_for_route claude brew && return 0
     update_brew_package claude-code
   elif active_install claude && [[ "$CLI_METHOD" == npm ]] && is_npm_global_installed "@anthropic-ai/claude-code"; then
-    update_npm_package "@anthropic-ai/claude-code"
+    update_npm_package "@anthropic-ai/claude-code" "$pin" "$age" claude
   elif command -v claude >/dev/null 2>&1; then
+    policy_hold_for_route claude vendor && return 0
     command_with_timeout 300 claude update
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
-    install_npm_package "@anthropic-ai/claude-code"
+    install_npm_package "@anthropic-ai/claude-code" "$pin" "$age" claude
   else
     pass_missing claude "command not found and no supported package manager install detected"
   fi
 }
 
 update_opencode_cli() {
+  local pin age
+  pin="$(aicm_policy_pin opencode)"
+  age="$(aicm_policy_effective_age opencode "$MIN_RELEASE_AGE_DAYS")"
   if active_install opencode && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == standalone ]]; then
+    policy_hold_for_route opencode standalone && return 0
     command_with_timeout 300 "$CLI_PATH" upgrade || return $?
     shadow_warning opencode
   elif active_brew_install opencode opencode; then
+    policy_hold_for_route opencode brew && return 0
     update_brew_package opencode
-  elif active_install opencode && [[ "$CLI_METHOD" == npm ]] && is_npm_global_installed "@opencode/cli"; then
-    # OpenCode 2.x is published as @opencode/cli; opencode-ai is the 1.x line.
-    update_npm_package "@opencode/cli"
-  elif active_install opencode && [[ "$CLI_METHOD" == npm ]] && is_npm_global_installed "opencode-ai"; then
-    update_npm_package "opencode-ai"
+  elif active_install opencode && [[ "$CLI_METHOD" == npm ]]; then
+    # Keep the PATH-owning major version when V1 and V2 are both installed.
+    update_npm_package "$CLI_NPMPKG" "$pin" "$age" opencode
   elif command -v opencode >/dev/null 2>&1; then
+    policy_hold_for_route opencode vendor && return 0
     command_with_timeout 300 opencode upgrade
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
-    install_npm_package "@opencode/cli"
+    install_npm_package "@opencode/cli" "$pin" "$age" opencode
   else
     pass_missing opencode "command not found and no supported package manager install detected"
   fi
@@ -603,8 +1142,9 @@ install_or_update_grok_cli() {
 # A vendor installer is a remote script that always installs the newest release. Succeeds only when
 # the installed version is known, a newer release exists, and that newest release is itself past the
 # waiting period. The npm package carries the same version numbers and publish dates.
-installer_update_due() { # name command npm-package
-  local name="$1" cmd="$2" pkg="$3" have want newest
+installer_update_due() { # name command npm-package [days]
+  local name="$1" cmd="$2" pkg="$3" days="${4:-$MIN_RELEASE_AGE_DAYS}" have want newest
+  [[ "$days" =~ ^[0-9]+$ ]] || days="$MIN_RELEASE_AGE_DAYS"
   have="$(aicm_timeout 15 "$cmd" --version 2>&1 | aicm_semver || true)"
   if [[ -z "$have" ]]; then
     echo "skip: cannot read the installed $name version, so the installer is not run unattended; update it by hand"
@@ -614,16 +1154,16 @@ installer_update_due() { # name command npm-package
     echo "skip: npm is needed to look up $name release dates; the installer is not run unattended. Update $name by hand"
     return 1
   fi
-  if ! registry_ok; then PENDING=true; return 1; fi
-  want="$(aicm_npm_target "$pkg" "$MIN_RELEASE_AGE_DAYS" || true)"
+  if ! registry_ok; then note_npm_pending "$pkg"; return 1; fi
+  want="$(aicm_npm_target "$pkg" "$days" || true)"
   if [[ -z "$want" ]] || ! aicm_version_older "$have" "$want"; then
-    echo "already current: $name $have (newest release at least $MIN_RELEASE_AGE_DAYS days old: $want)"
+    echo "already current: $name $have (newest release at least $days days old: $want)"
     return 1
   fi
-  if ((MIN_RELEASE_AGE_DAYS > 0)); then
+  if ((days > 0)); then
     newest="$(AICM_NPM_TIMEOUT=60 aicm_npm view "$pkg" version 2>/dev/null | aicm_semver || true)"
     if [[ -n "$newest" && "$newest" != "$want" ]]; then
-      echo "hold: $name $want is old enough, but the installer would install $newest, which is still in its $MIN_RELEASE_AGE_DAYS-day waiting period"
+      echo "hold: $name $want is old enough, but the installer would install $newest, which is still in its $days-day waiting period"
       return 1
     fi
   fi
@@ -631,20 +1171,28 @@ installer_update_due() { # name command npm-package
 }
 
 # `codex update` reruns the official installer, so it is gated like the Grok installer.
-update_codex_standalone() { # codex path
-  installer_update_due codex "$1" "@openai/codex" || return 0
+update_codex_standalone() { # codex path [days]
+  installer_update_due codex "$1" "@openai/codex" "${2:-$MIN_RELEASE_AGE_DAYS}" || return 0
   command_with_timeout 300 "$1" update
 }
 
 update_grok_cli() {
-  if command -v grok >/dev/null 2>&1 && active_path_contains grok "/node_modules/" && is_npm_global_installed "@xai-official/grok"; then
-    update_npm_package "@xai-official/grok"
-  elif command -v grok >/dev/null 2>&1; then
-    installer_update_due grok grok "@xai-official/grok" || return 0
+  local pin age
+  pin="$(aicm_policy_pin grok)"
+  age="$(aicm_policy_effective_age grok "$MIN_RELEASE_AGE_DAYS")"
+  # The catalog owner detector decides the route, exactly like the other CLIs: an npm launcher
+  # (prefix/bin symlink or package-owned shim) gets the npm pin/age checks, while a standalone copy
+  # stays on the gated vendor installer even when a hidden npm package exists.
+  if active_install grok && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == npm ]] && is_npm_global_installed "${CLI_NPMPKG:-@xai-official/grok}"; then
+    update_npm_package "${CLI_NPMPKG:-@xai-official/grok}" "$pin" "$age" grok
+  elif active_install grok && [[ "$CLI_INSTALLED" == true ]]; then
+    policy_hold_for_route grok vendor && return 0
+    installer_update_due grok "$CLI_PATH" "@xai-official/grok" "$age" || return 0
     install_or_update_grok_cli || return $?
     shadow_warning grok
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
-    install_or_update_grok_cli
+    policy_hold_for_route grok vendor && return 0
+    if install_or_update_grok_cli; then note_install_id grok; else return $?; fi
   else
     pass_missing grok "command not found"
   fi
@@ -664,6 +1212,7 @@ collect_catalog_extras() {
     id="${AICM_CLI_ID[$i]}"
     aicm_is_builtin "$id" && continue
     target_enabled "$id" || continue
+    aicm_policy_excluded "$id" && continue
     [[ -n "${AICM_CLI_CMD[$i]}" ]] || continue
     aicm_cli_install "$i"
     if [[ "$CLI_INSTALLED" == true ]] || { [[ "$INSTALL_MISSING" == true && -n "${AICM_CLI_NPM[$i]}" ]] && target_named "$id"; }; then
@@ -673,19 +1222,24 @@ collect_catalog_extras() {
 }
 
 update_catalog_extra() {
-  local i="$1" name self_args
+  local i="$1" name self_args id pin age
+  id="${AICM_CLI_ID[$i]}"
   name="${AICM_CLI_NAME[$i]}"
+  pin="$(aicm_policy_pin "$id")"
+  age="$(aicm_policy_effective_age "$id" "$MIN_RELEASE_AGE_DAYS")"
   aicm_cli_install "$i"
   if [[ "$CLI_INSTALLED" != true ]]; then
-    run_step "$name via npm install" install_npm_package "${AICM_CLI_NPM[$i]}"
+    run_step "$name via npm install" install_npm_package "${AICM_CLI_NPM[$i]}" "$pin" "$age" "$id"
     return 0
   fi
   case "$CLI_METHOD" in
-    npm) run_step "$name via npm" update_npm_package "${AICM_CLI_NPM[$i]}" ;;
+    npm) run_step "$name via npm" update_npm_package "${CLI_NPMPKG:-${AICM_CLI_NPM[$i]}}" "$pin" "$age" "$id" ;;
     brew)
+      if policy_hold_for_route "$id" brew; then return 0; fi
       if [[ -n "${AICM_CLI_BREW[$i]}" ]]; then run_step "$name via brew" update_brew_package "${AICM_CLI_BREW[$i]}"
-      else pass_missing "${AICM_CLI_ID[$i]}" "installed with Homebrew but the catalog has no Homebrew name"; fi ;;
+      else pass_missing "$id" "installed with Homebrew but the catalog has no Homebrew name"; fi ;;
     *)
+      if policy_hold_for_route "$id" standalone; then return 0; fi
       if [[ -n "${AICM_CLI_SELF[$i]}" && "${AICM_CLI_SELF[$i]}" != "@installer" ]]; then
         read -r -a self_args <<< "${AICM_CLI_SELF[$i]}"
         run_step "$name self-update" self_update_cli "${AICM_CLI_CMD[$i]}" "${self_args[@]}"
@@ -697,13 +1251,26 @@ update_catalog_extra() {
 }
 
 update_kimi_cli() {
+  local pin age method=""
+  pin="$(aicm_policy_pin kimi)"
+  age="$(aicm_policy_effective_age kimi "$MIN_RELEASE_AGE_DAYS")"
+  # The copy on PATH decides the route. A standalone Kimi must never let a hidden npm copy take the
+  # policy pin (the terminal would still run the standalone one).
+  if active_install kimi && [[ "$CLI_INSTALLED" == true ]]; then method="$CLI_METHOD"; fi
+  if [[ -n "$method" && "$method" != npm ]]; then
+    policy_hold_for_route kimi "$method" && return 0
+    echo "kimi command exists but is not npm-managed; skipping unattended update"
+    echo "      reinstall/update with npm for automation: npm install -g @moonshot-ai/kimi-code@latest"
+    return 0
+  fi
   if is_npm_global_installed "@moonshot-ai/kimi-code"; then
-    update_npm_package "@moonshot-ai/kimi-code"
+    update_npm_package "@moonshot-ai/kimi-code" "$pin" "$age" kimi
   elif command -v kimi >/dev/null 2>&1; then
+    policy_hold_for_route kimi standalone && return 0
     echo "kimi command exists but is not npm-managed; skipping unattended update"
     echo "      reinstall/update with npm for automation: npm install -g @moonshot-ai/kimi-code@latest"
   elif [[ "$INSTALL_MISSING" == "true" ]]; then
-    install_npm_package "@moonshot-ai/kimi-code"
+    install_npm_package "@moonshot-ai/kimi-code" "$pin" "$age" kimi
   else
     pass_missing kimi "command not found and npm global package not installed"
   fi
@@ -714,19 +1281,15 @@ echo "host=$(hostname) user=$(id -un) dry_run=$DRY_RUN targets=$AI_CLI_TARGETS i
 cleanup_old_logs
 [[ "$DRY_RUN" != true ]] && restore_missing_npm
 collect_catalog_extras
+build_verify_rows
+report_update_policy
 
 echo
 echo "== before versions =="
-gpt_target_enabled && version_of codex
-target_enabled opencode && version_of opencode
-target_enabled agy && version_of agy
-target_enabled kimi && version_of kimi
-target_enabled claude && version_of claude
-target_enabled grok && version_of grok
-for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx]}"; done
+capture_versions before
 
 if command -v "$BREW" >/dev/null 2>&1; then
-  if { gpt_target_enabled && active_brew_install codex codex; } || { target_enabled opencode && active_brew_install opencode opencode; } || { target_enabled claude && active_brew_install claude claude-code; }; then
+  if { gpt_target_enabled && ! aicm_policy_excluded codex && policy_brew_update_allowed codex && active_brew_install codex codex; } || { target_enabled opencode && ! aicm_policy_excluded opencode && policy_brew_update_allowed opencode && active_brew_install opencode opencode; } || { target_enabled claude && ! aicm_policy_excluded claude && policy_brew_update_allowed claude && active_brew_install claude claude-code; }; then
     run_step "brew update" aicm_timeout "$INSTALL_TIMEOUT_SECONDS" "$BREW" update
   else
     echo "pass: no target Homebrew-managed CLIs installed; skipping brew update"
@@ -737,83 +1300,101 @@ fi
 
 # Codex: prefer Homebrew when it manages the active install.
 if gpt_target_enabled; then
-  if active_brew_install codex codex; then
-    run_step "gpt/codex via brew" update_brew_package codex
-  elif active_install codex && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == npm ]]; then
-    run_step "gpt/codex via npm" update_npm_package "@openai/codex"
-  elif active_install codex && [[ "$CLI_INSTALLED" == true ]] && aicm_codex_standalone "$CLI_PATH"; then
-    # The official installer (~/.codex/packages/standalone) updates itself; the desktop app's copy does not live there.
-    run_step "gpt/codex standalone" update_codex_standalone "$CLI_PATH"
-  elif [[ "$INSTALL_MISSING" == "true" ]] && active_install codex && [[ "$CLI_INSTALLED" != true ]]; then
-    run_step "gpt/codex via npm install" install_npm_package "@openai/codex"
+  fail_mark=${#failures[@]}
+  if aicm_policy_excluded codex; then
+    echo "skip: codex excluded by update policy"
   else
-    pass_missing gpt "codex command not found and no brew/npm package"
-  fi
+    codex_pin="$(aicm_policy_pin codex)"
+    codex_age="$(aicm_policy_effective_age codex "$MIN_RELEASE_AGE_DAYS")"
+    if active_brew_install codex codex; then
+      policy_hold_for_route codex brew || run_step "gpt/codex via brew" update_brew_package codex
+    elif active_install codex && [[ "$CLI_INSTALLED" == true && "$CLI_METHOD" == npm ]]; then
+      run_step "gpt/codex via npm" update_npm_package "@openai/codex" "$codex_pin" "$codex_age" codex
+    elif active_install codex && [[ "$CLI_INSTALLED" == true ]] && aicm_codex_standalone "$CLI_PATH"; then
+      # The official installer (~/.codex/packages/standalone) updates itself; the desktop app's copy does not live there.
+      policy_hold_for_route codex standalone || run_step "gpt/codex standalone" update_codex_standalone "$CLI_PATH" "$codex_age"
+    elif [[ "$INSTALL_MISSING" == "true" ]] && active_install codex && [[ "$CLI_INSTALLED" != true ]]; then
+      run_step "gpt/codex via npm install" install_npm_package "@openai/codex" "$codex_pin" "$codex_age" codex
+    else
+      pass_missing gpt "codex command not found and no brew/npm package"
+    fi
 
-  # The Codex desktop app can put its own copy on PATH and updates it itself; say so when npm's copy is hidden.
-  shadow_warning codex
+    # The Codex desktop app can put its own copy on PATH and updates it itself; say so when npm's copy is hidden.
+    shadow_warning codex
 
-  # A quarantined cask build cannot start its code-mode host while Gatekeeper's first-open prompt waits
-  # (lib/codex-host.sh). Checked on every run, so a version installed by hand is fixed too. It runs
-  # before the recycle below, so the restarted servers find a host that starts.
-  if [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 ]] && [[ "$(uname -s)" == Darwin ]] && active_brew_install codex codex && is_brew_cask_installed codex; then
-    run_step "codex cask quarantine" release_codex_cask_quarantine
-  fi
+    # A quarantined cask build cannot start its code-mode host while Gatekeeper's first-open prompt waits
+    # (lib/codex-host.sh). Checked on every run, so a version installed by hand is fixed too. It runs
+    # before the recycle below, so the restarted servers find a host that starts.
+    if policy_codex_local_fix_allowed && [[ "${AICM_CODEX_UNQUARANTINE:-1}" != 0 ]] && [[ "$(uname -s)" == Darwin ]] && active_brew_install codex codex && is_brew_cask_installed codex; then
+      run_step "codex cask quarantine" release_codex_cask_quarantine
+    fi
 
-  # A Homebrew upgrade deletes the old cask folder that a running `codex app-server` (Paseo keeps one)
-  # still spawns its terminal host from (lib/codex-host.sh). Right after the upgrade: a later update
-  # can hang.
-  if [[ "${AICM_CODEX_RECYCLE:-1}" != 0 ]] && active_brew_install codex codex; then
-    run_step "stale codex app-servers" recycle_stale_codex_app_servers
+    # A Homebrew upgrade deletes the old cask folder that a running `codex app-server` (Paseo keeps one)
+    # still spawns its terminal host from (lib/codex-host.sh). Right after the upgrade: a later update
+    # can hang.
+    if policy_codex_local_fix_allowed && [[ "${AICM_CODEX_RECYCLE:-1}" != 0 ]] && active_brew_install codex codex; then
+      run_step "stale codex app-servers" recycle_stale_codex_app_servers
+    fi
   fi
+  take_target_failures codex "$fail_mark"
 fi
 
 if target_enabled opencode; then
-  run_step "opencode" update_opencode_cli
+  fail_mark=${#failures[@]}
+  if aicm_policy_excluded opencode; then echo "skip: opencode excluded by update policy"; else run_step "opencode" update_opencode_cli; fi
+  take_target_failures opencode "$fail_mark"
 fi
 
 if target_enabled agy; then
-  if command -v agy >/dev/null 2>&1; then
-    run_step "antigravity cli via agy" update_agy_cli
+  fail_mark=${#failures[@]}
+  if aicm_policy_excluded agy; then
+    echo "skip: agy excluded by update policy"
+  elif command -v agy >/dev/null 2>&1; then
+    policy_hold_for_route agy standalone || run_step "antigravity cli via agy" update_agy_cli
   else
     pass_missing agy "command not found"
   fi
+  take_target_failures agy "$fail_mark"
 fi
 
 if target_enabled kimi; then
-  run_step "kimi code via npm" update_kimi_cli
+  fail_mark=${#failures[@]}
+  if aicm_policy_excluded kimi; then echo "skip: kimi excluded by update policy"; else run_step "kimi code via npm" update_kimi_cli; fi
+  take_target_failures kimi "$fail_mark"
 fi
 
 if target_enabled claude; then
-  run_step "claude code" update_claude_cli
+  fail_mark=${#failures[@]}
+  if aicm_policy_excluded claude; then echo "skip: claude excluded by update policy"; else run_step "claude code" update_claude_cli; fi
+  take_target_failures claude "$fail_mark"
 fi
 
 if target_enabled grok; then
-  run_step "grok build" update_grok_cli
+  fail_mark=${#failures[@]}
+  if aicm_policy_excluded grok; then echo "skip: grok excluded by update policy"; else run_step "grok build" update_grok_cli; fi
+  take_target_failures grok "$fail_mark"
 fi
 
 for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do
-  update_catalog_extra "$idx"
+  fail_mark=${#failures[@]}
+  if aicm_policy_excluded "${AICM_CLI_ID[$idx]}"; then
+    echo "skip: ${AICM_CLI_ID[$idx]} excluded by update policy"
+  else
+    update_catalog_extra "$idx"
+  fi
+  take_target_failures "${AICM_CLI_ID[$idx]}" "$fail_mark"
 done
 
-versions_before="$VERSION_TEXT"
-VERSION_TEXT=""
 echo
 echo "== after versions =="
 hash -r || true
-gpt_target_enabled && version_of codex
-target_enabled opencode && version_of opencode
-target_enabled agy && version_of agy
-target_enabled kimi && version_of kimi
-target_enabled claude && version_of claude
-target_enabled grok && version_of grok
-for idx in ${EXTRA_IDX[@]+"${EXTRA_IDX[@]}"}; do version_of "${AICM_CLI_CMD[$idx]}"; done
+capture_versions after
+classify_results
 
-# Optional user hook, e.g. reload a daemon that keeps old CLI binaries loaded. Runs only when a CLI
-# version actually changed (the job retries during the day). Failure is only a warning.
+# Optional user hook. A broken or missing after probe never runs it.
 POST_UPDATE_HOOK="$AICM_HOME/hooks/post-update.sh"
 if [[ -x "$POST_UPDATE_HOOK" ]]; then
-  if [[ "$versions_before" != "$VERSION_TEXT" ]]; then run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
+  if version_changed; then run_optional_step "post-update hook" "$POST_UPDATE_HOOK"
   else echo; echo "post-update hook skipped: no CLI version changed"; fi
 fi
 
@@ -829,7 +1410,8 @@ if ((${#version_failures[@]})); then
 fi
 
 problems=()
-while IFS= read -r problem; do [[ -n "$problem" ]] && problems+=("$problem"); done < <(aicm_schedule_problems update)
+schedule_problem_text="$(aicm_schedule_problems update)" || true
+while IFS= read -r problem; do [[ -n "$problem" ]] && problems+=("$problem"); done <<< "$schedule_problem_text"
 if ((${#problems[@]})); then
   for problem in "${problems[@]}"; do echo "problem: $problem"; done
 fi
@@ -847,7 +1429,8 @@ if [[ "$DRY_RUN" != "true" ]]; then
   save_npm_state
   aicm_npm_leftovers
   aicm_update_app_copy
-  aicm_state_write last-update "{\"finishedAt\":\"$(ts)\",\"localDate\":\"$(date +%Y-%m-%d)\",\"targets\":\"$(aicm_json_escape "$(run_targets)")\",\"version\":\"$(aicm_version)\",\"ok\":$update_ok,\"pending\":$PENDING,\"failures\":\"$(aicm_json_escape "$failure_summary")\",\"logFile\":\"$(aicm_json_escape "$LOG_FILE")\"}"
+  aicm_state_write last-update "{\"finishedAt\":\"$(ts)\",\"localDate\":\"$(date +%Y-%m-%d)\",\"targets\":\"$(aicm_json_escape "$(run_targets)")\",\"policyFingerprint\":\"$(aicm_json_escape "$AICM_POLICY_FINGERPRINT")\",\"version\":\"$(aicm_version)\",\"ok\":$update_ok,\"pending\":$PENDING,\"failures\":\"$(aicm_json_escape "$failure_summary")\",\"logFile\":\"$(aicm_json_escape "$LOG_FILE")\",\"results\":$(verify_results_json)}"
+  record_update_history
   notes=()
   # The step name without its exit code, so the same failure keeps the same key from day to day.
   if ((${#failures[@]})); then for f in "${failures[@]}"; do notes+=("update failed: ${f% rc=*}"); done; fi

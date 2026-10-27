@@ -15,6 +15,10 @@ export CODEX_HOME="$WORK/home/.codex" USERPROFILE="$WORK/home"
 export AICM_PROCESSES=0 AICM_WORKTREES=0
 unset XDG_CACHE_HOME
 mkdir -p "$HOME" "$TMPDIR" "$AICM_HOME" "$WORK/outside" "$WORK/fakebin"
+# The home already belongs to the tool (an earlier run or `aicm schedule install` marked it). An unmarked
+# folder holding only dated archive folders is no longer adopted (no proof it is ours), so the archive
+# fixtures below need the marker to reach the archive rules under test.
+printf 'AI CLI Auto Manager home (logs, state, archive, installed copy)\n' > "$AICM_HOME/.aicm-home"
 # The command rule never reaches the real uv; cap fixtures use a deterministic open-file checker.
 printf '#!/bin/sh\necho fake-cache-pruned\n' > "$WORK/fakebin/uv"
 cat > "$WORK/fakebin/lsof" <<EOF
@@ -300,6 +304,28 @@ rm -f "$WORK/lsof-error"
 "$ROOT/bin/clean_ai_leftovers.sh" --rules codex-trace-db >/dev/null 2>&1 || true
 expect_gone "$HOME/.codex/logs_22.sqlite" "idle DB can be cleaned after the checker recovers"
 
+echo "# archive containment: linked archive ancestors are not purged or written"
+if [[ "$LINKS" == true ]]; then
+  mkdir -p "$WORK/outside-archive/arch-link/20200101" "$HOME/archsrc"
+  echo keep-purge > "$WORK/outside-archive/arch-link/20200101/note.txt"
+  rm -rf "$AICM_HOME/archive"
+  ln -s "$WORK/outside-archive" "$AICM_HOME/archive"
+  printf 'arch-link | all | archive | ~/archsrc | * | 1 | 1 | off |\n' > "$WORK/arch-link.conf"
+  "$ROOT/bin/clean_ai_leftovers.sh" --rules-file "$WORK/arch-link.conf" --local-rules-file "$WORK/none.conf" >/dev/null 2>&1 || true
+  expect_exists "$WORK/outside-archive/arch-link/20200101/note.txt" "purge does not follow a linked archive root"
+  rm -f "$AICM_HOME/archive"
+  mkdir -p "$AICM_HOME/archive/arch-move" "$WORK/outside-dest" "$HOME/archsrc"
+  make_file "$HOME/archsrc/old.txt" 10
+  ln -s "$WORK/outside-dest" "$AICM_HOME/archive/arch-move/$TODAY"
+  printf 'arch-move | all | archive | ~/archsrc | * | 1 | 60 | on |\n' > "$WORK/arch-move.conf"
+  "$ROOT/bin/clean_ai_leftovers.sh" --rules-file "$WORK/arch-move.conf" --local-rules-file "$WORK/none.conf" >/dev/null 2>&1 || true
+  expect_exists "$HOME/archsrc/old.txt" "archive move refuses a linked destination ancestor"
+  [[ -z "$(ls -A "$WORK/outside-dest" 2>/dev/null)" ]] && pass "linked dest received no archived files" || fail "linked dest was written: $(ls -A "$WORK/outside-dest")"
+  rm -f "$AICM_HOME/archive/arch-move/$TODAY"
+else
+  echo "skip - archive link containment (no symlink support)"
+fi
+
 echo "# unknown rule id"
 if "$ROOT/bin/clean_ai_leftovers.sh" --rules nope >/dev/null 2>&1; then fail "unknown id accepted"; else pass "unknown id rejected"; fi
 
@@ -308,6 +334,105 @@ printf 'x | all | weird | ~/.x | * | 1 | | on |\n' > "$WORK/bad.conf"
 if "$ROOT/bin/clean_ai_leftovers.sh" --dry-run --local-rules-file "$WORK/bad.conf" >/dev/null 2>&1; then fail "bad kind accepted"; else pass "bad kind rejected"; fi
 printf 'x | all | archive | ~/.x | * | 30 | | on |\n' > "$WORK/bad2.conf"
 if "$ROOT/bin/clean_ai_leftovers.sh" --dry-run --local-rules-file "$WORK/bad2.conf" >/dev/null 2>&1; then fail "archive rule without limit accepted"; else pass "archive rule needs a delete-after limit"; fi
+
+echo "# categories, explain and json"
+CLEAN="$ROOT/bin/clean_ai_leftovers.sh"
+for bad in nope 'sessions,' 'sessions,sessions' 'all,temp' ''; do
+  if [[ -z "$bad" ]]; then
+    if "$CLEAN" --category >/dev/null 2>&1; then fail "missing category value accepted"; else pass "missing category value rejected"; fi
+  elif "$CLEAN" --category "$bad" >/dev/null 2>&1; then fail "category '$bad' accepted"; else pass "category '$bad' rejected"; fi
+done
+make_file "$HOME/.gemini/tmp/chat/old.json" 40
+make_file "$HOME/.qwen/tmp/chat/old.json" 40
+age_dirs "$HOME/.gemini/tmp/chat" 40
+age_dirs "$HOME/.qwen/tmp/chat" 40
+make_file "$HOME/.codex/.tmp/cat-only.bin" 40
+make_file "$HOME/.claude/projects/z/old.jsonl" 40
+mkdir -p "$HOME/.codex/generated_images"
+make_file "$AICM_HOME/archive/codex-images/20200103/old.png" 2000
+exp="$("$CLEAN" --explain --category temp 2>&1)" || true
+grep -q $'codex-tmp\tcategory=temp\t' <<< "$exp" && grep -q $'age=7\t' <<< "$exp" && grep -q $'action=delete' <<< "$exp" && pass "explain shows temp rule age and action" || fail "explain temp: $exp"
+grep -q 'gemini-tmp' <<< "$exp" && fail "explain temp listed gemini" || pass "explain temp omits sessions"
+"$CLEAN" --category temp >/dev/null 2>&1 || true
+expect_gone "$HOME/.codex/.tmp/cat-only.bin" "category temp removes temp files"
+expect_exists "$HOME/.gemini/tmp/chat/old.json" "gemini chats are sessions, not temp"
+expect_exists "$HOME/.qwen/tmp/chat/old.json" "qwen chats are sessions, not temp"
+expect_exists "$AICM_HOME/archive/codex-images/20200103/old.png" "category temp does not purge other archives"
+"$CLEAN" --category sessions >/dev/null 2>&1 || true
+expect_gone "$HOME/.gemini/tmp/chat/old.json" "category sessions removes gemini chats"
+expect_gone "$HOME/.qwen/tmp/chat/old.json" "category sessions removes qwen chats"
+expect_exists "$HOME/.claude/projects/z/old.jsonl" "category does not enable a disabled rule"
+expect_exists "$AICM_HOME/archive/codex-images/20200103/old.png" "category sessions does not purge an other archive"
+"$CLEAN" --category cache --rules claude-transcripts >/dev/null 2>&1 || true
+expect_exists "$HOME/.claude/projects/z/old.jsonl" "category intersects --rules"
+"$CLEAN" --category sessions --rules claude-transcripts >/dev/null 2>&1 || true
+expect_gone "$HOME/.claude/projects/z/old.jsonl" "explicit rule enables only the selected id inside the category"
+printf 'my-extra | all | age | ~/my-extra | * | 1 | | on | custom leftovers\n' >> "$AICM_HOME/clean-rules.local.conf"
+make_file "$HOME/my-extra/old.txt" 5
+exp="$("$CLEAN" --explain --category other --rules my-extra)" || true
+grep -q $'my-extra\tcategory=other\t' <<< "$exp" && grep -q 'reason=custom leftovers' <<< "$exp" && pass "custom rule id is category other" || fail "custom category: $exp"
+expect_exists "$HOME/my-extra/old.txt" "explain removes nothing"
+mkdir -p "$WORK/fakenode"
+printf '#!/bin/sh\necho "$@" >> "%s/node-calls.log"\nexit 0\n' "$WORK" > "$WORK/fakenode/node"
+chmod +x "$WORK/fakenode/node"
+: > "$WORK/node-calls.log"
+PATH="$WORK/fakenode:$PATH" AICM_WORKTREES=1 "$CLEAN" --dry-run --category temp >/dev/null 2>&1 || true
+! grep -q worktrees <<< "$(cat "$WORK/node-calls.log")" && pass "category run does not start worktrees" || fail "worktrees ran: $(cat "$WORK/node-calls.log")"
+: > "$WORK/node-calls.log"
+PATH="$WORK/fakenode:$PATH" AICM_WORKTREES=1 "$CLEAN" --dry-run >/dev/null 2>&1 || true
+grep -q worktrees.js "$WORK/node-calls.log" && pass "a full dry-run still checks worktrees" || fail "full dry-run skipped worktrees: $(cat "$WORK/node-calls.log")"
+"$CLEAN" --category all >/dev/null 2>&1 || true
+expect_gone "$AICM_HOME/archive/codex-images/20200103" "category all still purges off-rule archives"
+printf 'only-temp | all | age | ~/only-temp | * | 1 | | on | json byte check\n' > "$WORK/only-temp.conf"
+: > "$WORK/none.conf"
+make_file "$HOME/only-temp/old.bin" 5 128
+make_file "$HOME/only-temp/new.bin" 0 10
+cp -p "$AICM_HOME/state/last-clean.json" "$WORK/state.keep"
+preview="$( "$CLEAN" --json --dry-run --rules only-temp --rules-file "$WORK/only-temp.conf" --local-rules-file "$WORK/none.conf" --category other 2>"$WORK/json.err" )" || true
+[[ "$preview" != *cleanup* && "$preview" == '{'* ]] && pass "json stdout has no log text" || fail "json stdout mixed: $preview"
+python3 - "$preview" <<'PY' || fail "json preview document"
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["schemaVersion"] == 1 and d["dryRun"] is True
+assert d["categories"] == ["other"]
+assert d["errors"] == []
+r = d["rules"][0]
+assert r["id"] == "only-temp" and r["category"] == "other" and r["action"] == "delete"
+assert r["enabled"] is True and r["candidates"] == 1 and r["candidateBytes"] == 128
+assert r["removed"] == 0 and d["summary"]["freedBytes"] == 0 and d["summary"]["plannedBytes"] == 128
+assert "json byte check" in r["reason"]
+print("ok")
+PY
+expect_exists "$HOME/only-temp/old.bin" "json preview deletes nothing"
+cmp -s "$WORK/state.keep" "$AICM_HOME/state/last-clean.json" && pass "json preview keeps last-clean" || fail "json preview changed last-clean"
+grep -q 'cleanup started' "$WORK/json.err" && pass "json messages are on stderr" || fail "json stderr: $(cat "$WORK/json.err")"
+live="$( "$CLEAN" --json --rules only-temp --rules-file "$WORK/only-temp.conf" --local-rules-file "$WORK/none.conf" --category other 2>"$WORK/json-live.err" )" || true
+python3 - "$live" <<'PY' || fail "json live document: $live"
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["dryRun"] is False
+r = d["rules"][0]
+assert r["candidates"] == 1 and r["candidateBytes"] == 128
+assert r["removed"] == 1 and r["removedBytes"] == 128
+assert d["summary"]["freedBytes"] == 128
+print("ok")
+PY
+expect_gone "$HOME/only-temp/old.bin" "json run removed the old file"
+expect_exists "$HOME/only-temp/new.bin" "json run kept the fresh file"
+[[ "$live" != *cleanup* ]] && pass "live json stdout stays pure" || fail "live json mixed"
+
+echo "# no-argument real cleanup through the node lease"
+real_node="$(command -v node)" || fail "node is required for the lease smoke"
+grep -q "leaseValid" "$ROOT/lib/maintenance.js" || fail "maintenance.js has no lease wrapper"
+mkdir -p "$WORK/smokenode" "$WORK/smoke-home"
+printf '#!/bin/sh\necho "$@" >> "%s/smoke-node.log"\nexec "%s" "$@"\n' "$WORK" "$real_node" > "$WORK/smokenode/node"
+chmod +x "$WORK/smokenode/node"
+: > "$WORK/smoke-node.log"
+noarg="$(HOME="$WORK/smoke-home" USERPROFILE="$WORK/smoke-home" CODEX_HOME="$WORK/smoke-home/.codex" AICM_HOME="$WORK/smoke-home/.ai-cli-auto-manager" PATH="$WORK/smokenode:$PATH" "$CLEAN" 2>&1)" && noarg_ok=0 || noarg_ok=$?
+printf '%s\n' "$noarg" | grep -q 'unbound variable' && fail "no-argument cleanup tripped set -u: $noarg"
+[[ "$noarg_ok" -eq 0 ]] && pass "no-argument cleanup with node lease" || fail "no-argument cleanup exit $noarg_ok: $noarg"
+grep -q 'run-clean' "$WORK/smoke-node.log" && pass "no-argument cleanup entered the node lease" || fail "lease was not used: $(cat "$WORK/smoke-node.log")"
+grep -F -- "-NoProfile', '-NonInteractive', '-File'" "$ROOT/bin/clean_ai_leftovers.ps1" >/dev/null && pass "windows re-exec passes -NonInteractive" || fail "windows re-exec missing -NonInteractive"
 
 echo
 if ((fails)); then echo "$fails check(s) failed"; exit 1; fi

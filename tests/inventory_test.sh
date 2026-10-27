@@ -36,7 +36,7 @@ cat > "$WORK/fakebin/brew" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$WORK/brew-calls.log"
 case "\${1:-}" in
-  --prefix) echo "$WORK/brew" ;;
+  --prefix) echo "\${FAKE_BREW_PREFIX:-$WORK/brew}" ;;
   list) [[ -f "$WORK/brew-installed" ]] ;;
   outdated) echo "\${@: -1}" ;;
   update|upgrade) exit 0 ;;
@@ -263,12 +263,17 @@ echo "# a CLI lost by an interrupted install"
 was="$(sed -n 's/.*"version": "\(.*\)".*/\1/p' "$FAKE_NPM_ROOT/@fake/npmcli/package.json")"
 mv "$FAKE_NPM_ROOT/@fake/npmcli" "$FAKE_NPM_ROOT/@fake/.npmcli-XyZw9876"
 n_before="$(grep -cx "install -g @fake/npmcli@$was" <<< "$(calls)" || true)"
+# fakenpm is not selected: recovery must not touch its backup, package or state.
 out="$("$UPD" --targets fakeshadow 2>&1)" && rc=0 || rc=$?
-[[ "$rc" == 0 ]] && grep -q "restored: @fake/npmcli $was" <<< "$out" && [[ "$(grep -cx "install -g @fake/npmcli@$was" <<< "$(calls)")" == $((n_before + 1)) ]] && pass "a CLI whose install was cut off is reinstalled at the same version" || fail "restore: rc=$rc $out"
+[[ "$rc" == 0 ]] && ! grep -q "restored: @fake/npmcli $was" <<< "$out" && [[ -d "$FAKE_NPM_ROOT/@fake/.npmcli-XyZw9876" ]] && [[ ! -e "$FAKE_NPM_ROOT/@fake/npmcli" ]] && grep -q '@fake/npmcli' "$AICM_HOME/state/update-npm.tsv" && pass "an unselected CLI is not recovered and its backup and state are kept" || fail "unselected recovery: rc=$rc $out"
+# Explicitly named: the interrupted install is recovered at the same version.
+out="$("$UPD" --targets fakeshadow,fakenpm 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -q "restored: @fake/npmcli $was" <<< "$out" && [[ "$(grep -cx "install -g @fake/npmcli@$was" <<< "$(calls)")" == $((n_before + 1)) ]] && pass "a selected CLI whose install was cut off is reinstalled at the same version" || fail "restore: rc=$rc $out"
 rm -rf "$FAKE_NPM_ROOT/@fake/.npmcli-XyZw9876" "$FAKE_NPM_ROOT/@fake/newcli"
-out="$("$UPD" --targets fakeshadow 2>&1)" && rc=0 || rc=$?
-[[ "$rc" != 0 ]] && grep -q 'notify: .*@fake/newcli disappeared since the last update' <<< "$out" && pass "a managed CLI that is gone is reported as a failure" || fail "missing CLI: rc=$rc $out"
-out="$("$UPD" --targets fakeshadow 2>&1)" && rc=0 || rc=$?
+rm -f "$PREFIX/bin/fakenew"
+out="$("$UPD" --targets fakenew 2>&1)" && rc=0 || rc=$?
+[[ "$rc" != 0 ]] && grep -q 'notify: .*@fake/newcli disappeared since the last update' <<< "$out" && pass "a selected managed CLI that is gone is reported as a failure" || fail "missing CLI: rc=$rc $out"
+out="$("$UPD" --targets fakenew 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 ]] && ! grep -q 'disappeared' <<< "$out" && pass "it is reported once, then forgotten (it may have been removed on purpose)" || fail "missing CLI repeated: rc=$rc $out"
 
 echo "# the scheduler's own log files are trimmed"
@@ -325,6 +330,20 @@ out="$(env -u NPM "$UPD" --targets opencode 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 ]] && grep -qx 'install -g @opencode/cli@2.1.0' <<< "$(calls)" && pass "OpenCode 2.x is updated through the npm on PATH, not opencode upgrade" || fail "opencode 2.x: rc=$rc $out"
 ! grep -Eq '^(update|upgrade)( |$)' "$WORK/brew-calls.log" && pass "npm OpenCode does not update the hidden Homebrew copy" || fail "hidden Homebrew OpenCode touched"
 
+echo "# OpenCode V1 keeps its npm owner when V2 is also installed"
+node -e 'const fs=require("fs"),f=process.argv[1],r=JSON.parse(fs.readFileSync(f,"utf8"));r["opencode-ai"]={latest:"1.1.0",versions:{"1.0.0":{daysAgo:30},"1.1.0":{daysAgo:10}}};fs.writeFileSync(f,JSON.stringify(r));' "$WORK/registry.json"
+"$NPM" install -g opencode-ai@1.0.0 >/dev/null
+printf '#!/bin/sh\necho opencode 1.0.0\n' > "$FAKE_NPM_ROOT/opencode-ai/opencode"
+chmod +x "$FAKE_NPM_ROOT/opencode-ai/opencode"
+rm -f "$PREFIX/bin/opencode"
+ln -s "$FAKE_NPM_ROOT/opencode-ai/opencode" "$PREFIX/bin/opencode"
+: > "$WORK/npm-calls.log"
+out="$("$UPD" --targets opencode 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'install -g opencode-ai@1.1.0' <<< "$(calls)" && ! grep -q '@opencode/cli@' <<< "$(calls)" && pass "OpenCode V1 updates without switching to V2" || fail "OpenCode V1 owner: rc=$rc $out"
+
+out="$(/bin/bash -c '. "$1/lib/aicm-common.sh"; aicm_load_catalog; i="$(aicm_cli_index amp)"; AICM_CLI_NPM[$i]=@private/custom-amp; aicm_cli_npm_names "$i"' _ "$ROOT")"
+[[ "$out" == '@private/custom-amp' ]] && pass "local Amp catalog overrides do not add public aliases" || fail "Amp override widened: $out"
+
 echo "# npm Claude also takes priority over a hidden Homebrew copy"
 node -e 'const fs=require("fs"),f=process.argv[1],r=JSON.parse(fs.readFileSync(f,"utf8"));r["@anthropic-ai/claude-code"]={latest:"2.1.0",versions:{"2.0.0":{daysAgo:30},"2.1.0":{daysAgo:10}}};fs.writeFileSync(f,JSON.stringify(r));' "$WORK/registry.json"
 npm_cli claude @anthropic-ai/claude-code 2.0.0
@@ -339,6 +358,89 @@ chmod +x "$WORK/brew/Cellar/codex/0.1/bin/codex"
 ln -s "$WORK/brew/Cellar/codex/0.1/bin/codex" "$WORK/brewbin/codex"
 out="$(PATH="$WORK/brewbin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 ]] && grep -qx update "$WORK/brew-calls.log" && grep -qx 'upgrade --cask codex' "$WORK/brew-calls.log" && pass "active Homebrew Codex is updated through the fake brew" || fail "active brew: $out"
+
+echo "# Amp uses @ampcode/cli, keeps legacy @sourcegraph/amp, and updates the PATH owner"
+node -e 'const fs=require("fs"),f=process.argv[1],r=JSON.parse(fs.readFileSync(f,"utf8"));
+  r["@ampcode/cli"]={latest:"1.1.0",versions:{"1.0.0":{daysAgo:30},"1.1.0":{daysAgo:10}}};
+  r["@sourcegraph/amp"]={latest:"0.2.0",versions:{"0.1.0":{daysAgo:30},"0.2.0":{daysAgo:10}}};
+  fs.writeFileSync(f,JSON.stringify(r));' "$WORK/registry.json"
+amp_pkg_cli() { # package version: launcher inside the package so PATH ownership is proven
+  "$NPM" install -g "$1@$2" >/dev/null
+  printf '#!/usr/bin/env bash\necho "amp %s"\n' "$2" > "$FAKE_NPM_ROOT/$1/amp"
+  chmod +x "$FAKE_NPM_ROOT/$1/amp"
+  mkdir -p "$PREFIX/bin"
+  ln -sfn "$FAKE_NPM_ROOT/$1/amp" "$PREFIX/bin/amp"
+}
+amp_pkg_cli @ampcode/cli 1.0.0
+: > "$WORK/npm-calls.log"
+out="$("$UPD" --targets amp 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'install -g @ampcode/cli@1.1.0' <<< "$(calls)" && pass "canonical Amp package is updated" || fail "amp canonical: rc=$rc $out"
+! grep -q '@sourcegraph/amp' <<< "$(calls)" && pass "missing legacy Amp package is not checked as the install" || fail "legacy probed on canonical-only: $(calls)"
+rm -f "$PREFIX/bin/amp"
+"$NPM" install -g @sourcegraph/amp@0.1.0 >/dev/null
+amp_pkg_cli @sourcegraph/amp 0.1.0
+: > "$WORK/npm-calls.log"
+out="$("$UPD" --targets amp 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'install -g @sourcegraph/amp@0.2.0' <<< "$(calls)" && pass "legacy Amp package is updated when it owns PATH" || fail "amp legacy: rc=$rc $out"
+! grep -q '@ampcode/cli@' <<< "$(calls)" && pass "canonical Amp is not updated while PATH is the legacy copy" || fail "canonical updated behind legacy: $(calls)"
+"$NPM" install -g @ampcode/cli@1.0.0 >/dev/null
+amp_pkg_cli @ampcode/cli 1.0.0
+: > "$WORK/npm-calls.log"
+out="$("$UPD" --targets amp 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'install -g @ampcode/cli@1.1.0' <<< "$(calls)" && pass "PATH-owning Amp package is selected when both exist" || fail "amp both: rc=$rc $out"
+! grep -q '@sourcegraph/amp@0.2.0' <<< "$(calls)" && pass "hidden Amp alternate is not updated" || fail "hidden amp updated: $(calls)"
+out="$("$ROOT/bin/inventory_ai_clis.sh" --offline --local-catalog-file "$WORK/none.conf" 2>&1)" || true
+grep -Eq '^Amp +npm +1\.0\.0 ' <<< "$out" && pass "inventory reports the Amp copy the updater uses" || fail "amp inventory: $out"
+
+echo "# Copilot Homebrew cask is covered and updated on the installed channel"
+mkdir -p "$WORK/brew/Caskroom/copilot-cli/0.1/bin" "$WORK/caskbin"
+printf '#!/bin/sh\necho copilot 0.1.0\n' > "$WORK/brew/Caskroom/copilot-cli/0.1/bin/copilot"
+chmod +x "$WORK/brew/Caskroom/copilot-cli/0.1/bin/copilot"
+ln -sfn "$WORK/brew/Caskroom/copilot-cli/0.1/bin/copilot" "$WORK/caskbin/copilot"
+touch "$WORK/brew-installed"
+: > "$WORK/brew-calls.log"
+out="$(PATH="$WORK/caskbin:$PATH" "$ROOT/bin/inventory_ai_clis.sh" --offline --local-catalog-file "$WORK/none.conf" 2>&1)" || true
+grep -Eq '^GitHub Copilot CLI +brew .* yes$' <<< "$out" && pass "brew Copilot is covered" || fail "copilot brew coverage: $out"
+out="$(PATH="$WORK/caskbin:$PATH" "$UPD" --targets copilot 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'upgrade --cask copilot-cli' "$WORK/brew-calls.log" && pass "installed brew Copilot is upgraded" || fail "copilot brew update: rc=$rc $out"
+npm_installs_before="$(grep -c '^install -g @github/copilot' "$WORK/npm-calls.log" || true)"
+out="$(PATH="$WORK/caskbin:$PATH" "$UPD" --targets copilot --install-missing 2>&1)" || true
+[[ "$(grep -c '^install -g @github/copilot' "$WORK/npm-calls.log" || true)" == "$npm_installs_before" ]] && pass "Copilot stays on the brew channel" || fail "copilot channel changed: $out"
+
+echo "# shared npm/Homebrew prefix: Caskroom ownership wins; standalone agy is not brew"
+SHARED="$WORK/sharedprefix"
+mkdir -p "$SHARED/bin" "$SHARED/lib/node_modules" "$SHARED/Caskroom/codex/0.1/bin"
+printf '#!/bin/sh\necho "codex-cli 0.1.0"\n' > "$SHARED/Caskroom/codex/0.1/bin/codex"
+chmod +x "$SHARED/Caskroom/codex/0.1/bin/codex"
+ln -sfn "$SHARED/Caskroom/codex/0.1/bin/codex" "$SHARED/bin/codex"
+printf '#!/bin/sh\necho "agy 1.0.0"\n' > "$SHARED/bin/agy"
+chmod +x "$SHARED/bin/agy"
+: > "$WORK/brew-calls.log"
+out="$(FAKE_NPM_PREFIX="$SHARED" FAKE_NPM_ROOT="$SHARED/lib/node_modules" FAKE_BREW_PREFIX="$SHARED" PATH="$SHARED/bin:$WORK/fakebin:$PATH" "$ROOT/bin/inventory_ai_clis.sh" --offline --local-catalog-file "$WORK/none.conf" 2>&1)" || true
+grep -Eq '^OpenAI Codex +brew .* yes$' <<< "$out" && pass "shared-prefix Caskroom Codex is brew" || fail "shared prefix brew: $out"
+grep -Eq '^Antigravity CLI +standalone .* yes$' <<< "$out" && pass "shared-prefix agy is standalone, not brew" || fail "shared prefix agy: $out"
+out="$(FAKE_NPM_PREFIX="$SHARED" FAKE_NPM_ROOT="$SHARED/lib/node_modules" FAKE_BREW_PREFIX="$SHARED" PATH="$SHARED/bin:$WORK/fakebin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 ]] && grep -qx 'upgrade --cask codex' "$WORK/brew-calls.log" && pass "shared-prefix Caskroom Codex is updated through brew" || fail "shared prefix update: rc=$rc $out"
+! grep -q '@openai/codex' <<< "$(calls)" && pass "shared-prefix Codex is not treated as npm" || fail "shared prefix npm: $(calls)"
+
+# Regression: short-lived alias producers must not overlap while the captured updater keeps
+# walking the recovery catalog. Repeats also prove Caskroom stays on brew in a shared npm prefix.
+repeat_ok=true
+for repeat in 1 2 3 4; do
+  out="$(FAKE_NPM_PREFIX="$SHARED" FAKE_NPM_ROOT="$SHARED/lib/node_modules" FAKE_BREW_PREFIX="$SHARED" PATH="$SHARED/bin:$WORK/fakebin:$PATH" "$UPD" --targets codex 2>&1)" && rc=0 || rc=$?
+  [[ "$rc" == 0 ]] || { repeat_ok=false; fail "repeated captured updater $repeat: rc=$rc $out"; }
+done
+[[ "$repeat_ok" == true && "$(grep -cx 'upgrade --cask codex' "$WORK/brew-calls.log")" == 5 ]] && pass "five captured updates preserve the shared-prefix brew route" || fail "repeated brew route"
+! grep -q '@openai/codex' <<< "$(calls)" && pass "repeated brew updates never install the hidden npm Codex" || fail "repeat selected npm instead of brew"
+
+# A list can end with a false alias condition and still contain valid candidates.
+for alias_kind in amp opencode; do
+  case "$alias_kind" in amp) alias_pkg=@sourcegraph/amp; expected=$'@sourcegraph/amp\n@ampcode/cli' ;; *) alias_pkg=opencode-ai; expected=$'opencode-ai\n@opencode/cli' ;; esac
+  rc=0
+  # shellcheck disable=SC2016 # literal inner shell, not the test's arrays
+  out="$(/bin/bash -c '. "$1/lib/aicm-common.sh"; AICM_CLI_ID=("$2"); AICM_CLI_NPM=("$3"); aicm_cli_npm_names 0' _ "$ROOT" "$alias_kind" "$alias_pkg")" || rc=$?
+  [[ "$rc" == 0 && "$out" == "$expected" ]] && pass "$alias_kind legacy list returns success and preserves canonical fallback" || fail "alias list $alias_kind: rc=$rc $out"
+done
 
 echo "# bad catalog"
 printf 'Bad Id | x | x |  |  |  |  |\n' > "$WORK/bad.conf"

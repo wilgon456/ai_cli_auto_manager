@@ -10,6 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Verify release manifest
+        run: python3 scripts/check_manifest.py
+      - name: Release packaging tests
+        run: python3 tests/release_packaging_test.py
+      - name: Build source archives from the manifest (not published)
+        run: |
+          python3 scripts/build_release.py --output-dir "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release" && sha256sum -c SHA256SUMS
       - name: ShellCheck
         run: shellcheck -x bin/aicm bin/*.sh lib/*.sh tests/*.sh
 
@@ -21,6 +29,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Use the bash 3.2 that ships with macOS
         if: runner.os == 'macOS'
         run: |
@@ -32,22 +43,35 @@ jobs:
         run: bash tests/clean_test.sh
       - name: Live SQLite and symlink ancestor regressions
         run: python3 tests/cleanup_safety_test.py
+      - name: Cache budget rules and byte sums above 2 GiB
+        run: bash tests/cache_budget_test.sh
+      - name: Cache budget engine (PowerShell 7 on ${{ runner.os }}, portable checks)
+        shell: pwsh
+        run: ./tests/cache_budget_test.ps1
       - name: Command and schedule tests
         run: bash tests/aicm_test.sh
       - name: Inventory and catalog update tests
         run: bash tests/inventory_test.sh
+      - name: npm recovery ownership regressions
+        run: python3 tests/npm_recovery_safety_test.py
       - name: Codex app-server recycle tests
         run: bash tests/codex_host_test.sh
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Worktree, config drift and process tests (Node)
+      - name: Archive, history and cleanup-scope tests
+        run: bash tests/maintenance_integration_test.sh
+      - name: Update verify
+        run: bash tests/update_verify_test.sh
+      - name: Per-CLI update policy tests
+        run: bash tests/update_policy_test.sh
+      - name: Worktree, config drift, process, optimize and boundary tests (Node)
         run: node --test tests/node/*.test.js
 
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Cleanup tests (Windows PowerShell 5.1)
         shell: powershell
         run: .\tests\clean_test.ps1
@@ -57,6 +81,21 @@ jobs:
       - name: Inventory and catalog update tests (Windows PowerShell 5.1)
         shell: powershell
         run: .\tests\inventory_test.ps1
+      - name: Cleanup JSON runtime (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\maintenance_json_test.ps1
+      - name: Per-CLI update policy tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\update_policy_test.ps1
+      - name: AICM_HOME ownership and purge tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\home_ownership_test.ps1
+      - name: Korean profile, clone and npm prefix paths (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\unicode_paths_test.ps1
+      - name: Cache budget rules and FileGuard (Windows PowerShell 5.1)
+        shell: powershell
+        run: .\tests\cache_budget_test.ps1
       - name: Cleanup tests (PowerShell 7)
         shell: pwsh
         run: .\tests\clean_test.ps1
@@ -66,12 +105,26 @@ jobs:
       - name: Inventory and catalog update tests (PowerShell 7)
         shell: pwsh
         run: .\tests\inventory_test.ps1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - name: Worktree, config drift and process tests (Node)
+      - name: Cleanup JSON runtime (PowerShell 7)
         shell: pwsh
-        run: node --test tests/node/worktrees.test.js tests/node/config-drift.test.js tests/node/processes.test.js
+        run: .\tests\maintenance_json_test.ps1
+      - name: Per-CLI update policy tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\update_policy_test.ps1
+      - name: AICM_HOME ownership and purge tests (PowerShell 7)
+        shell: pwsh
+        run: .\tests\home_ownership_test.ps1
+      - name: Korean profile, clone and npm prefix paths (PowerShell 7)
+        shell: pwsh
+        run: .\tests\unicode_paths_test.ps1
+      - name: Cache budget rules and FileGuard (PowerShell 7)
+        shell: pwsh
+        run: .\tests\cache_budget_test.ps1
+      - name: Worktree, config drift, process, optimize and boundary tests (Node)
+        shell: pwsh
+        run: |
+          $nodeTests = @(Get-ChildItem -Path tests/node -Filter *.test.js | ForEach-Object { $_.FullName })
+          node --test @nodeTests
       - name: PSScriptAnalyzer errors
         shell: pwsh
         run: |

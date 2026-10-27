@@ -62,6 +62,40 @@ test('command line: pick and candidates read the npm view file', () => {
   }
 });
 
+test('Amp git-describe stable train is kept; betas and versions above latest are not', () => {
+  const amp = {
+    name: '@ampcode/cli',
+    time: {
+      created: daysAgo(400), modified: daysAgo(0),
+      '0.0.1792700000-gabc123': daysAgo(10),
+      '0.0.1792800065-ga5b55b': daysAgo(2),
+      '0.0.1792600000-beta.1': daysAgo(12),
+      '0.0.1792900000-gffff': daysAgo(10),
+      '0.0.1792500000-gaaaaaa': daysAgo(20),
+    },
+    'dist-tags': { latest: '0.0.1792800065-ga5b55b' },
+    versions: [
+      '0.0.1792500000-gaaaaaa',
+      '0.0.1792600000-beta.1',
+      '0.0.1792700000-gabc123',
+      '0.0.1792800065-ga5b55b',
+      '0.0.1792900000-gffff',
+    ],
+  };
+  assert.deepStrictEqual(candidatesOf(amp, 3, NOW), ['0.0.1792700000-gabc123', '0.0.1792500000-gaaaaaa']);
+  assert.deepStrictEqual(candidatesOf(amp, 0, NOW), ['0.0.1792800065-ga5b55b', '0.0.1792700000-gabc123', '0.0.1792500000-gaaaaaa']);
+  assert.deepStrictEqual(candidatesOf({ ...amp, name: '@sourcegraph/amp' }, 3, NOW), ['0.0.1792700000-gabc123', '0.0.1792500000-gaaaaaa']);
+  assert.deepStrictEqual(candidatesOf({ ...amp, name: 'unrelated-package' }, 0, NOW), [], 'the exception is limited to Amp');
+  assert.deepStrictEqual(candidatesOf({ ...amp, name: undefined }, 0, NOW), [], 'unknown callers keep rejecting prereleases');
+});
+
+test('git suffixes on ordinary semver and ambiguous Amp timestamps remain excluded', () => {
+  const versions = ['1.2.3-gabcdef', '0.0.1792800065-g111111', '0.0.1792800065-ga5b55b'];
+  const data = { name: '@ampcode/cli', versions, time: Object.fromEntries(versions.map((v) => [v, daysAgo(10)])),
+    'dist-tags': { latest: '0.0.1792800065-ga5b55b' } };
+  assert.deepStrictEqual(candidatesOf(data, 3, NOW), ['0.0.1792800065-ga5b55b']);
+});
+
 test('red flags: lost provenance and new install scripts', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'npm-guard-'));
   try {
