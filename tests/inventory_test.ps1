@@ -37,6 +37,9 @@ function New-NpmCli([string]$Command, [string]$Package, [string]$Version) {
   $pkgDir = Join-Path $npmRoot $rel
   "console.log('$Command ' + require('./package.json').version)" |
     Set-Content -LiteralPath (Join-Path $pkgDir 'cli.js') -Encoding ASCII
+  $payload = Join-Path "$work\package-payloads" $rel
+  New-Item -ItemType Directory -Path $payload -Force | Out-Null
+  Copy-Item -LiteralPath (Join-Path $pkgDir 'cli.js') -Destination $payload -Force
   # A real npm global .cmd calls the package script directly, so ownership detection can read the
   # node_modules reference instead of guessing from the prefix.
   "@node `"%~dp0node_modules\$rel\cli.js`" %*" | Set-Content -LiteralPath "$prefix\$Command.cmd" -Encoding ASCII
@@ -402,6 +405,9 @@ try {
     Invoke-FakeNpm @('install', '-g', "$Package@$Version")
     $pkgDir = Join-Path $npmRoot ($Package -replace '/', '\')
     @('@echo off', "echo amp $Version") | Set-Content -LiteralPath (Join-Path $pkgDir 'amp.cmd') -Encoding ASCII
+    $payload = Join-Path "$work\package-payloads" ($Package -replace '/', '\')
+    New-Item -ItemType Directory -Path $payload -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $pkgDir 'amp.cmd') -Destination $payload -Force
     return $pkgDir
   }
   $ampDir = New-AmpOwned '@ampcode/cli' '1.0.0'

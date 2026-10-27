@@ -738,7 +738,7 @@ test('maintenance', { concurrency: false }, async (t) => {
     const fx = fresh();
     const win = process.platform === 'win32';
     const script = path.join(__dirname, '..', '..', 'bin', win ? 'clean_ai_leftovers.ps1' : 'clean_ai_leftovers.sh');
-    const engine = win ? 'powershell.exe' : '/bin/bash';
+    const engine = win ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : '/bin/bash';
     const childArgs = win ? ['-NoProfile', '-NonInteractive', '-File', script, '--dry-run'] : [script, '--dry-run'];
     const origSpawn = cp.spawnSync;
     withEnv(fx.env, () => {

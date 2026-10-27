@@ -135,7 +135,7 @@ try {
   Put (P @($own, 'inventory.md')) "# AI CLI inventory - test`r`n"
   Put (P @($own, 'hooks', 'post-update.ps1')) 'Write-Host hi'
   $before = Get-Snapshot $own
-  $out = Invoke-AicmPurge $own -DryRun 6>&1 | Out-String
+  $out = Invoke-AicmPurge $own -DryRun 6>&1 | Out-String -Width 4096
   if ((Get-Snapshot $own) -eq $before -and $out -match 'would remove .*update-20240101-000000\.log' -and $out -match 'logs.personal\.txt' -and $out -match 'would remove 1 archived files' -and $out -match '20200101.personal\.txt \(not in the archive index\)' -and $out -match 'nothing was changed') { Pass 'purge -DryRun lists what goes and stays and changes nothing' } else { Fail "purge dry run: $out" }
   $out = Invoke-AicmPurge $own 6>&1 | Out-String
   $keptOk = $true

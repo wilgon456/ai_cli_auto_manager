@@ -37,7 +37,7 @@ function Invoke-Child([string[]]$PsArguments) {
     $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_WORKTREES = '0'; $env:AICM_TASK_PATH = $taskPath
     $env:HOME = $fakeHome; $env:CODEX_HOME = "$fakeHome\.codex"; $env:PATH = $runtimePath
     $ErrorActionPreference = 'Continue'
-    $output = & $exe -NoProfile -ExecutionPolicy Bypass @PsArguments 2>&1 | Out-String
+    $output = & $exe -NoProfile -ExecutionPolicy Bypass @PsArguments 2>&1 | Out-String -Width 4096
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
   } finally {
     foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
@@ -328,10 +328,10 @@ try {
   $r = Invoke-Aicm @('uninstall', '-Purge', '-DryRun')
   $homeAfter = (Get-ChildItem -LiteralPath $aicmHome -Recurse -Force | Sort-Object FullName | ForEach-Object { if ($_ -is [IO.FileInfo]) { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } else { "directory|$($_.FullName)" } }) -join ';'
   $tasks = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)
-  if ($r.ExitCode -eq 0 -and $homeAfter -eq $homeBefore -and $tasks.Count -eq 3 -and $r.Output -match 'would remove: ' -and $r.Output -match 'would remove installed copy' -and $r.Output -match 'logs\\personal\.txt') { Pass 'uninstall -Purge -DryRun lists everything and changes nothing' } else { Fail "purge dry run: $($r.ExitCode) tasks=$($tasks.Count) $($r.Output)" }
+  if ($r.ExitCode -eq 0 -and $homeAfter -eq $homeBefore -and $tasks.Count -eq 4 -and $r.Output -match 'would remove: ' -and $r.Output -match 'would remove installed copy' -and $r.Output -match 'logs\\personal\.txt') { Pass 'uninstall -Purge -DryRun lists everything and changes nothing' } else { Fail "purge dry run: $($r.ExitCode) tasks=$($tasks.Count) $($r.Output)" }
   Set-Content -LiteralPath "$aicmHome\app\personal.txt" -Value 'mine'
   $r = Invoke-Aicm @('uninstall')
-  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$aicmHome\app\personal.txt") -and @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue).Count -eq 3) { Pass 'uninstall refuses a copy holding personal files before changing anything' } else { Fail "uninstall with personal app file: $($r.Output)" }
+  if ($r.ExitCode -ne 0 -and (Test-Path -LiteralPath "$aicmHome\app\personal.txt") -and @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue).Count -eq 4) { Pass 'uninstall refuses a copy holding personal files before changing anything' } else { Fail "uninstall with personal app file: $($r.Output)" }
   Remove-Item -LiteralPath "$aicmHome\app\personal.txt"
   $r = Invoke-Aicm @('uninstall', '-Purge')
   if ((Test-Path -LiteralPath "$aicmHome\logs\personal.txt") -and -not (Test-Path -LiteralPath "$aicmHome\app") -and -not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'uninstall -Purge keeps a personal log file' } else { Fail "purge personal log: $($r.Output)" }

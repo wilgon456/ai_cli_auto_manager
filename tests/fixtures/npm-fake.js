@@ -50,6 +50,9 @@ function manifest(name, version) {
 function writePackage(nodeModules, name, version) {
   const d = path.join(nodeModules, ...name.split('/'));
   fs.mkdirSync(d, { recursive: true });
+  // Optional fixture tarball contents: a reinstall must recreate the executable as real npm does.
+  const payload = path.join(dir, 'package-payloads', ...name.split('/'));
+  if (fs.existsSync(payload)) fs.cpSync(payload, d, { recursive: true });
   fs.writeFileSync(path.join(d, 'package.json'), JSON.stringify({ name, version }, null, 2));
 }
 

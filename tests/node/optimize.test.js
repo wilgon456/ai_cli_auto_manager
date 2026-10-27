@@ -183,10 +183,7 @@ test('the busy check ignores this optimizer but retains package-manager ancestor
     { pid: 22, ppid: 1, name: 'node', cmd: 'node C:\\npm\\node_modules\\npm\\bin\\npx-cli.js cowsay' },
     { pid: 23, ppid: 1, name: 'vim', cmd: 'vim npm-notes.txt' },
   ];
-  const fakePpid = Object.getOwnPropertyDescriptor(process, 'ppid');
-  Object.defineProperty(process, 'ppid', { value: 11, configurable: true });
-  let mine;
-  try { mine = opt.ownChain(list); } finally { Object.defineProperty(process, 'ppid', fakePpid); }
+  const mine = opt.ownChain(list, process.pid, 11);
   assert.ok(mine.has(10) && mine.has(11) && mine.has(process.pid));
   const npm = opt.TASKS.find((t) => t.id === 'npm-verify');
   assert.deepEqual(opt.busyPids(npm, list, mine), [10, 22]);

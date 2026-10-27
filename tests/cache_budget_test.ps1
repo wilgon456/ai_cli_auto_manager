@@ -169,7 +169,13 @@ try {
     try {
       $env:USERPROFILE = $fakeHome; $env:HOME = $fakeHome; $env:AICM_HOME = $aicmHome; $env:AICM_NOTIFY = '0'; $env:AICM_WORKTREES = '0'; $env:AICM_PROCESSES = '0'; $env:AICM_CLOCK_CHECK = '0'
       $exe = (Get-Process -Id $PID).Path
+      # Windows PowerShell turns native stderr into ErrorRecords even when redirected.
+      $savedPreference = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
       $out = & $exe -NoProfile -ExecutionPolicy Bypass -File (P @($root, 'bin', 'clean_ai_leftovers.ps1')) -RulesFile $rules -LocalRulesFile (P @($work, 'none.conf')) -Json 2>$null | Out-String
+      $childExit = $LASTEXITCODE
+      $ErrorActionPreference = $savedPreference
+      if ($childExit -ne 0) { throw "cleanup exited ${childExit}: $out" }
       $doc = $out | ConvertFrom-Json
       $rule = @($doc.rules)[0]
       if ((Test-Path -LiteralPath (P @($c, 'held.bin'))) -and -not (Test-Path -LiteralPath (P @($c, 'old.bin'))) -and (Test-Path -LiteralPath (P @($c, 'fresh.bin')))) { Pass 'the open file is kept, the next oldest goes' } else { Fail "end to end: $out" }
