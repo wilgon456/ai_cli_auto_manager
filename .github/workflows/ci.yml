@@ -72,67 +72,41 @@ jobs:
 
   windows:
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Cleanup tests (Windows PowerShell 5.1)
-        shell: powershell
+      - name: Cleanup tests
         run: .\tests\clean_test.ps1
-      - name: Command and schedule tests (Windows PowerShell 5.1)
-        shell: powershell
+      - name: Command and schedule tests
         run: .\tests\aicm_test.ps1
-      - name: Inventory and catalog update tests (Windows PowerShell 5.1)
-        shell: powershell
+      - name: Inventory and catalog update tests
         run: .\tests\inventory_test.ps1
-      - name: Cleanup JSON runtime (Windows PowerShell 5.1)
-        shell: powershell
+      - name: Cleanup JSON runtime
         run: .\tests\maintenance_json_test.ps1
-      - name: Per-CLI update policy tests (Windows PowerShell 5.1)
-        shell: powershell
+      - name: Per-CLI update policy tests
         run: .\tests\update_policy_test.ps1
-      - name: AICM_HOME ownership and purge tests (Windows PowerShell 5.1)
-        shell: powershell
+      - name: AICM_HOME ownership and purge tests
         run: .\tests\home_ownership_test.ps1
-      - name: Korean profile, clone and npm prefix paths (Windows PowerShell 5.1)
-        shell: powershell
+      - name: Korean profile, clone and npm prefix paths
         run: .\tests\unicode_paths_test.ps1
-      - name: Cache budget rules and FileGuard (Windows PowerShell 5.1)
-        shell: powershell
-        run: .\tests\cache_budget_test.ps1
-      - name: Cleanup tests (PowerShell 7)
-        shell: pwsh
-        run: .\tests\clean_test.ps1
-      - name: Command and schedule tests (PowerShell 7)
-        shell: pwsh
-        run: .\tests\aicm_test.ps1
-      - name: Inventory and catalog update tests (PowerShell 7)
-        shell: pwsh
-        run: .\tests\inventory_test.ps1
-      - name: Cleanup JSON runtime (PowerShell 7)
-        shell: pwsh
-        run: .\tests\maintenance_json_test.ps1
-      - name: Per-CLI update policy tests (PowerShell 7)
-        shell: pwsh
-        run: .\tests\update_policy_test.ps1
-      - name: AICM_HOME ownership and purge tests (PowerShell 7)
-        shell: pwsh
-        run: .\tests\home_ownership_test.ps1
-      - name: Korean profile, clone and npm prefix paths (PowerShell 7)
-        shell: pwsh
-        run: .\tests\unicode_paths_test.ps1
-      - name: Cache budget rules and FileGuard (PowerShell 7)
-        shell: pwsh
+      - name: Cache budget rules and FileGuard
         run: .\tests\cache_budget_test.ps1
       - name: Worktree, config drift, process, optimize and boundary tests (Node)
-        shell: pwsh
         run: |
           $nodeTests = @(Get-ChildItem -Path tests/node -Filter *.test.js | ForEach-Object { $_.FullName })
           node --test @nodeTests
       - name: PSScriptAnalyzer errors
-        shell: pwsh
+        if: matrix.shell == 'pwsh'
         run: |
           $found = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
           $found | Format-Table -AutoSize | Out-String | Write-Host

@@ -476,7 +476,7 @@ exit 0
   New-TestFile "$codexHome\.tmp\cat-only.bin" 40
   New-TestFile "$aicmHome\archive\codex-images\20200103\old.png" 2000
   $r = Invoke-Clean @('-Explain', '-Category', 'temp')
-  if ($r.Output -match 'codex-tmp\tcategory=temp\t' -and $r.Output -match 'age=7\taction=delete' -and $r.Output -notmatch 'gemini-tmp') { Pass 'explain shows temp age and action' } else { Fail "explain: $($r.Output)" }
+  if ($r.Output -match 'codex-tmp\tcategory=temp\t' -and $r.Output -match 'age=7\tlimit=0\taction=delete' -and $r.Output -notmatch 'gemini-tmp') { Pass 'explain shows temp age, size limit and action' } else { Fail "explain: $($r.Output)" }
   $null = Invoke-Clean @('-Category', 'temp')
   Expect-Gone "$codexHome\.tmp\cat-only.bin" 'category temp removes temp files'
   Expect-Exists "$fakeHome\.gemini\tmp\chat\old.json" 'gemini chats are sessions, not temp'

@@ -874,7 +874,7 @@ case "$cmd" in
     exec node "$AICM_ROOT/lib/maintenance-cli.js" "$cmd" "$@"
     ;;
   run)
-    [[ "${1:-}" == -- ]] || { echo 'usage: aicm run -- command [args...]' >&2; exit 2; }
+    [[ "${1:-}" == -- && $# -ge 2 ]] || { echo 'usage: aicm run -- command [args...]' >&2; exit 2; }
     aicm_claim_home || exit 1
     exec node "$AICM_ROOT/lib/supervise.js" "$@" ;;
   maintenance) maintenance_run "$@" ;;

@@ -552,8 +552,8 @@ switch ($Command) {
   }
   'config' { $null = Invoke-AicmNodeModule 'config-drift' @() }
   'run' {
-    Confirm-AicmHome
     if (-not $Cli) { throw 'run needs -Cli command [-CliArguments args]' }
+    Confirm-AicmHome
     Initialize-AicmProcessContainment -WholeProcess
     & $Cli @CliArguments
     exit $LASTEXITCODE
