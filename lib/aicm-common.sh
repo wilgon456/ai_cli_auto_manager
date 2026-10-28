@@ -616,7 +616,7 @@ aicm_state_file_owned() {
   case "$1" in .weekly-due.[0-9]*|.schedule-time.[0-9]*) return 0 ;; esac
   case "$n" in
     last-update.json|last-clean.json|last-maintenance.json|inventory.json|schedule.json|npm-verdicts.json|npm-verdicts.tsv) return 0 ;;
-    update-running.json|update-npm.json|update-npm.tsv|update-deferred.json|inventory-error.json) return 0 ;;
+    update-running.json|update-npm.json|update-npm.tsv|update-deferred.json|update-deferred.tsv|inventory-error.json) return 0 ;;
     inventory.tsv|inventory-shadow.txt|config-drift.json|processes.json|worktrees.json|*-attention.json) return 0 ;;
     attention-*.tsv|attention-*.json) return 0 ;;
   esac

@@ -274,6 +274,20 @@ out="$(run_update --targets pincli 2>&1)" && rc=0 || rc=$?
 grep -q '^install -g @fake/pin@1.2.3' "$WORK/npm.log" && pass "install used the exact pin" || fail "install: $(cat "$WORK/npm.log")"
 ! grep -Eq '@fake/pin@(2\.0\.0|latest)' "$WORK/npm.log" && pass "pin did not fall back to latest" || fail "latest was used"
 
+echo "# a running npm CLI also defers an exact pinned update"
+fresh_home
+new_npm_cli pincli @fake/pin
+write_policy '{"schemaVersion":1,"tools":{"pincli":{"pin":"1.2.3","minReleaseAgeDays":7}}}'
+printf '#!/usr/bin/env perl\nsleep 120;\n' > "$NPM_ROOT/@fake/pin/serve.pl"
+chmod +x "$NPM_ROOT/@fake/pin/serve.pl"
+ln -sfn "$NPM_ROOT/@fake/pin/serve.pl" "$PREFIX/bin/pinserve"
+pinserve & srv=$!
+out="$(run_update --targets pincli 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && "$(row pincli status)" == deferred && "$(row pincli reason)" == "is running"* ]] && pass "running pinned CLI is deferred" || fail "running pin rc=$rc $(row pincli status) $(row pincli reason) $out"
+! grep -q 'install -g @fake/pin' "$WORK/npm.log" && pass "the pinned update does not overwrite a running CLI" || fail "running pin installed"
+kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
+rm -f "$PREFIX/bin/pinserve" "$NPM_ROOT/@fake/pin/serve.pl"
+
 echo "# pin holds: too young, missing, deprecated, downgrade"
 fresh_home
 new_npm_cli pincli @fake/pin
@@ -328,7 +342,7 @@ fresh_home
 new_cli solocli
 write_policy '{"schemaVersion":1,"tools":{"solocli":{"pin":"1.2.3"}}}'
 out="$(run_update --targets solocli 2>&1)" && rc=0 || rc=$?
-[[ "$(row solocli status)" == skipped && "$(row solocli reason)" == *"requires the npm install route"* ]] && pass "pin on a self-update route is held" || fail "solocli pin: $(row solocli status) $(row solocli reason)"
+[[ "$(row solocli status)" == skipped && "$(row solocli reason)" == *"requires the npm install route"* ]] && pass "pin on a self-update route is held" || fail "solocli pin rc=$rc: $(row solocli status) $(row solocli reason) $out"
 ! grep -q solocli "$WORK/upgrade.log" && pass "held self-update was not invoked" || fail "held self-update ran"
 
 fresh_home

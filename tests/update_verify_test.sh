@@ -27,6 +27,13 @@ cat > "$WORK/fake-npm" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$WORK/npm.log"
 if [[ "\${FAKE_NPM_OFFLINE:-}" == 1 && "\${1:-}" == ping ]]; then exit 1; fi
+if [[ "\${FAKE_NPM_DELAY_GUARD:-}" == 1 && "\${1:-}" == install && "\${2:-}" == @fake/pend@* && "\$*" == *--prefix* ]]; then
+  : > "$WORK/guard-ready"
+  for ((i = 0; i < 200; i++)); do
+    [[ -f "$WORK/guard-continue" ]] && break
+    sleep 0.1
+  done
+fi
 case "\${1:-}" in
   prefix) echo "$PREFIX" ;;
   root) echo "$FAKE_NPM_ROOT" ;;
@@ -252,6 +259,111 @@ out="$(FAKE_NPM_OFFLINE=1 "${UPD[@]}" pendcli,solocli 2>&1)" && rc=0 || rc=$?
 [[ "$rc" == 0 && "$(row pendcli status)" == deferred && "$(row pendcli reason)" == pending ]] && pass "offline npm update is deferred with reason pending" || fail "pending rc=$rc $(row pendcli status) $(row pendcli reason) $out"
 [[ "$(row solocli status)" == unchanged && -z "$(row solocli reason)" ]] && pass "a CLI that was not held is not given a fabricated pending result" || fail "solo $(row solocli status) $(row solocli reason)"
 python3 -c 'import json,sys; raise SystemExit(0 if json.load(open(sys.argv[1]))["pending"] else 1)' "$AICM_HOME/state/last-update.json" && pass "run stays pending" || fail "pending flag"
+
+echo "# a running npm CLI is deferred, not overwritten"
+cat > "$FAKE_NPM_ROOT/@fake/pend/serve.sh" <<'EOF'
+#!/usr/bin/env bash
+trap 'kill "$child" 2>/dev/null || true' TERM
+sleep 120 & child=$!
+wait "$child"
+EOF
+# Like node, perl closes its script after reading it: only the link in the command line shows it.
+printf '#!/usr/bin/env perl\nsleep 120;\n' > "$FAKE_NPM_ROOT/@fake/pend/serve.pl"
+chmod +x "$FAKE_NPM_ROOT/@fake/pend/serve.sh" "$FAKE_NPM_ROOT/@fake/pend/serve.pl"
+ln -sfn "$FAKE_NPM_ROOT/@fake/pend/serve.pl" "$PREFIX/bin/pendserve"
+installs() { grep -c 'install -g @fake/pend@' "$WORK/npm.log" 2>/dev/null || true; }
+NPMRUN=(env AICM_MIN_RELEASE_AGE_DAYS=0 AICM_VERIFY_SIGNATURES=0 "${UPD[@]}" pendcli)
+rm -f "$WORK/npm.log"
+bash "$FAKE_NPM_ROOT/@fake/pend/serve.sh" & srv=$!
+out="$("${NPMRUN[@]}" 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && "$(row pendcli status)" == deferred && "$(row pendcli reason)" == "is running (1 processes, e.g. bash pid $srv)" ]] && pass "a process started from the package folder defers the update" || fail "folder rc=$rc $(row pendcli status) $(row pendcli reason) $out"
+[[ "$(installs)" == 0 ]] && grep -q "deferred: @fake/pend is running" <<< "$out" && pass "nothing is installed over the running CLI" || fail "folder installs=$(installs)"
+python3 -c 'import json,sys; raise SystemExit(0 if json.load(open(sys.argv[1]))["pending"] else 1)' "$AICM_HOME/state/last-update.json" && pass "a deferred run stays pending so the retry runs" || fail "deferred pending flag"
+[[ "$(cut -f1 "$AICM_HOME/state/update-deferred.tsv")" == @fake/pend ]] && pass "the deferral start is remembered" || fail "deferred state $(cat "$AICM_HOME/state/update-deferred.tsv" 2>/dev/null)"
+kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
+
+pendserve & srv=$!
+out="$("${NPMRUN[@]}" 2>&1)" && rc=0 || rc=$?
+[[ "$(row pendcli status)" == deferred && "$(installs)" == 0 ]] && pass "a script started through its npm bin link defers the update" || fail "link $(row pendcli status) installs=$(installs) $out"
+
+first="$(cut -f2 "$AICM_HOME/state/update-deferred.tsv")"
+"${UPD[@]}" solocli >/dev/null 2>&1 || true
+[[ "$(cut -f2 "$AICM_HOME/state/update-deferred.tsv")" == "$first" ]] && pass "an unrelated targeted update preserves the deferral" || fail "targeted run lost deferral"
+FAKE_NPM_OFFLINE=1 "${NPMRUN[@]}" >/dev/null 2>&1 || true
+[[ "$(cut -f2 "$AICM_HOME/state/update-deferred.tsv")" == "$first" ]] && pass "an offline update preserves the deferral" || fail "offline run lost deferral"
+
+# Two-column state from previous versions remains readable.
+printf '@fake/pend\t%s\n' "$(( $(date +%s) - 6 * 86400 ))" > "$AICM_HOME/state/update-deferred.tsv"
+rm -f "$AICM_HOME/state/attention-update.tsv"
+"${NPMRUN[@]}" >/dev/null 2>&1 || true
+reminder='@fake/pend has been deferred for at least 5 days because it was running'
+grep -qF "$reminder" "$AICM_HOME/state/attention-update.tsv" 2>/dev/null && pass "a CLI deferred for 5 days raises one reminder" || fail "no 5-day reminder"
+[[ "$(cut -f2 "$AICM_HOME/state/update-deferred.tsv")" -le "$(( $(date +%s) - 5 * 86400 ))" ]] && pass "the first deferral time is kept across runs" || fail "deferral time reset"
+reminders="$(grep -cF "$reminder" "$AICM_HOME/logs/notifications.log" || true)"
+"${UPD[@]}" solocli >/dev/null 2>&1 || true
+"${NPMRUN[@]}" >/dev/null 2>&1 || true
+[[ "$(grep -cF "$reminder" "$AICM_HOME/logs/notifications.log" || true)" == "$reminders" ]] && pass "a lasting deferral is reminded only once across partial runs" || fail "deferral reminded again"
+
+out="$(AICM_DEFER_RUNNING=0 "${NPMRUN[@]}" 2>&1)" && rc=0 || rc=$?
+[[ "$(installs)" == 1 && "$(row pendcli status)" != deferred ]] && pass "AICM_DEFER_RUNNING=0 updates a running CLI" || fail "opt-out installs=$(installs) $(row pendcli status) $out"
+kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
+
+# Node can replace its entire visible command line with a process title and close the script.
+printf 'process.title = "pendtitle"; setTimeout(() => {}, 120000);\n' > "$FAKE_NPM_ROOT/@fake/pend/title.js"
+ln -sfn "$FAKE_NPM_ROOT/@fake/pend/title.js" "$PREFIX/bin/pendtitle"
+rm -f "$WORK/npm.log"
+"$AICM_TEST_NODE_RUNTIME" "$PREFIX/bin/pendtitle" & srv=$!
+sleep 1
+out="$("${NPMRUN[@]}" 2>&1)" && rc=0 || rc=$?
+[[ "$(row pendcli status)" == deferred && "$(installs)" == 0 ]] && pass "a retitled Node CLI defers the update" || fail "retitled $(row pendcli status) installs=$(installs) $out"
+kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
+
+# A visible executable path outside the npm package is not treated as a bare matching title.
+"$AICM_TEST_NODE_RUNTIME" -e 'process.title = process.argv[1]; setTimeout(() => {}, 120000)' "$WORK/elsewhere/pendtitle" & srv=$!
+sleep 1
+out="$("${NPMRUN[@]}" 2>&1)" && rc=0 || rc=$?
+[[ "$(row pendcli status)" != deferred && "$(installs)" == 1 ]] && pass "an unrelated explicit path with the same basename does not defer" || fail "other path $(row pendcli status) installs=$(installs) $out"
+kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
+rm -f "$PREFIX/bin/pendtitle" "$FAKE_NPM_ROOT/@fake/pend/title.js"
+
+# A CLI starting during the potentially slow release checks is detected just before installation.
+rm -f "$WORK/npm.log" "$WORK/guard-ready" "$WORK/guard-continue" "$AICM_HOME/state/npm-verdicts.tsv"
+env FAKE_NPM_DELAY_GUARD=1 AICM_MIN_RELEASE_AGE_DAYS=0 AICM_VERIFY_SIGNATURES=1 "${UPD[@]}" pendcli > "$WORK/race.out" 2>&1 & update_pid=$!
+for ((i = 0; i < 200; i++)); do [[ -f "$WORK/guard-ready" ]] && break; sleep 0.1; done
+if [[ -f "$WORK/guard-ready" ]]; then
+  bash "$FAKE_NPM_ROOT/@fake/pend/serve.sh" & srv=$!
+  sleep 1
+  : > "$WORK/guard-continue"
+  wait "$update_pid" || true
+  [[ "$(row pendcli status)" == deferred && "$(installs)" == 0 ]] && pass "a CLI started during release checks is deferred" || fail "late start $(row pendcli status) installs=$(installs) $(cat "$WORK/race.out")"
+  kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
+else
+  : > "$WORK/guard-continue"
+  wait "$update_pid" || true
+  fail "release-check fixture did not reach the pause: $(cat "$WORK/race.out")"
+fi
+
+# A renamed native process shows neither the folder, the link nor its basename; lsof finds the file.
+if command -v cc >/dev/null 2>&1 && { command -v lsof >/dev/null 2>&1 || [[ -x /usr/sbin/lsof ]]; }; then
+  printf '#include <stdlib.h>\n#include <unistd.h>\nint main(int c, char **v) { sleep(c > 1 ? atoi(v[1]) : 30); return 0; }\n' > "$WORK/pendbin.c"
+  cc -o "$FAKE_NPM_ROOT/@fake/pend/pendbin" "$WORK/pendbin.c"
+  ln -sfn "$FAKE_NPM_ROOT/@fake/pend/pendbin" "$PREFIX/bin/pendbin"
+  rm -f "$WORK/npm.log"
+  (cd "$WORK" && exec -a aicm-native-fixture pendbin 120) & srv=$!
+  sleep 1
+  out="$("${NPMRUN[@]}" 2>&1)" && rc=0 || rc=$?
+  [[ "$(row pendcli status)" == deferred && "$(installs)" == 0 ]] && pass "an open native executable defers the update even with a different process title" || fail "native $(row pendcli status) installs=$(installs) $out"
+  kill "$srv" 2>/dev/null || true; wait "$srv" 2>/dev/null || true
+  rm -f "$PREFIX/bin/pendbin"
+else
+  echo "skip - native binary deferral (needs cc and lsof)"
+fi
+
+rm -f "$WORK/npm.log"
+out="$("${NPMRUN[@]}" 2>&1)" && rc=0 || rc=$?
+[[ "$rc" == 0 && "$(installs)" == 1 && "$(row pendcli status)" != deferred ]] && pass "a CLI that is not running is updated" || fail "idle rc=$rc installs=$(installs) $(row pendcli status) $out"
+[[ ! -s "$AICM_HOME/state/update-deferred.tsv" ]] && pass "the deferral is forgotten once the CLI was not running" || fail "deferred state kept $(cat "$AICM_HOME/state/update-deferred.tsv")"
+rm -f "$PREFIX/bin/pendserve" "$FAKE_NPM_ROOT/@fake/pend/serve.sh" "$FAKE_NPM_ROOT/@fake/pend/serve.pl" "$FAKE_NPM_ROOT/@fake/pend/pendbin"
 
 echo "# npm install exits 0 but the new command is still absent"
 printf 'freshcli | freshcli | Fresh | @fake/fresh | | | |\n' >> "$AICM_HOME/ai-clis.local.conf"

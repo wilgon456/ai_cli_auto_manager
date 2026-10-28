@@ -486,15 +486,16 @@ target_fail_reason() {
   printf '%s' "$out"
 }
 
-# "pending" when this CLI's npm package was skipped for a run-wide network hold.
-# No per-CLI reason is invented for a hold that never named the package.
+# "pending" when this CLI's npm package was skipped for a run-wide network hold, or the reason it was
+# deferred because it is running. No per-CLI reason is invented for a hold that never named the package.
 cli_pending_reason() {
-  local idx="$1" pkg names
+  local idx="$1" pkg names why
   # Finish the producer before reading: avoid nested asynchronous process substitutions
   # in this captured function on Bash 3.2. Read the buffered output in the same shell.
   names="$(aicm_cli_npm_names "$idx")" || true
   while IFS= read -r pkg; do
     [[ -n "$pkg" ]] || continue
+    if why="$(npm_deferred_reason "$pkg")"; then printf '%s' "$why"; return 0; fi
     case " $NPM_PENDING_PKGS " in
       *" $pkg "*) printf 'pending'; return 0 ;;
     esac
@@ -803,6 +804,119 @@ npm_global_install() { # spec [extra args]
   return "$rc"
 }
 
+# Processes running from global npm package $1, one "pid command" line each. npm replaces the package
+# folder in place: a session that is already running keeps the old code in memory and may later load a
+# file of the new release, so the update waits until the CLI is closed. A process counts when its
+# command line names the package folder or an npm bin link, its title starts with a bin link's bare
+# name, or lsof shows it executing a file a link points to. A CLI may rewrite its process title and
+# close its script, making the bare name the only remaining clue. That clue can also match another
+# installation of the same CLI, so it is deliberately conservative.
+npm_package_users() { # pkg
+  local pkg="$1" root prefix dir real link target links="" names="" targets=() pids="" lsof
+  aicm_npm_cache
+  root="$AICM_NPM_ROOT_CACHE"
+  [[ -n "$root" && -d "$root/$pkg" ]] || return 0
+  dir="$root/$pkg/"
+  real="$(aicm_realpath "$root/$pkg")/"
+  prefix="$AICM_NPM_PREFIX_CACHE"
+  if [[ -n "$prefix" && -d "$prefix/bin" ]]; then
+    for link in "$prefix/bin"/*; do
+      [[ -L "$link" ]] || continue
+      target="$(aicm_realpath "$link")"
+      [[ "$target" == "$real"* ]] || continue
+      links+="$link"$'\n'
+      names+="${link##*/}"$'\n'
+      [[ -f "$target" ]] && targets+=("$target")
+    done
+  fi
+  lsof="$(command -v lsof 2>/dev/null || true)"
+  [[ -z "$lsof" && -x /usr/sbin/lsof ]] && lsof=/usr/sbin/lsof
+  if ((${#targets[@]})) && [[ -n "$lsof" ]]; then
+    pids="$(aicm_timeout 15 "$lsof" -t -- "${targets[@]}" 2>/dev/null | sort -u | paste -sd ' ' -)" || true
+  fi
+  ps -A -ww -o pid= -o args= 2>/dev/null | D="$dir" R="$real" L="$links" N="$names" P=" $pids " SELF="$$" awk '
+    BEGIN { n = split(ENVIRON["L"], links, "\n"); split(ENVIRON["N"], names, "\n") }
+    {
+      line = $0; sub(/^ +/, "", line)
+      pid = line; sub(/ .*/, "", pid)
+      if (pid == ENVIRON["SELF"]) next
+      args = " " substr(line, length(pid) + 2) " "
+      first = substr(line, length(pid) + 2); sub(/[[:space:]].*/, "", first)
+      hit = index(args, ENVIRON["D"]) || index(args, ENVIRON["R"]) || index(ENVIRON["P"], " " pid " ")
+      for (i = 1; !hit && i <= n; i++) {
+        if (links[i] != "" && index(args, " " links[i] " ")) hit = 1
+        else if (names[i] != "" && index(first, "/") == 0 && first == names[i]) hit = 1
+      }
+      if (hit) print line
+    }' || true
+}
+
+# npm packages left alone this run because they are running (pkg and reason, same index).
+DEFER_PKG=(); DEFER_WHY=(); DEFER_RESOLVED=()
+DEFER_STATE="$AICM_HOME/state/update-deferred.tsv"
+
+# Returns 0 (and records the deferral) when $1 is running. AICM_DEFER_RUNNING=0 updates it anyway.
+defer_if_running() { # pkg
+  local pkg="$1" users count first pid cmd why
+  [[ "${AICM_DEFER_RUNNING:-1}" != 0 ]] || return 1
+  users="$(npm_package_users "$pkg")"
+  [[ -n "$users" ]] || return 1
+  count="$(printf '%s\n' "$users" | awk 'END { print NR }')"
+  first="${users%%$'\n'*}"; pid="${first%% *}"; cmd="${first#* }"; cmd="${cmd%% *}"
+  why="is running ($count processes, e.g. ${cmd##*/} pid $pid)"
+  echo "deferred: $pkg $why; retried on the next run"
+  DEFER_PKG+=("$pkg"); DEFER_WHY+=("$why")
+  PENDING=true
+  return 0
+}
+
+npm_deferred_reason() { # pkg
+  local i
+  for ((i = 0; i < ${#DEFER_PKG[@]}; i++)); do
+    if [[ "${DEFER_PKG[$i]}" == "$1" ]]; then printf '%s' "${DEFER_WHY[$i]}"; return 0; fi
+  done
+  return 1
+}
+
+# Preserve unresolved entries even during a partial or offline run. A successful install or a
+# confirmed current version clears the entry; the third field records that the reminder was sent.
+note_deferred_since() {
+  local now i pkg first sent record old_pkg old_first old_sent keep out=""
+  now="$(date +%s)"
+  if [[ -f "$DEFER_STATE" ]]; then
+    while IFS=$'\t' read -r old_pkg old_first old_sent; do
+      [[ -n "$old_pkg" && "$old_first" =~ ^[0-9]+$ ]] || continue
+      keep=1
+      for ((i = 0; i < ${#DEFER_RESOLVED[@]}; i++)); do
+        [[ "${DEFER_RESOLVED[$i]}" == "$old_pkg" ]] && keep=0
+      done
+      for ((i = 0; i < ${#DEFER_PKG[@]}; i++)); do
+        [[ "${DEFER_PKG[$i]}" == "$old_pkg" ]] && keep=0
+      done
+      if ((keep)); then
+        [[ "$old_sent" == 1 ]] || old_sent=0
+        out+="$old_pkg"$'\t'"$old_first"$'\t'"$old_sent"$'\n'
+      fi
+    done < "$DEFER_STATE"
+  fi
+  for ((i = 0; i < ${#DEFER_PKG[@]}; i++)); do
+    pkg="${DEFER_PKG[$i]}"
+    [[ $'\n'"$out" == *$'\n'"$pkg"$'\t'* ]] && continue
+    record=""
+    [[ -f "$DEFER_STATE" ]] && record="$(P="$pkg" awk -F '\t' '$1 == ENVIRON["P"] { print $2 "\t" $3; exit }' "$DEFER_STATE")"
+    first="${record%%$'\t'*}"; sent="${record#*$'\t'}"
+    [[ "$first" =~ ^[0-9]+$ ]] || first="$now"
+    [[ "$sent" == 1 ]] || sent=0
+    if ((now - first >= 5 * 86400 && sent == 0)); then
+      problems+=("$pkg has been deferred for at least 5 days because it was running; close its sessions for a moment or run 'aicm update' when it is idle")
+      sent=1
+    fi
+    out+="$pkg"$'\t'"$first"$'\t'"$sent"$'\n'
+  done
+  mkdir -p "$AICM_HOME/state"
+  printf '%s' "$out" > "$DEFER_STATE.$$.tmp" && mv -f "$DEFER_STATE.$$.tmp" "$DEFER_STATE"
+}
+
 update_npm_package() { # pkg [pin] [age] [id]
   local pkg="$1" pin="${2:-}" age="${3:-$MIN_RELEASE_AGE_DAYS}" id="${4:-}" installed target before hold amp="" existing
   # A hold recorded earlier in this run (for example an interrupted install kept for manual repair)
@@ -820,6 +934,7 @@ update_npm_package() { # pkg [pin] [age] [id]
     if [[ -n "$pin" ]]; then
       if [[ -n "$installed" && "$installed" == "$pin" ]]; then
         echo "already at the pinned version: $pkg $installed"
+        DEFER_RESOLVED+=("$pkg")
         return 0
       fi
       # Two Amp commit builds with the same timestamp have no trustworthy order.
@@ -850,10 +965,13 @@ update_npm_package() { # pkg [pin] [age] [id]
         return 0
       fi
       echo "candidate: $pkg $installed -> $pin (pinned)"
+      defer_if_running "$pkg" && return 0
       aicm_npm_check "$pkg" "$installed" "$pin" "$age" || return 1
       before="$(aicm_npm_before "$age")"
+      defer_if_running "$pkg" && return 0
       if npm_global_install "$pkg@$pin" ${before:+"$before"}; then
         note_install_pkg "$pkg"
+        DEFER_RESOLVED+=("$pkg")
       else
         return $?
       fi
@@ -869,13 +987,17 @@ update_npm_package() { # pkg [pin] [age] [id]
     fi
     if [[ -n "$installed" ]] && ! aicm_version_older "$installed" "$target"; then
       echo "already current: $pkg $installed (newest release at least $age days old: $target)"
+      DEFER_RESOLVED+=("$pkg")
       return 0
     fi
     echo "candidate: $pkg $installed -> $target"
+    defer_if_running "$pkg" && return 0
     aicm_npm_check "$pkg" "$installed" "$target" "$age" || return 1
     before="$(aicm_npm_before "$age")"
+    defer_if_running "$pkg" && return 0
     if npm_global_install "$pkg@$target" ${before:+"$before"}; then
       note_install_pkg "$pkg"
+      DEFER_RESOLVED+=("$pkg")
     else
       return $?
     fi
@@ -1429,6 +1551,7 @@ fi
 
 if [[ "$DRY_RUN" != "true" ]]; then
   update_ok=true; [[ -z "$failure_summary" ]] || update_ok=false
+  note_deferred_since
   # npm CLIs looked after: the next run reports one that disappears (see restore_missing_npm).
   save_npm_state
   aicm_npm_leftovers

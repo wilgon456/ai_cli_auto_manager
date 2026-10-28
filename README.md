@@ -161,7 +161,7 @@ Security fixes also arrive as updates, so a long waiting period has a cost. Thre
 
 ### Unattended runs that keep working
 
-- **A CLI that is running is not overwritten.** On Windows a running program's files cannot be replaced (npm fails with `EBUSY`), and agent sessions often run all day. Such an update is recorded as *deferred*, not failed, and the scheduled job retries every 3 hours for 15 hours; a later run on a day that already succeeded exits immediately. If a CLI stays deferred for 5 days you get one reminder to close its sessions for a moment.
+- **Updates to running npm CLIs are deferred when detected.** On Windows, replacing a running program's files can fail with `EBUSY`. On macOS and Linux, replacing the package folder can cause a running session to load new files alongside old code. The updater checks for running npm CLIs and records a *deferred* update instead of a failure; the scheduled job retries every 3 hours for 15 hours, and a later run on a day that already succeeded exits immediately. After 5 days it sends a reminder to close the sessions. On macOS and Linux detection is best effort: a session can start after the final check or hide its identity, and a matching process name can defer a different installation. Homebrew, native and installer-script update routes remain unchanged.
 - **Nothing hangs forever.** Installs have a time limit, and a timeout ends the whole process tree, not only the launcher. If a run still holds the lock after 3 hours, the next run tells you (once) instead of exiting quietly behind it.
 - **No registry, no failure.** When the npm registry cannot be reached the run is recorded as pending and retried; it is not reported as a failed update.
 - **Leftovers of interrupted installs are removed, carefully.** npm leaves staging folders (`node_modules/.<name>-XXXXXXXX`, hundreds of MB) behind when an install fails half way; those older than a day are removed after each update, but only while the package itself is installed, because such a folder can be npm's only backup. A managed CLI that disappears is reinstalled at the same version from that backup, or reported once.
@@ -404,6 +404,7 @@ SSH/remote trees, service accounts, elevated and unverifiable processes stay. Se
 | `AICM_WORKTREES=0` | Skip worktree and branch cleanup in the Clean job |
 | `AICM_PROCESSES=0` | Skip the process check in the Update job |
 | `AICM_CODEX_RECYCLE=0` | Do not restart Codex app-servers left on a replaced Homebrew Codex |
+| `AICM_DEFER_RUNNING=0` | macOS/Linux: update an npm-installed CLI even while it is running |
 | `AICM_CODEX_UNQUARANTINE=0` | Do not clear the quarantine from the notarized OpenAI Codex cask build |
 | `AICM_KILL_ORPHANS` | Retired; use explicit `maintenance --apply` for verified owned orphans |
 | Untagged orphan threshold | At least 6 hours plus a listening TCP port; alert-only |
