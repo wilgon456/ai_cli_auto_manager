@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.10.2 - 2026-10-28
+
+- macOS and Linux: defer updates to npm-installed CLIs when running sessions are detected. The check
+  uses package and npm bin paths, bare bin names (including rewritten process titles), and mapped
+  bin targets when lsof is available. Detection is best effort: a name may match another install,
+  and a session can hide its identity or start after the final check. Deferred updates remain pending
+  for scheduled retries; after 5 days one reminder is sent (`state/update-deferred.tsv`). Partial and
+  offline runs retain the deferral until the package is updated or confirmed current. Homebrew, native
+  and installer-script routes are unchanged. `AICM_DEFER_RUNNING=0` turns the check off.
+
 ## 2.10.1 - 2026-10-28
 
 - Replace the Windows scheduled-task VBScript launcher with a GUI-subsystem executable compiled by

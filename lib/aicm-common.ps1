@@ -836,7 +836,7 @@ function Test-AicmStateFileName([string]$Name) {
   if ($Name -like '.weekly-due.[0-9]*' -or $Name -like '.schedule-time.[0-9]*') { return $true }
   $n = $Name -replace '\.\d+\.tmp$', ''
   if (@('last-update.json', 'last-clean.json', 'last-maintenance.json', 'inventory.json', 'schedule.json', 'npm-verdicts.json', 'npm-verdicts.tsv',
-    'update-running.json', 'update-npm.json', 'update-npm.tsv', 'update-deferred.json', 'inventory-error.json',
+    'update-running.json', 'update-npm.json', 'update-npm.tsv', 'update-deferred.json', 'update-deferred.tsv', 'inventory-error.json',
     'inventory.tsv', 'inventory-shadow.txt', 'config-drift.json', 'processes.json', 'worktrees.json') -contains $n) { return $true }
   foreach ($p in '*-attention.json', 'attention-*.tsv', 'attention-*.json') { if ($n -like $p) { return $true } }
   return $false
