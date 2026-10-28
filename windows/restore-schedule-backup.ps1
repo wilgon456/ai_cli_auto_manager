@@ -9,6 +9,8 @@ $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $root 'lib\aicm-common.ps1')
 . (Join-Path $root 'lib\aicm-scheduler.ps1')
 
+$lock = Enter-AicmScheduleLock
+try {
 $area = Get-AicmWindowlessArea
 $backupBase = Join-Path $area 'backups'
 $backup = [IO.Path]::GetFullPath($BackupDir).TrimEnd('\', '/')
@@ -87,3 +89,4 @@ try {
 } finally {
   if (Test-Path -LiteralPath $stage) { Write-Warning "Staged copy retained for review: $stage" }
 }
+} finally { Exit-AicmScheduleLock $lock }

@@ -251,6 +251,8 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
   foreach ($k in 'updateAt', 'inventoryAt', 'cleanAt') {
     if (-not (Test-TimeText $Opt[$k])) { throw "invalid time '$($Opt[$k])' for $k`: use HH:MM with hour 0-23 and minute 0-59, like 05:00" }
   }
+  $lock = Enter-AicmScheduleLock
+  try {
   # Options are valid. Only then claim the home (a folder this tool did not create is refused untouched).
   Confirm-AicmHome
   $prev = Read-AicmState 'schedule'
@@ -333,6 +335,7 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
   } else {
     Write-Host 'Each run checks that the other jobs still exist and shows a desktop notification if one is gone.'
   }
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 # Jobs asked for on the command line.
@@ -346,6 +349,8 @@ function Get-WantedJobs {
 }
 
 function Invoke-ScheduleInstall {
+  $lock = Enter-AicmScheduleLock
+  try {
   $opt = Get-ParamScheduleOptions
   if ($KeepOtherJobs) {
     # Jobs that are not being installed keep the days and times they were installed with.
@@ -356,19 +361,25 @@ function Invoke-ScheduleInstall {
     if ($NoUpdate) { foreach ($k in 'updateAt', 'targets', 'installMissing', 'logRetentionDays') { $opt[$k] = $base[$k] } }
   }
   Install-Schedule $opt @(Get-WantedJobs) -KeepOthers:$KeepOtherJobs
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 # Re-registers the installed jobs with their stored options (run by the update after it refreshed
 # the installed copy). Changes nothing when the tasks already match.
 function Invoke-ScheduleRefresh {
+  $lock = Enter-AicmScheduleLock
+  try {
   $sched = Read-AicmState 'schedule'
   if (-not $sched) { Write-Host 'no schedule installed; nothing to refresh'; return }
   $want = @(@($sched.jobs) | Where-Object { $script:JobNames -contains $_ })
   if ($want.Count -eq 0) { Write-Host 'no scheduled jobs recorded; nothing to refresh'; return }
   Install-Schedule (Get-InstalledScheduleOptions $sched) $want -Refresh
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 function Remove-Schedule {
+  $lock = Enter-AicmScheduleLock
+  try {
   foreach ($name in 'Update', 'Inventory', 'Clean', 'Maintenance') {
     if (Get-AicmTask $name) {
       Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Confirm:$false
@@ -377,6 +388,7 @@ function Remove-Schedule {
   }
   $file = Join-Path (Join-Path (Get-AicmHome) 'state') 'schedule.json'
   if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 # The tasks `aicm.ps1 uninstall` would remove (for -DryRun).
@@ -391,6 +403,8 @@ function Show-SchedulePreview {
 # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless -Purge.
 # Everything is checked before anything is changed; -DryRun only lists what would go.
 function Invoke-Uninstall {
+  $lock = Enter-AicmScheduleLock
+  try {
   $app = Get-AicmAppDir
   $homeDir = Get-AicmHome
   $removeApp = $false
@@ -431,6 +445,7 @@ function Invoke-Uninstall {
   } else {
     Write-Host "kept $homeDir (logs, state, archive, local rules); add -Purge to remove it too"
   }
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 function Show-Schedule {

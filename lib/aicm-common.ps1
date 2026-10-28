@@ -62,6 +62,36 @@ function Get-AicmLockName([string]$Kind) {
   return $name
 }
 
+# Serialize schedule/app mutations across processes and interactive sessions for the same home.
+# The operating system releases the mutex if a holder exits unexpectedly. The mutex is recursive
+# within a thread so schedule refresh can call the app-copy helper while holding the same lock.
+function Enter-AicmScheduleLock([int]$WaitMilliseconds = 30000) {
+  $homePath = [IO.Path]::GetFullPath((Get-AicmHome)).TrimEnd('\', '/').ToLowerInvariant()
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { $hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($homePath)))).Replace('-', '').ToLowerInvariant() }
+  finally { $sha.Dispose() }
+  $mutex = [Threading.Mutex]::new($false, ('Global\aicm-schedule-' + $hash.Substring(0, 24)))
+  $acquired = $false
+  try {
+    try { $acquired = $mutex.WaitOne($WaitMilliseconds) }
+    catch {
+      $ex = $_.Exception
+      while ($ex -and -not ($ex -is [Threading.AbandonedMutexException])) { $ex = $ex.InnerException }
+      if (-not $ex) { throw }
+      # WaitOne owns an abandoned mutex even though it throws. Release it, then stop so the caller
+      # can inspect the latest backup and task actions before starting another mutation.
+      $mutex.ReleaseMutex()
+      throw 'a previous schedule operation stopped unexpectedly; review the task and latest backup before retrying'
+    }
+    if (-not $acquired) { throw 'another schedule operation is in progress; retry when it completes' }
+    return $mutex
+  } catch { $mutex.Dispose(); throw }
+}
+
+function Exit-AicmScheduleLock($Mutex) {
+  try { $Mutex.ReleaseMutex() } finally { $Mutex.Dispose() }
+}
+
 function Initialize-AicmDirectory([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) {
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -1148,6 +1178,12 @@ function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
 # next to the old one and checked file by file before the swap; when anything fails, the old copy
 # stays (or is put back), so the scheduled tasks never point at a missing or half-copied folder.
 function Sync-AicmAppCopy([string]$Source, [string]$RecordedSource = '') {
+  $lock = Enter-AicmScheduleLock
+  try { return (Sync-AicmAppCopyLocked $Source $RecordedSource) }
+  finally { Exit-AicmScheduleLock $lock }
+}
+
+function Sync-AicmAppCopyLocked([string]$Source, [string]$RecordedSource = '') {
   $app = Get-AicmAppDir
   if (Test-AicmSamePath $Source $app) { return $app }
   if (-not $RecordedSource) { $RecordedSource = $Source }
@@ -1288,6 +1324,15 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
     if (-not $task) {
       $problems.Add("scheduled task '$job' is missing; run: aicm.ps1 schedule install")
       continue
+    }
+    if ($launcher -eq 'windowless') {
+      $legacy = @($task.Actions | Where-Object {
+        [string]$_.Execute -match '(?i)(?:^|[\\/])(?:wscript|cscript|powershell)(?:\.exe)?$' -or
+        [string]$_.Execute -match '(?i)\.vbs$' -or
+        [string]$_.Arguments -match '(?i)(?:^|[\\/\s"])(?:wscript|cscript)(?:\.exe)?(?:\s|"|$)' -or
+        [string]$_.Arguments -match '(?i)\.vbs(?:\s|"|$)'
+      })
+      if ($legacy.Count -gt 0) { $problems.Add("scheduled task '$job' uses a legacy launcher despite windowless state; run: aicm.ps1 schedule refresh") }
     }
     foreach ($p in @(Get-AicmTaskProblems $task $job)) { $problems.Add($p) }
     if ($NoStale -or -not $limits.ContainsKey($job)) { continue }

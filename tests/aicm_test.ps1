@@ -11,6 +11,7 @@ $folderName = 'AICM Test ' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $taskPath = "\$folderName\"
 $script:fails = 0
 . (Join-Path $PSScriptRoot 'test-env.ps1')
+. (Join-Path $root 'lib\aicm-common.ps1')
 $runtimePath = New-TestRuntimePath $work
 
 function Pass([string]$m) { Write-Host "ok   - $m" }
@@ -115,6 +116,31 @@ try {
   $onlyLines = @($migrationOnly.Output -split '\r?\n' | Where-Object { $_ -match '^schedule backup: ' } | Select-Object -First 1)
   $onlyBackup = if ($onlyLines.Count -eq 1) { $onlyLines[0] -replace '^schedule backup: ', '' } else { '' }
   if ($migrationOnly.ExitCode -eq 0 -and $appHashBefore -ceq $appHashAfter -and $newState.launcher -eq 'windowless' -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Execute -eq $launcherFile) { Pass 'launcher-only migration preserves every installed app file' } else { Fail "launcher-only migration: $($migrationOnly.Output)" }
+  $backupsDir = Split-Path -Parent $onlyBackup
+  $backupCount = @(Get-ChildItem -LiteralPath $backupsDir -Directory).Count
+  $stateHash = (Get-FileHash -LiteralPath $schedFile -Algorithm SHA256).Hash
+  $repeatMigration = Invoke-Script 'windows\migrate-windowless-tasks.ps1' @()
+  if ($repeatMigration.ExitCode -eq 0 -and $repeatMigration.Output -match 'already use the verified windowless launcher' -and
+      @(Get-ChildItem -LiteralPath $backupsDir -Directory).Count -eq $backupCount -and
+      (Get-FileHash -LiteralPath $schedFile -Algorithm SHA256).Hash -ceq $stateHash) { Pass 'repeated launcher-only migration makes no backup or state changes' } else { Fail "repeated migration: $($repeatMigration.Output)" }
+  $savedScheduleHome = [Environment]::GetEnvironmentVariable('AICM_HOME')
+  $heldScheduleLock = $null
+  try {
+    $env:AICM_HOME = $aicmHome
+    $heldScheduleLock = Enter-AicmScheduleLock 0
+    $blocked = Invoke-Lib $root 'try { $m = Enter-AicmScheduleLock 200; Exit-AicmScheduleLock $m; exit 0 } catch { Write-Host $_.Exception.Message; exit 19 }'
+    if ($blocked.ExitCode -eq 19 -and $blocked.Output -match 'another schedule operation is in progress') { Pass 'a second process cannot acquire the schedule mutation lock' } else { Fail "schedule lock: $($blocked.Output)" }
+  } finally {
+    if ($heldScheduleLock) { Exit-AicmScheduleLock $heldScheduleLock }
+    [Environment]::SetEnvironmentVariable('AICM_HOME', $savedScheduleHome)
+  }
+  $originalInventoryAction = (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0]
+  try {
+    $driftArgs = ('//B //Nologo "{0}" powershell.exe {1}' -f $legacyFile, $originalInventoryAction.Arguments)
+    Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument $driftArgs) | Out-Null
+    $drift = Invoke-Aicm @('doctor')
+    if ($drift.Output -match "'Inventory' uses a legacy launcher despite windowless state") { Pass 'doctor detects a legacy action even if state says windowless' } else { Fail "launcher drift: $($drift.Output)" }
+  } finally { Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action $originalInventoryAction | Out-Null }
   $scheduleBackup = Join-Path $onlyBackup 'schedule.json'
   $scheduleBytes = [IO.File]::ReadAllBytes($scheduleBackup)
   [IO.File]::AppendAllText($scheduleBackup, ' ')

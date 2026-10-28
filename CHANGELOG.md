@@ -15,6 +15,9 @@
   `AI CLI Auto Update` task is no longer removed automatically; review it separately.
 - A standalone migration can change only managed task actions without replacing a customized
   installed app. Its backup can be restored with the `-ActionsOnly` option.
+- Serialize manager schedule and app-copy changes for the same home, avoid new backups on an
+  already-completed standalone migration, and report legacy task actions even if the stored state
+  says the launcher is windowless.
 
 ## 2.10.0 - 2026-10-27
 

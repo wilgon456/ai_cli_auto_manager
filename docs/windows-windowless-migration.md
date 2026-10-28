@@ -28,6 +28,16 @@ actions, and records the launcher type in the schedule state. It does not replac
 running that older code could restore the old actions. Upgrade it separately after reviewing any local
 changes if you want the new registration behavior there too.
 
+Repeating this command after all managed actions and state already match verifies the launcher and
+leaves the tasks, state and backups unchanged. The manager serializes schedule and installed-copy
+mutations using a per-home mutex; a concurrent operation waits briefly or reports that it is busy.
+Use the same spelling of the home path for concurrent commands: different junction or symbolic-link
+aliases may refer to the same folder while producing different mutex names. External programs that
+edit Task Scheduler directly do not use this mutex. If a waiting operation receives an abandoned
+mutex error, it stops and asks for review. The mutex is not a durable crash record and does not
+automatically restore a partially completed operation; review the tasks and latest backup after an
+interruption.
+
 Alternatively, to upgrade the installed app and migrate its tasks together, run:
 
 ```powershell
@@ -53,6 +63,8 @@ Update, Inventory, Clean and Maintenance tasks into a unique folder under the cu
 folder as `schedule backup: ...`. It refuses unexpected legacy task actions, links or an unowned app
 copy. The action migration preserves the previous PowerShell arguments, working directory, triggers,
 principal and settings. It neither starts the scheduled work nor creates an extra Maintenance task.
+Backups are retained until explicitly reviewed and removed. A full `schedule refresh` may create
+another backup because it can replace the installed app, even when task actions already match.
 
 If a migration needs to be rolled back, wait for the tasks to be idle, then run from the new checkout:
 
