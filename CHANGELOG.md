@@ -23,6 +23,8 @@
 - Before changing task actions, use a temporary scheduled task for each execution account to confirm
   that Task Scheduler can start and hash the same launcher; refuse the migration on failure.
 - The system-wide VBScript audit handles non-executable scheduled-task actions, including COM handlers.
+- Desktop window sampling runs separately from slower Task Scheduler status queries and reports
+  measured sampling intervals; sampling can still miss windows that appear between observations.
 
 ## 2.10.0 - 2026-10-27
 

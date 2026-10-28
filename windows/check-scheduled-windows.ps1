@@ -45,67 +45,43 @@ foreach ($target in $targets) {
         $arguments -notmatch '(?i)cleanup_paseo_sessions\.ps1') { throw 'Paseo cleanup does not have the required dry-run arguments' }
   }
   $exeName = [IO.Path]::GetFileName([string]$action.Execute)
-  $beforeProcesses = @([AicmWindowObserver.Snapshot]::Processes())
-  $beforeIds = @($beforeProcesses | Where-Object { $_.Name -ieq $exeName } | ForEach-Object { $_.Pid })
-  $seenWindows = @{}
-  foreach ($window in @([AicmWindowObserver.Snapshot]::Windows($beforeProcesses))) {
-    $seenWindows["$($window.Handle):$($window.OwnerPid):$($window.ClassName)"] = $true
-  }
   $beforeTime = (Get-ScheduledTaskInfo -TaskPath $target.Path -TaskName $target.Name).LastRunTime
   $logFile = Join-Path $OutputDir ($target.Name + '-windows.jsonl')
   $writer = New-Object IO.StreamWriter($logFile, $false, (New-Object Text.UTF8Encoding($false)))
-  $roots = New-Object 'System.Collections.Generic.HashSet[uint32]'
-  $maxInterval = 0L; $lastSample = -1L; $related = 0; $unattributed = 0
-  $sessionConfirmed = $true; $finished = $false; $lastResult = $null
+  $sampler = [AicmWindowObserver.Sampler]::new($exeName, [uint32]$observingSession)
+  $measurement = $null; $related = 0; $unattributed = 0
+  $finished = $false; $lastResult = $null
   $clock = [Diagnostics.Stopwatch]::StartNew()
-  $nextSample = 0L; $nextTaskCheck = 0L
   try {
+    $sampler.Start()
     Start-ScheduledTask -TaskPath $target.Path -TaskName $target.Name
     while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-      $now = $clock.ElapsedMilliseconds
-      if ($lastSample -ge 0) { $maxInterval = [Math]::Max($maxInterval, $now - $lastSample) }
-      $lastSample = $now
-      $processes = @([AicmWindowObserver.Snapshot]::Processes())
-      foreach ($process in $processes) {
-        if ($process.Name -ieq $exeName -and $beforeIds -notcontains $process.Pid) {
-          [void]$roots.Add($process.Pid)
-          try { if ((Get-Process -Id $process.Pid -ErrorAction Stop).SessionId -ne $observingSession) { $sessionConfirmed = $false } }
-          catch { $sessionConfirmed = $false }
-        }
+      $task = Get-ScheduledTask -TaskPath $target.Path -TaskName $target.Name -ErrorAction Stop
+      $info = Get-ScheduledTaskInfo -TaskPath $target.Path -TaskName $target.Name -ErrorAction Stop
+      if ($info.LastRunTime -gt $beforeTime -and $task.State -notin @('Running', 'Queued')) {
+        $finished = $true; $lastResult = $info.LastTaskResult; break
       }
-      $currentWindows = @{}
-      foreach ($window in @([AicmWindowObserver.Snapshot]::Windows($processes))) {
-        $key = "$($window.Handle):$($window.OwnerPid):$($window.ClassName)"
-        $currentWindows[$key] = $true
-        if ($seenWindows.ContainsKey($key)) { continue }
-        $isRelated = @($window.ParentChain | Where-Object { $roots.Contains([uint32]$_.Pid) }).Count -gt 0
-        if ($isRelated) { $related++ } else { $unattributed++ }
-        $entry = [ordered]@{
-          elapsedMs = $now; class = $window.ClassName; ownerPid = $window.OwnerPid
-          sessionId = $window.SessionId; relatedToObservedTaskRoot = $isRelated
-          parentChain = @($window.ParentChain | ForEach-Object { @{ pid = $_.Pid; parent = $_.Parent; name = $_.Name } })
-        }
-        $writer.WriteLine(($entry | ConvertTo-Json -Depth 5 -Compress)); $writer.Flush()
-      }
-      $seenWindows = $currentWindows
-      if ($now -ge $nextTaskCheck) {
-        $nextTaskCheck = $now + 500
-        $task = Get-ScheduledTask -TaskPath $target.Path -TaskName $target.Name -ErrorAction Stop
-        $info = Get-ScheduledTaskInfo -TaskPath $target.Path -TaskName $target.Name -ErrorAction Stop
-        if ($info.LastRunTime -gt $beforeTime -and $task.State -notin @('Running', 'Queued')) {
-          $finished = $true; $lastResult = $info.LastTaskResult; break
-        }
-      }
-      $nextSample += 100
-      $delay = $nextSample - $clock.ElapsedMilliseconds
-      if ($delay -gt 0) { Start-Sleep -Milliseconds $delay }
+      Start-Sleep -Milliseconds 250
     }
-  } finally { $writer.Dispose(); $clock.Stop() }
-  $status = if (-not $finished -or $roots.Count -eq 0 -or -not $sessionConfirmed -or $maxInterval -gt 150 -or $unattributed -gt 0) { 'inconclusive' }
+  } finally {
+    try { $measurement = $sampler.Stop() } finally { $writer.Dispose(); $clock.Stop() }
+  }
+  foreach ($event in @($measurement.Events)) {
+    $window = $event.Window
+    if ($event.Related) { $related++ } else { $unattributed++ }
+    $entry = [ordered]@{
+      elapsedMs = $event.ElapsedMs; class = $window.ClassName; ownerPid = $window.OwnerPid
+      sessionId = $window.SessionId; relatedToObservedTaskRoot = $event.Related
+      parentChain = @($window.ParentChain | ForEach-Object { @{ pid = $_.Pid; parent = $_.Parent; name = $_.Name } })
+    }
+    Add-Content -LiteralPath $logFile -Value ($entry | ConvertTo-Json -Depth 5 -Compress) -Encoding UTF8
+  }
+  $status = if (-not $finished -or @($measurement.Roots).Count -eq 0 -or -not $measurement.SameSession -or
+                $measurement.SampleCount -lt 2 -or $measurement.Error -or $measurement.MaxIntervalMs -gt 150 -or $unattributed -gt 0) { 'inconclusive' }
             elseif ($related -gt 0 -or $lastResult -ne 0) { 'failed' } else { 'passed-sampled' }
   $summaries.Add([pscustomobject]@{
-    task = $target.Name; finished = $finished; lastResult = $lastResult; observedRoots = @($roots)
-    sameSession = $sessionConfirmed; maxIntervalMs = $maxInterval
+    task = $target.Name; finished = $finished; lastResult = $lastResult; observedRoots = @($measurement.Roots)
+    sameSession = $measurement.SameSession; maxIntervalMs = $measurement.MaxIntervalMs; samples = $measurement.SampleCount; samplingError = $measurement.Error
     relatedNewWindows = $related; unattributedNewWindows = $unattributed; status = $status
   })
 }

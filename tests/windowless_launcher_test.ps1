@@ -99,6 +99,11 @@ if (!fs.readFileSync(log, 'utf8').includes('windowless transcript fixture')) pro
   Add-Type -Path (Join-Path $root 'windows\window-observer.cs')
   $snapshot = @([AicmWindowObserver.Snapshot]::Processes())
   if (@($snapshot | Where-Object { $_.Pid -eq $PID }).Count -eq 1) { Pass 'window observer captures process ancestry' } else { Fail 'window observer could not find the current process' }
+  $sampler = [AicmWindowObserver.Sampler]::new('aicm-no-such-process.exe', [uint32][Diagnostics.Process]::GetCurrentProcess().SessionId)
+  $sampler.Start()
+  Start-Sleep -Milliseconds 700
+  $samples = $sampler.Stop()
+  if ($samples.SampleCount -ge 3 -and -not $samples.Error) { Pass 'window sampling continues while the caller is blocked' } else { Fail 'background window sampler did not complete' }
 
   $hookDir = Join-Path $env:AICM_HOME 'hooks'
   New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
