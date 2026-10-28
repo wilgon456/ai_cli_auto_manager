@@ -548,9 +548,9 @@ aicm_marker_valid() { # home
 aicm_app_file_shape() { # exact legacy file names only
   case "$1" in
     bin/aicm|bin/aicm.ps1|bin/clean_ai_leftovers.ps1|bin/clean_ai_leftovers.sh|bin/inventory_ai_clis.ps1|bin/inventory_ai_clis.sh|bin/update_ai_clis.ps1|bin/update_ai_clis.sh) return 0 ;;
-    lib/aicm-common.ps1|lib/aicm-common.sh|lib/aicm-file-guard.cs|lib/aicm-job.cs|lib/aicm-process-token.cs|lib/auto-maintenance.js|lib/codex-host.sh|lib/config-drift.js|lib/maintenance-cli.js|lib/maintenance-files.js|lib/maintenance-files.ps1|lib/maintenance-processes.js|lib/maintenance.js|lib/node-common.js|lib/npm-guard.js|lib/optimize.js|lib/processes.js|lib/supervise.js|lib/update-policy.js|lib/worktrees.js) return 0 ;;
+    lib/aicm-common.ps1|lib/aicm-common.sh|lib/aicm-scheduler.ps1|lib/aicm-file-guard.cs|lib/aicm-job.cs|lib/aicm-process-token.cs|lib/auto-maintenance.js|lib/codex-host.sh|lib/config-drift.js|lib/maintenance-cli.js|lib/maintenance-files.js|lib/maintenance-files.ps1|lib/maintenance-processes.js|lib/maintenance.js|lib/node-common.js|lib/npm-guard.js|lib/optimize.js|lib/processes.js|lib/supervise.js|lib/update-policy.js|lib/worktrees.js) return 0 ;;
     rules/ai-clis.conf|rules/clean-categories.conf|rules/clean-rules.conf|rules/maintenance.conf) return 0 ;;
-    windows/install_scheduled_task.ps1|windows/run-hidden.vbs) return 0 ;;
+    windows/install_scheduled_task.ps1|windows/run-hidden.vbs|windows/aicm-windowless.cs|windows/restore-schedule-backup.ps1|windows/window-observer.cs|windows/check-scheduled-windows.ps1) return 0 ;;
     *) return 1 ;;
   esac
 }

@@ -9,7 +9,6 @@ $fakeHome = Join-Path $work 'home'
 $aicmHome = Join-Path $fakeHome '.ai-cli-auto-manager'
 $folderName = 'AICM Test ' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $taskPath = "\$folderName\"
-$wshKey = 'HKCU:\Software\AICM Test WSH ' + [guid]::NewGuid().ToString('N')
 $script:fails = 0
 . (Join-Path $PSScriptRoot 'test-env.ps1')
 $runtimePath = New-TestRuntimePath $work
@@ -87,24 +86,48 @@ try {
   if ($clean -and $clean.Actions[0].Arguments -match 'clean_ai_leftovers\.ps1') { Pass 'clean task arguments' } else { Fail 'clean task arguments' }
   $appDir = Join-Path $aicmHome 'app'
   if ((Test-Path -LiteralPath "$appDir\bin\update_ai_clis.ps1") -and (Test-Path -LiteralPath "$appDir\SOURCE")) { Pass 'jobs run an installed copy, not the clone' } else { Fail 'installed copy' }
-  if ($update -and $update.Actions[0].Execute -eq 'wscript.exe' -and $update.Actions[0].Arguments -like "*$appDir\windows\run-hidden.vbs*" -and $update.Actions[0].Arguments -like "*$appDir\bin\update_ai_clis.ps1*") { Pass 'tasks start hidden from the installed copy' } else { Fail "task action: $($update.Actions[0].Execute) $($update.Actions[0].Arguments)" }
+  $launcherFile = [string]$update.Actions[0].Execute
+  if ($update -and $launcherFile -match 'aicm-windowless-[a-f0-9]{64}\.exe$' -and (Test-Path -LiteralPath $launcherFile) -and $update.Actions[0].Arguments -like "*$appDir\bin\update_ai_clis.ps1*") { Pass 'tasks start from the windowless launcher and installed copy' } else { Fail "task action: $($update.Actions[0].Execute) $($update.Actions[0].Arguments)" }
   if ($update -and $update.Actions[0].Arguments -match '-Scheduled' -and $update.Triggers[0].Repetition.Interval -eq 'PT3H') { Pass 'update task retries every 3 hours' } else { Fail 'update retry' }
   $schedFile = "$aicmHome\state\schedule.json"
   $o = (Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json).options
   if ($o.updateAt -eq '06:15' -and $o.inventoryDay -eq 'Wednesday' -and $o.inventoryAt -eq '11:40' -and $o.cleanDay -eq 'Sunday' -and $o.cleanAt -eq '13:05' -and $o.targets -eq 'codex,claude') { Pass 'schedule.json keeps the install options' } else { Fail "options: $($o | ConvertTo-Json -Compress)" }
+
+  # A legacy action is migrated with its argument string, trigger, principal and settings intact.
+  $legacyFile = Join-Path $appDir 'windows\run-hidden.vbs'
+  "' isolated legacy fixture" | Set-Content -LiteralPath $legacyFile -Encoding ASCII
+  Add-Content -LiteralPath (Join-Path $appDir '.aicm-copy') -Value 'windows/run-hidden.vbs' -Encoding UTF8
+  $legacyArgs = ('//B //Nologo "{0}" powershell.exe {1}' -f (Join-Path $appDir 'windows\run-hidden.vbs'), $update.Actions[0].Arguments)
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument $legacyArgs) | Out-Null
+  [xml]$beforeXml = Export-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
+  $beforeParts = $beforeXml.Task.Triggers.OuterXml + $beforeXml.Task.Principals.OuterXml + $beforeXml.Task.Settings.OuterXml
+  $r = Invoke-Aicm @('schedule', 'refresh')
+  $migrated = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
+  [xml]$afterXml = Export-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
+  $afterParts = $afterXml.Task.Triggers.OuterXml + $afterXml.Task.Principals.OuterXml + $afterXml.Task.Settings.OuterXml
+  if ($r.ExitCode -eq 0 -and $migrated.Actions[0].Execute -eq $launcherFile -and $migrated.Actions[0].Arguments -eq $update.Actions[0].Arguments -and $beforeParts -ceq $afterParts -and $r.Output -match 'schedule backup: ') { Pass 'migration backs up and preserves arguments, trigger, principal and settings' } else { Fail "legacy migration: $($r.Output)" }
+  $backupLine = @($r.Output -split '\r?\n' | Where-Object { $_ -match '^schedule backup: ' } | Select-Object -First 1)
+  $backupPath = if ($backupLine.Count -eq 1) { $backupLine[0] -replace '^schedule backup: ', '' } else { '' }
+  $rollback = Invoke-Script 'windows\restore-schedule-backup.ps1' @('-BackupDir', $backupPath)
+  $restored = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
+  if ($rollback.ExitCode -eq 0 -and $restored.Actions[0].Execute -eq 'wscript.exe' -and $restored.Actions[0].Arguments -eq $legacyArgs -and (Test-Path -LiteralPath $legacyFile)) { Pass 'rollback restores the backed-up launcher action and installed copy' } else { Fail "rollback: $($rollback.Output)" }
+  $r = Invoke-Aicm @('schedule', 'refresh')
+  if ($r.ExitCode -eq 0 -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Execute -eq $launcherFile) { Pass 'a restored legacy task can be migrated again' } else { Fail "remigrate: $($r.Output)" }
+  # The rollback deliberately preserves the newer app beside the old one. Remove only this fixture.
+  Get-ChildItem -LiteralPath $aicmHome -Directory -Filter 'app.rollback-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
 
   # Installing the same schedule again changes nothing; refresh re-registers stale tasks from the stored options.
   $installArgs = @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')
   $r = Invoke-Aicm $installArgs
   if ($r.Output -match 'unchanged:' -and $r.Output -notmatch 'registered:') { Pass 'same install again leaves the tasks alone' } else { Fail "reinstall: $($r.Output)" }
   $wantArgs = $update.Actions[0].Arguments
-  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument 'stale arguments') | Out-Null
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -Action (New-ScheduledTaskAction -Execute $launcherFile -Argument 'stale arguments') | Out-Null
   $r = Invoke-Aicm @('schedule', 'refresh')
   if ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Arguments -eq $wantArgs) { Pass 'refresh puts a stale task back with the stored options' } else { Fail "refresh: $($r.Output)" }
   $r = Invoke-Aicm @('schedule', 'refresh')
   if ($r.Output -match 'already match' -and $r.Output -notmatch 'registered:') { Pass 'refresh with nothing to change changes nothing' } else { Fail "second refresh: $($r.Output)" }
   $custom = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 47) -MultipleInstances Queue
-  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Settings $custom -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument 'stale arguments') | Out-Null
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Settings $custom -Action (New-ScheduledTaskAction -Execute $launcherFile -Argument 'stale arguments') | Out-Null
   Disable-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' | Out-Null
   $r = Invoke-Aicm @('schedule', 'refresh')
   $i = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory'
@@ -142,7 +165,7 @@ try {
   $r = Invoke-Lib $appDir 'Update-AicmAppCopy'
   if ((Get-Content -LiteralPath "$appDir\VERSION" -TotalCount 1) -eq '99.0.0' -and $r.Output -match 'not newer') { Pass 'an older version in the clone does not downgrade the copy' } else { Fail "downgrade: $($r.Output)" }
   Set-Content -LiteralPath "$appDir\VERSION" -Value '0.0.1'
-  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument 'stale arguments') | Out-Null
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute $launcherFile -Argument 'stale arguments') | Out-Null
   $r = Invoke-Lib $appDir 'Update-AicmAppCopy'
   if ((Get-Content -LiteralPath "$appDir\VERSION" -TotalCount 1) -eq $version -and $r.Output -match 'updated 0\.0\.1 -> ') { Pass 'a newer version in the clone refreshes the copy' } else { Fail "upgrade: $($r.Output)" }
   if ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0].Arguments -match 'inventory_ai_clis\.ps1') { Pass 'after the copy is refreshed the tasks are re-registered' } else { Fail "re-register after update: $($r.Output)" }
@@ -214,11 +237,10 @@ try {
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 1 -and $r.Output -match "'Inventory' is disabled") { Pass 'doctor notices a disabled task' } else { Fail "disabled task: $($r.Output)" }
   Enable-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' | Out-Null
-  $vbsFile = "$aicmHome\app\windows\run-hidden.vbs"
-  Rename-Item -LiteralPath $vbsFile -NewName 'run-hidden.vbs.away'
+  Move-Item -LiteralPath $launcherFile -Destination "$launcherFile.away"
   $r = Invoke-Aicm @('doctor')
-  if ($r.ExitCode -eq 1 -and $r.Output -match "'Update' starts .*run-hidden\.vbs, which does not exist") { Pass 'doctor notices a task whose file is gone' } else { Fail "missing file: $($r.Output)" }
-  Rename-Item -LiteralPath "$vbsFile.away" -NewName 'run-hidden.vbs'
+  if ($r.ExitCode -eq 1 -and $r.Output -match "'Update' starts .*aicm-windowless-.*\.exe, which does not exist") { Pass 'doctor notices a missing launcher' } else { Fail "missing file: $($r.Output)" }
+  Move-Item -LiteralPath "$launcherFile.away" -Destination $launcherFile
   Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c exit 5') | Out-Null
   Start-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory'
   $deadline = (Get-Date).AddSeconds(60)
@@ -226,23 +248,6 @@ try {
   $r = Invoke-Aicm @('doctor')
   if ($r.ExitCode -eq 1 -and $r.Output -match "'Inventory' failed on its last run \(result 0x5\)") { Pass 'doctor notices a task whose last run failed' } else { Fail "failed run: $($r.Output)" }
   $null = Invoke-Aicm @('schedule', 'refresh')
-
-  # Windows Script Host turned off: the doctor says so, and install falls back to PowerShell.
-  New-Item -Path $wshKey -Force | Out-Null
-  New-ItemProperty -Path $wshKey -Name 'Enabled' -Value '0' -PropertyType String -Force | Out-Null
-  $env:AICM_WSH_KEYS = $wshKey
-  try {
-    $r = Invoke-Aicm @('doctor')
-    if ($r.ExitCode -eq 1 -and $r.Output -match 'Windows Script Host is turned off') { Pass 'doctor notices Windows Script Host turned off' } else { Fail "wsh off: $($r.Output)" }
-  } finally { Remove-Item Env:\AICM_WSH_KEYS }
-  $env:AICM_WSCRIPT_EXE = Join-Path $work 'no-such-wscript.exe'
-  try { $r = Invoke-Aicm $installArgs } finally { Remove-Item Env:\AICM_WSCRIPT_EXE }
-  $u = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
-  $s = Get-Content -LiteralPath "$aicmHome\state\schedule.json" -Raw | ConvertFrom-Json
-  if ($u.Actions[0].Execute -eq 'powershell.exe' -and $u.Actions[0].Arguments -match '^-WindowStyle Hidden .*-File ".*\\bin\\update_ai_clis\.ps1"' -and $s.launcher -eq 'powershell') { Pass 'install falls back to PowerShell when wscript cannot run' } else { Fail "fallback: $($u.Actions[0].Execute) $($u.Actions[0].Arguments) / $($r.Output)" }
-  $r = Invoke-Aicm $installArgs
-  $u = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
-  if ($u.Actions[0].Execute -eq 'wscript.exe' -and $u.Actions[0].Arguments -like '//B //Nologo *') { Pass 'install goes back to wscript (batch mode) when it works' } else { Fail "wscript again: $($u.Actions[0].Arguments)" }
 
   # Someone deletes the cleanup task: doctor and the next update run must notice.
   Unregister-ScheduledTask -TaskPath $taskPath -TaskName 'Clean' -Confirm:$false
@@ -413,7 +418,6 @@ try {
     $svc.Connect()
     $svc.GetFolder('\').DeleteFolder($folderName, 0)
   } catch { }
-  Remove-Item -LiteralPath $wshKey -Recurse -Force -ErrorAction SilentlyContinue
   Remove-TestWorkspace $work
 }
 

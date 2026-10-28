@@ -420,14 +420,14 @@ SSH/remote trees, service accounts, elevated and unverifiable processes stay. Se
 
 `schedule install` copies the tool to `~/.ai-cli-auto-manager/app` and the jobs run that copy, so moving or deleting your git clone cannot stop them. When the clone gets a newer version (`git pull`), the next daily update refreshes the copy and then re-registers the jobs from it with the days and times you installed them with (`schedule refresh` does the same by hand; jobs that already match are left alone). An older version in the clone (an old tag checked out) never replaces the copy. The new copy is checked file by file before it is swapped in; if anything fails, the old copy stays.
 
-On Windows the jobs start through a small launcher (`windows/run-hidden.vbs`), so no PowerShell window flashes on screen. `schedule install` first tests that launcher; where Windows Script Host is turned off it starts PowerShell directly with a hidden window instead (it may flash briefly).
+On Windows, scheduled jobs use a small GUI-subsystem launcher compiled from `windows/aicm-windowless.cs` with the built-in .NET Framework compiler. It starts PowerShell with `CREATE_NO_WINDOW` and returns the script's exit code. If the compiler is unavailable or launcher verification fails, task installation stops instead of falling back to a visible console. Before changing existing tasks, the manager saves their XML and the old installed copy. See [Windows migration and rollback](docs/windows-windowless-migration.md).
 
 On macOS and Linux the jobs get the `PATH` of the shell you ran `schedule install` in (plus the folders of `node`, `npm`, `brew` and `codex`), so CLIs installed with nvm, fnm, volta, mise, `~/.npm-global` or Homebrew are found. If you later move Node.js, run `schedule install` again; `doctor` tells you when the jobs no longer find `node` or `npm`.
 
 On Windows a run missed while the PC was off starts at the next boot; on macOS a run missed during sleep starts on wake. cron (Linux) skips missed runs, so there the weekly jobs start every day at their time and run only when this week's run has not happened yet.
 Leave out jobs you do not want with `--no-update`, `--no-inventory`, `--no-clean` (`-NoUpdate`, `-NoInventory`, `-NoClean`). On Windows, `-KeepOtherJobs` leaves the jobs you did not ask for as they are instead of removing them.
 
-Scheduled jobs can disappear or stop working silently. The jobs installed are recorded at install time, and every run checks that the others still exist, are not disabled, still point at existing files, did not fail on their last run, and have completed recently (update within 3 days, inventory and clean within 9). It also checks that Windows Script Host is on (Windows) and that a cron daemon runs (Linux; WSL starts none by default). It shows a desktop notification when something is wrong. Every notification is also written to `logs/notifications.log`, and `status` and `doctor` show the latest ones, so a notification that never reached the screen is not lost. State files are written atomically, so a crash never leaves a half-written file behind. Set `AICM_NOTIFY=0` to turn desktop notifications off.
+Scheduled jobs can disappear or stop working silently. The jobs installed are recorded at install time, and every run checks that the others still exist, are not disabled, still point at existing files, did not fail on their last run, and have completed recently (update within 3 days, inventory and clean within 9). On Windows it also flags legacy launchers; on Linux it checks that a cron daemon runs (WSL starts none by default). It shows a desktop notification when something is wrong. Every notification is also written to `logs/notifications.log`, and `status` and `doctor` show the latest ones, so a notification that never reached the screen is not lost. State files are written atomically, so a crash never leaves a half-written file behind. Set `AICM_NOTIFY=0` to turn desktop notifications off.
 
 ## Logs and state
 
@@ -480,7 +480,7 @@ and any other file are never removed.
 
 - The repository was renamed from `ai_cli_auto_update_public` to `ai_cli_auto_manager`; GitHub redirects the old URL.
 - `bin/update_ai_clis.sh` and `bin/update_ai_clis.ps1` are still there, so existing automation keeps working.
-- On Windows, `aicm.ps1 schedule install` replaces the old `AI CLI Auto Update` task (keep it with `-KeepLegacyTask`). `windows\install_scheduled_task.ps1` still works and registers only the update job, as before; Inventory and Clean jobs that are already registered stay as they are.
+- On Windows, an old `AI CLI Auto Update` task is left in place for separate review. `windows\install_scheduled_task.ps1` still works and registers only the update job, as before; Inventory and Clean jobs that are already registered stay as they are.
 - Logs moved from `~/.ai-cli-auto-update` to `~/.ai-cli-auto-manager`. The old folder is left alone; delete it when you no longer need it.
 - If you installed the old macOS template (`com.example.ai-cli-auto-update`), `aicm schedule install` prints the commands to remove it.
 

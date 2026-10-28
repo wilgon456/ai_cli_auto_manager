@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.10.1 - Unreleased
+
+- Replace the Windows scheduled-task VBScript launcher with a GUI-subsystem executable compiled by
+  the .NET Framework compiler. It starts PowerShell without a console window and returns the child
+  exit code. Installation fails closed if the compiler or launcher is unavailable.
+- Before migrating the manager's Windows tasks, save task XML and the installed app, then replace
+  only the action while preserving arguments, triggers, principal and settings. The launcher stays
+  outside the app so an update does not replace a running executable. Backups are retained for rollback.
+- Third-party tasks are not migrated automatically. The Windows migration guide describes how to
+  inspect them and retain any existing dry-run arguments.
+
 ## 2.10.0 - 2026-10-27
 
 ### Integration with v2.9.0
