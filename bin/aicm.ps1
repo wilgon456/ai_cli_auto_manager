@@ -276,11 +276,9 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
     if ($Want -contains $name) {
       $spec = Get-JobSpec $name $Opt $app $launcher
       $same = $existing -and (Get-TaskSignature $existing.Actions[0] $existing.Triggers[0]) -eq (Get-TaskSignature $spec.Action $spec.Trigger)
-      # A freshly migrated action retains its original arguments; every refresh retains the trigger.
-      if ($existing -and $Refresh) {
-        $same = ($migrated -contains $name) -or
-          ($existing.Actions[0].Execute -eq $spec.Action.Execute -and $existing.Actions[0].Arguments -eq $spec.Action.Arguments)
-      }
+      # Refresh preserves the existing task's arguments and trigger; migration already replaced
+      # its launcher after validating the installed script. Explicit install can change options.
+      if ($existing -and $Refresh) { $same = $true }
       if ($same) {
         if (-not $Refresh) { Write-Host ("unchanged:  {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text) }
       } else {

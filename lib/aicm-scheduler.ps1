@@ -17,7 +17,9 @@ function Get-AicmWindowlessArea {
   if (-not (Test-Path -LiteralPath $parent)) { [void][IO.Directory]::CreateDirectory($parent) }
   if (-not (Test-AicmRealDir (Get-Item -LiteralPath $parent -Force))) { throw 'launcher parent is not a real directory' }
   $id = Get-AicmSha256Text ([IO.Path]::GetFullPath((Get-AicmHome)).TrimEnd('\', '/').ToLowerInvariant())
-  $area = Join-Path $parent ("windowless-$id")
+  # Task Scheduler's executable-path limit is short, so filenames use 96-bit prefixes.
+  # The marker and records below still verify the complete SHA-256 values.
+  $area = Join-Path $parent ("w-" + $id.Substring(0, 24))
   if (-not (Test-Path -LiteralPath $area)) { [void][IO.Directory]::CreateDirectory($area) }
   if (-not (Test-AicmRealDir (Get-Item -LiteralPath $area -Force))) { throw 'launcher area is not a real directory' }
   $marker = Join-Path $area '.aicm-windowless'
@@ -38,8 +40,10 @@ function Initialize-AicmWindowlessLauncher([string]$SourceRoot) {
   if (-not (Test-AicmRealFile (Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue))) { throw 'windowless launcher source is missing or linked' }
   $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
   $area = Get-AicmWindowlessArea
-  $exe = Join-Path $area "aicm-windowless-$sourceHash.exe"
-  $record = Join-Path $area "aicm-windowless-$sourceHash.json"
+  $stem = 'aicm-run-' + $sourceHash.Substring(0, 24)
+  $exe = Join-Path $area "$stem.exe"
+  $record = Join-Path $area "$stem.json"
+  if ($exe.Length -gt 259) { throw 'windowless launcher path exceeds the Windows scheduled-task limit' }
   $exeItem = Get-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
   $recordItem = Get-Item -LiteralPath $record -Force -ErrorAction SilentlyContinue
   if ($exeItem -or $recordItem) {
@@ -145,7 +149,7 @@ function Get-AicmOldTaskArguments($Task, [string]$ExpectedScript, [string]$App) 
     $area = Get-AicmWindowlessArea
     if (-not [IO.Path]::IsPathRooted($execute) -or
         -not (Test-AicmSamePath (Split-Path -Parent $execute) $area) -or
-        (Split-Path -Leaf $execute) -notmatch '^aicm-windowless-[0-9a-f]{64}\.exe$') {
+        (Split-Path -Leaf $execute) -notmatch '^aicm-run-[0-9a-f]{24}\.exe$') {
       throw "task $($Task.TaskName) has an unrecognized action; refusing to replace it"
     }
     $binary = Get-Item -LiteralPath $execute -Force -ErrorAction SilentlyContinue
@@ -186,8 +190,8 @@ function Convert-AicmLegacyTasks([string[]]$Names, [string]$TaskPath, [string]$L
   $pending = @()
   foreach ($name in $Names) {
     $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $name -ErrorAction Stop
-    if (@($task.Actions).Count -eq 1 -and [string]$task.Actions[0].Execute -ceq $Launcher) { continue }
     $arguments = Get-AicmOldTaskArguments $task $scripts[$name] (Get-AicmAppDir)
+    if (@($task.Actions).Count -eq 1 -and [string]$task.Actions[0].Execute -ceq $Launcher) { continue }
     $old = @($task.Actions)[0]
     $params = @{ Execute = $Launcher; Argument = $arguments }
     if ($old.WorkingDirectory) { $params.WorkingDirectory = [string]$old.WorkingDirectory }

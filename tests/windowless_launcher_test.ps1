@@ -38,8 +38,14 @@ const result = cp.spawnSync(exe, [
   '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
   '-Output', dest, '-Text', text, '-Result', '37'
 ], { windowsHide: true, timeout: 30000 });
-if (result.error || result.status !== 37) process.exit(1);
-if (fs.readFileSync(dest, 'utf8') !== text) process.exit(2);
+if (result.error || result.status !== 37) {
+  console.error('launcher status:', result.status, 'error:', result.error && result.error.message);
+  process.exit(1);
+}
+if (fs.readFileSync(dest, 'utf8') !== text) {
+  console.error('launcher altered fixture arguments');
+  process.exit(2);
+}
 '@ | Set-Content -LiteralPath $nodeTest -Encoding ASCII
   $node = (Get-Command node -CommandType Application | Select-Object -First 1).Source
   & $node $nodeTest $exe $fixture (Join-Path $work 'output.txt')
@@ -60,6 +66,15 @@ if (fs.readFileSync(dest, 'utf8') !== text) process.exit(2);
     $info = Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName 'Exit 37'
   } while ((Get-Date) -lt $deadline -and ($info.LastRunTime -le $before -or $task.State -eq 'Running'))
   if ($info.LastRunTime -gt $before -and $info.LastTaskResult -eq 37) { Pass 'Task Scheduler records the script failure code' } else { Fail "Task Scheduler result: $($info.LastTaskResult), state $($task.State)" }
+
+  Add-Type -Path (Join-Path $root 'windows\window-observer.cs')
+  $snapshot = @([AicmWindowObserver.Snapshot]::Processes())
+  if (@($snapshot | Where-Object { $_.Pid -eq $PID }).Count -eq 1) { Pass 'window observer captures process ancestry' } else { Fail 'window observer could not find the current process' }
+
+  [IO.File]::AppendAllText($exe, 'tampered')
+  $tamperRefused = $false
+  try { [void](Initialize-AicmWindowlessLauncher $root) } catch { $tamperRefused = $_.Exception.Message -match 'integrity check failed' }
+  if ($tamperRefused) { Pass 'a modified launcher is not silently reused' } else { Fail 'modified launcher was accepted' }
 
   $env:AICM_HOME = Join-Path $fakeHome 'another-manager'
   $env:WINDIR = Join-Path $work 'no-compiler'

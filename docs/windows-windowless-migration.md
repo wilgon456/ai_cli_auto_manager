@@ -23,7 +23,7 @@ run the following only when ready to change the installed tasks:
 
 Before changing a managed task, the command copies the old app and exports XML for the existing
 Update, Inventory, Clean and Maintenance tasks into a unique folder under the current user's
-`%LOCALAPPDATA%\AI CLI Auto Manager\windowless-<home hash>\backups\`. The command prints that
+`%LOCALAPPDATA%\AI CLI Auto Manager\w-<home hash>\backups\`. The command prints that
 folder as `schedule backup: ...`. It refuses unexpected legacy task actions, links or an unowned app
 copy. The action migration preserves the previous PowerShell arguments, working directory, triggers,
 principal and settings. It neither starts the scheduled work nor creates an extra Maintenance task.
@@ -49,6 +49,8 @@ scheduled tasks without printing their arguments:
 Get-ScheduledTask | Where-Object {
   @($_.Actions | Where-Object {
     [string]$_.Execute -match '(?i)(?:^|[\\/])(?:wscript|cscript)(?:\.exe)?$' -or
+    [string]$_.Execute -match '(?i)\.vbs$' -or
+    [string]$_.Arguments -match '(?i)(?:^|[\\/\s"])(?:wscript|cscript)(?:\.exe)?(?:\s|"|$)' -or
     [string]$_.Arguments -match '(?i)\.vbs(?:\s|"|$)'
   }).Count -gt 0
 } | Select-Object TaskPath, TaskName

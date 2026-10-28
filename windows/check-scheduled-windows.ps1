@@ -101,6 +101,8 @@ foreach ($target in $targets) {
 $vbsTasks = @(Get-ScheduledTask | Where-Object {
   @($_.Actions | Where-Object {
     [string]$_.Execute -match '(?i)(?:^|[\\/])(?:wscript|cscript)(?:\.exe)?$' -or
+    [string]$_.Execute -match '(?i)\.vbs$' -or
+    [string]$_.Arguments -match '(?i)(?:^|[\\/\s"])(?:wscript|cscript)(?:\.exe)?(?:\s|"|$)' -or
     [string]$_.Arguments -match '(?i)\.vbs(?:\s|"|$)'
   }).Count -gt 0
 } | ForEach-Object { @{ path = $_.TaskPath; name = $_.TaskName } })
