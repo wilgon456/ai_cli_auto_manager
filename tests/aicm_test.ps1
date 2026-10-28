@@ -119,21 +119,58 @@ try {
   $backupsDir = Split-Path -Parent $onlyBackup
   $backupCount = @(Get-ChildItem -LiteralPath $backupsDir -Directory).Count
   $stateHash = (Get-FileHash -LiteralPath $schedFile -Algorithm SHA256).Hash
-  $repeatMigration = Invoke-Script 'windows\migrate-windowless-tasks.ps1' @()
-  if ($repeatMigration.ExitCode -eq 0 -and $repeatMigration.Output -match 'already use the verified windowless launcher' -and
-      @(Get-ChildItem -LiteralPath $backupsDir -Directory).Count -eq $backupCount -and
-      (Get-FileHash -LiteralPath $schedFile -Algorithm SHA256).Hash -ceq $stateHash) { Pass 'repeated launcher-only migration makes no backup or state changes' } else { Fail "repeated migration: $($repeatMigration.Output)" }
+  $repeatProblem = ''
+  foreach ($attempt in 1..5) {
+    $repeatMigration = Invoke-Script 'windows\migrate-windowless-tasks.ps1' @()
+    if ($repeatMigration.ExitCode -ne 0 -or $repeatMigration.Output -notmatch 'already use the verified windowless launcher' -or
+        @(Get-ChildItem -LiteralPath $backupsDir -Directory).Count -ne $backupCount -or
+        (Get-FileHash -LiteralPath $schedFile -Algorithm SHA256).Hash -cne $stateHash) {
+      $repeatProblem = "attempt $attempt`: $($repeatMigration.Output)"; break
+    }
+  }
+  if (-not $repeatProblem) { Pass 'five repeated launcher-only migrations make no backup or state changes' } else { Fail "repeated migration: $repeatProblem" }
   $savedScheduleHome = [Environment]::GetEnvironmentVariable('AICM_HOME')
   $heldScheduleLock = $null
+  $worker = $null; $workerBlocked = $false
   try {
     $env:AICM_HOME = $aicmHome
     $heldScheduleLock = Enter-AicmScheduleLock 0
     $blocked = Invoke-Lib $root 'try { $m = Enter-AicmScheduleLock 200; Exit-AicmScheduleLock $m; exit 0 } catch { Write-Host $_.Exception.Message; exit 19 }'
     if ($blocked.ExitCode -eq 19 -and $blocked.Output -match 'another schedule operation is in progress') { Pass 'a second process cannot acquire the schedule mutation lock' } else { Fail "schedule lock: $($blocked.Output)" }
+    $workerFile = Join-Path $work 'schedule-lock-worker.ps1'
+    $readyFile = Join-Path $work 'schedule-lock-worker.ready'
+    @'
+param([string]$Ready, [string]$Migration)
+$ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText($Ready, 'ready')
+& $Migration
+'@ | Set-Content -LiteralPath $workerFile -Encoding ASCII
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = (Get-Process -Id $PID).Path
+    $start.Arguments = Join-AicmProcessArguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $workerFile, $readyFile, (Join-Path $root 'windows\migrate-windowless-tasks.ps1'))
+    $start.UseShellExecute = $false; $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true
+    $start.EnvironmentVariables['USERPROFILE'] = $fakeHome
+    $start.EnvironmentVariables['HOME'] = $fakeHome
+    $start.EnvironmentVariables['AICM_HOME'] = $aicmHome
+    $start.EnvironmentVariables['LOCALAPPDATA'] = "$fakeHome\AppData\Local"
+    $start.EnvironmentVariables['AICM_TASK_PATH'] = $taskPath
+    $start.EnvironmentVariables['TEMP'] = "$work\tmp"; $start.EnvironmentVariables['TMP'] = "$work\tmp"
+    $worker = [Diagnostics.Process]::Start($start)
+    $workerOut = $worker.StandardOutput.ReadToEndAsync(); $workerErr = $worker.StandardError.ReadToEndAsync()
+    $readyDeadline = (Get-Date).AddSeconds(20)
+    while (-not (Test-Path -LiteralPath $readyFile) -and -not $worker.HasExited -and (Get-Date) -lt $readyDeadline) { Start-Sleep -Milliseconds 100 }
+    Start-Sleep -Milliseconds 1000
+    $workerBlocked = (Test-Path -LiteralPath $readyFile) -and -not $worker.HasExited
   } finally {
     if ($heldScheduleLock) { Exit-AicmScheduleLock $heldScheduleLock }
     [Environment]::SetEnvironmentVariable('AICM_HOME', $savedScheduleHome)
   }
+  try {
+    if (-not $worker.WaitForExit(30000)) { $worker.Kill(); $worker.WaitForExit(); Fail 'concurrent migration did not finish after the lock was released' }
+    elseif ($workerBlocked -and $worker.ExitCode -eq 0 -and $workerOut.GetAwaiter().GetResult() -match 'already use the verified windowless launcher') { Pass 'concurrent migration waits until the schedule lock is released' }
+    else { Fail "concurrent migration: $($workerErr.GetAwaiter().GetResult())" }
+  } finally { if ($worker) { $worker.Dispose() } }
   $originalInventoryAction = (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0]
   try {
     $driftArgs = ('//B //Nologo "{0}" powershell.exe {1}' -f $legacyFile, $originalInventoryAction.Arguments)

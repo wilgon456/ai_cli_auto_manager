@@ -50,7 +50,7 @@
   "rules/maintenance.conf": "cf5f66db67c4148ec28249a799c09f25112bfdbb022537d38c214d164e1595eb",
   "scripts/build_release.py": "81f794e382c65f57e9e1e98f865ed695aee648a7458183960d6a8108d3912be8",
   "scripts/check_manifest.py": "8ae17bedd0dd281f64703d4d96c686bc4cde84016416d171a5ba1711c8494004",
-  "tests/aicm_test.ps1": "a79e5c3fdff048ff8e78c1b8f50236ec5b7af18517aade0829c6fd08c5e3d209",
+  "tests/aicm_test.ps1": "dddf444cd5a1dd5e80d269f7011c4cee41d7220e58848b9f6810191482ce501f",
   "tests/aicm_test.sh": "21d9d1c5729a81ae56092c91c457476be9544ce81a539624dc7f0f6020cca043",
   "tests/auto_maintenance_test.ps1": "18b8dd09aa502fe0525f874e684bd593360fcb5904b00f132dabf2fc51a6f4bf",
   "tests/cache_budget_test.ps1": "40d12d989dcb20a366bfdd3882515409ab3857724f2d66af400ad1fbe7d71dc8",
