@@ -10,6 +10,11 @@
   outside the app so an update does not replace a running executable. Backups are retained for rollback.
 - Third-party tasks are not migrated automatically. The Windows migration guide describes how to
   inspect them and retain any existing dry-run arguments.
+- A separate checkout can install the reviewed copy with `schedule refresh -PreserveSource` while
+  retaining the original update-source path. A running task blocks manual refresh. The old
+  `AI CLI Auto Update` task is no longer removed automatically; review it separately.
+- A standalone migration can change only managed task actions without replacing a customized
+  installed app. Its backup can be restored with the `-ActionsOnly` option.
 
 ## 2.10.0 - 2026-10-27
 

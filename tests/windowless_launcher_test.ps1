@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $work = Join-Path ([IO.Path]::GetTempPath()) ('aicm-test-' + [guid]::NewGuid().ToString('N'))
-$fakeHome = Join-Path $work 'home'
+$fakeHome = Join-Path $work ('home ' + [string][char]0xD55C + [string][char]0xAE00)
 $taskPath = '\AICM Launcher Test ' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '\'
 $script:fails = 0
 . (Join-Path $PSScriptRoot 'test-env.ps1')
@@ -110,7 +110,8 @@ $env:AICM_TASK_PATH = '{3}'
 [IO.File]::WriteAllText('{6}', [string]$LASTEXITCODE)
 exit $LASTEXITCODE
 '@ -f (& $quote $fakeHome), (& $quote $local), (& $quote $env:AICM_HOME), (& $quote $taskPath), (& $quote $ps), (& $quote (Join-Path $root 'bin\aicm.ps1')), (& $quote $finished)
-  [IO.File]::WriteAllText($fixtureUpdate, $dummy, (New-Object Text.UTF8Encoding($false)))
+  # This generated fixture embeds a Unicode path; Windows PowerShell 5.1 needs its UTF-8 BOM.
+  [IO.File]::WriteAllText($fixtureUpdate, $dummy, (New-Object Text.UTF8Encoding($true)))
   Start-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
   $deadline = (Get-Date).AddSeconds(120)
   while (-not (Test-Path -LiteralPath $finished) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }

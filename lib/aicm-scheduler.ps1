@@ -90,6 +90,9 @@ function New-AicmScheduleBackup([string[]]$Names, [string]$TaskPath) {
   $appItem = Get-Item -LiteralPath $app -Force -ErrorAction SilentlyContinue
   if (-not $appItem) { throw 'managed tasks exist but their installed copy is missing; refusing to change them' }
   if (-not (Test-AicmAppCopyOwned $app)) { throw "cannot back up the installed copy: $($script:AicmHomeProblem)" }
+  foreach ($entry in (Get-AicmEntries $app)) {
+    if (Test-AicmLink $entry) { throw 'cannot back up an installed copy with a linked entry' }
+  }
   $area = Get-AicmWindowlessArea
   $base = Join-Path $area 'backups'
   if (-not (Test-Path -LiteralPath $base)) { [void][IO.Directory]::CreateDirectory($base) }
@@ -123,7 +126,10 @@ function New-AicmScheduleBackup([string[]]$Names, [string]$TaskPath) {
       $appHashes[$relative] = (Get-FileHash -LiteralPath $copied.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
   }
-  $schedule = Join-Path (Join-Path (Get-AicmHome) 'state') 'schedule.json'
+  $stateDir = Join-Path (Get-AicmHome) 'state'
+  $stateItem = Get-Item -LiteralPath $stateDir -Force -ErrorAction SilentlyContinue
+  if ($stateItem -and -not (Test-AicmRealDir $stateItem)) { throw 'schedule state folder is linked or invalid' }
+  $schedule = Join-Path $stateDir 'schedule.json'
   $schedItem = Get-Item -LiteralPath $schedule -Force -ErrorAction SilentlyContinue
   if ($schedItem) {
     if (-not (Test-AicmRealFile $schedItem)) { throw 'schedule state is not a real file' }

@@ -99,8 +99,25 @@ try {
   Add-Content -LiteralPath (Join-Path $appDir '.aicm-copy') -Value 'windows/run-hidden.vbs' -Encoding UTF8
   $legacyArgs = ('//B //Nologo "{0}" powershell.exe {1}' -f (Join-Path $appDir 'windows\run-hidden.vbs'), $update.Actions[0].Arguments)
   Set-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -Action (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument $legacyArgs) | Out-Null
+  $legacyState = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
+  $legacyState.launcher = 'wscript'
+  $legacyState | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $schedFile -Encoding UTF8
   [xml]$beforeXml = Export-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
   $beforeParts = $beforeXml.Task.Triggers.OuterXml + $beforeXml.Task.Principals.OuterXml + $beforeXml.Task.Settings.OuterXml
+  $appHashBefore = (Get-ChildItem -LiteralPath $appDir -Recurse -File -Force | Sort-Object FullName | ForEach-Object {
+    "$($_.FullName)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+  }) -join ';'
+  $migrationOnly = Invoke-Script 'windows\migrate-windowless-tasks.ps1' @()
+  $appHashAfter = (Get-ChildItem -LiteralPath $appDir -Recurse -File -Force | Sort-Object FullName | ForEach-Object {
+    "$($_.FullName)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+  }) -join ';'
+  $newState = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
+  $onlyLines = @($migrationOnly.Output -split '\r?\n' | Where-Object { $_ -match '^schedule backup: ' } | Select-Object -First 1)
+  $onlyBackup = if ($onlyLines.Count -eq 1) { $onlyLines[0] -replace '^schedule backup: ', '' } else { '' }
+  if ($migrationOnly.ExitCode -eq 0 -and $appHashBefore -ceq $appHashAfter -and $newState.launcher -eq 'windowless' -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Execute -eq $launcherFile) { Pass 'launcher-only migration preserves every installed app file' } else { Fail "launcher-only migration: $($migrationOnly.Output)" }
+  $onlyRollback = Invoke-Script 'windows\restore-schedule-backup.ps1' @('-BackupDir', $onlyBackup, '-ActionsOnly')
+  $restoredState = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
+  if ($onlyRollback.ExitCode -eq 0 -and $restoredState.launcher -eq 'wscript' -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Arguments -eq $legacyArgs) { Pass 'launcher-only rollback restores task action and state' } else { Fail "launcher-only rollback: $($onlyRollback.Output)" }
   $r = Invoke-Aicm @('schedule', 'refresh')
   $migrated = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
   [xml]$afterXml = Export-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
@@ -398,7 +415,7 @@ try {
   $r = Invoke-Aicm @('status')
   if ($r.Output -match '== disk use by cleanup rule ==' -and $r.Output -match 'codex-sessions') { Pass 'status shows rules' } else { Fail "status output: $($r.Output)" }
 
-  # The legacy installer removes a real '\AI CLI Auto Update' task, so only run it where none exists.
+  # Skip the legacy installer if a real root task exists; these tests never modify it.
   if (Get-ScheduledTask -TaskPath '\' -TaskName 'AI CLI Auto Update' -ErrorAction SilentlyContinue) {
     Write-Host 'skip - legacy installer (a real legacy task exists on this machine)'
   } else {

@@ -2,7 +2,7 @@
    Example: .\windows\restore-schedule-backup.ps1 -BackupDir 'C:\...\backups\...'
    Run only while the managed tasks are idle. The current copy is retained beside app. #>
 [CmdletBinding()]
-param([Parameter(Mandatory = $true)][string]$BackupDir)
+param([Parameter(Mandatory = $true)][string]$BackupDir, [switch]$ActionsOnly)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -44,6 +44,20 @@ $app = Get-AicmAppDir
 if (-not (Test-AicmAppCopyOwned $app)) { throw "current installed copy is not safe to replace: $($script:AicmHomeProblem)" }
 $recovery = New-AicmScheduleBackup $names $script:AicmTaskPath
 Write-Host "Current task XML and installed copy backed up to: $recovery"
+if ($ActionsOnly) {
+  Restore-AicmTaskActions $backup
+  $savedSchedule = Join-Path $backup 'schedule.json'
+  if (Test-Path -LiteralPath $savedSchedule -PathType Leaf) {
+    $stateDir = Join-Path (Get-AicmHome) 'state'
+    if (-not (Test-AicmRealDir (Get-Item -LiteralPath $stateDir -Force -ErrorAction SilentlyContinue))) { throw 'current schedule state folder is linked or missing' }
+    $schedule = Join-Path $stateDir 'schedule.json'
+    $currentSchedule = Get-Item -LiteralPath $schedule -Force -ErrorAction SilentlyContinue
+    if ($currentSchedule -and -not (Test-AicmRealFile $currentSchedule)) { throw 'current schedule state is linked; it was not replaced' }
+    Copy-Item -LiteralPath $savedSchedule -Destination $schedule -Force -ErrorAction Stop
+  }
+  Write-Host 'Restored the task actions and schedule state without replacing the installed copy.'
+  exit 0
+}
 $stage = "$app.restore-$([guid]::NewGuid().ToString('N'))"
 $savedCurrent = "$app.rollback-$([guid]::NewGuid().ToString('N'))"
 if ((Test-Path -LiteralPath $stage) -or (Test-Path -LiteralPath $savedCurrent)) { throw 'rollback staging path already exists' }

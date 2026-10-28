@@ -14,8 +14,21 @@ from refreshing themselves. It can also be needed when explicitly restoring an o
 
 ## Manager tasks
 
-Review the existing task definitions and wait until none are running. From the new source checkout,
-run the following only when ready to change the installed tasks:
+Review the existing task definitions and wait until none are running. To keep every file in the
+current installed app and its source checkout exactly as they are, run this from the new checkout
+only when ready to change the managed task actions:
+
+```powershell
+.\windows\migrate-windowless-tasks.ps1
+```
+
+This builds the launcher, saves task XML and a copy of the current app, converts recognized managed
+actions, and records the launcher type in the schedule state. It does not replace the app or its
+`SOURCE` file. An older installed app still contains its old schedule-registration code; manually
+running that older code could restore the old actions. Upgrade it separately after reviewing any local
+changes if you want the new registration behavior there too.
+
+Alternatively, to upgrade the installed app and migrate its tasks together, run:
 
 ```powershell
 .\bin\aicm.ps1 schedule refresh
@@ -52,6 +65,13 @@ installed copy and task actions, and keeps the replaced copy next to the app. It
 actions only: existing triggers, principal and settings stay in place. Restoring an old action can
 reintroduce the old VBScript dependency; use this when rolling back intentionally. The backup contains
 local paths and task definitions; protect it as user data.
+
+For a launcher-only migration where the installed app has not been upgraded, add `-ActionsOnly` to
+restore the task actions and schedule state without replacing the app:
+
+```powershell
+.\windows\restore-schedule-backup.ps1 -BackupDir 'C:\path\printed\after\schedule backup' -ActionsOnly
+```
 
 ## Tasks outside this repository
 
