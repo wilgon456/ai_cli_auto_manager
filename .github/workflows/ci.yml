@@ -101,7 +101,7 @@ jobs:
         shell: pwsh
         run: |
           $nodeTests = @(Get-ChildItem -Path tests/node -Filter *.test.js | ForEach-Object { $_.FullName })
-          node --test @nodeTests
+          node --test --test-concurrency=2 @nodeTests
       - name: PSScriptAnalyzer errors
         shell: pwsh
         run: |

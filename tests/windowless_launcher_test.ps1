@@ -13,7 +13,7 @@ function Pass([string]$Message) { Write-Host "ok   - $Message" }
 function Fail([string]$Message) { Write-Host "FAIL - $Message"; $script:fails++ }
 
 $saved = @{}
-foreach ($key in 'USERPROFILE', 'HOME', 'AICM_HOME', 'LOCALAPPDATA', 'WINDIR') { $saved[$key] = [Environment]::GetEnvironmentVariable($key) }
+foreach ($key in 'USERPROFILE', 'HOME', 'AICM_HOME', 'LOCALAPPDATA', 'WINDIR', 'AICM_TASK_PATH') { $saved[$key] = [Environment]::GetEnvironmentVariable($key) }
 try {
   $local = Join-Path $fakeHome 'AppData\Local'
   New-Item -ItemType Directory -Path $local -Force | Out-Null
@@ -71,6 +71,49 @@ if (fs.readFileSync(dest, 'utf8') !== text) {
   $snapshot = @([AicmWindowObserver.Snapshot]::Processes())
   if (@($snapshot | Where-Object { $_.Pid -eq $PID }).Count -eq 1) { Pass 'window observer captures process ancestry' } else { Fail 'window observer could not find the current process' }
 
+  $hookDir = Join-Path $env:AICM_HOME 'hooks'
+  New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
+  'exit 0' | Set-Content -LiteralPath (Join-Path $hookDir 'post-update.ps1') -Encoding ASCII
+  $observerOutput = Join-Path $work 'observer-must-not-start'
+  $ps = (Get-Process -Id $PID).Path
+  $preference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $out = & $ps -NoProfile -File (Join-Path $root 'windows\check-scheduled-windows.ps1') -OutputDir $observerOutput -RunTasks 2>&1 | Out-String -Width 400
+  $childStatus = $LASTEXITCODE
+  $ErrorActionPreference = $preference
+  if ($childStatus -ne 0 -and $out -match 'post-update hook' -and -not (Test-Path -LiteralPath $observerOutput)) { Pass 'live observer refuses an update with a user hook before starting tasks' } else { Fail "observer hook guard: $out" }
+
+  # A scheduled Update may refresh its own copy while it is still the running task. The updater
+  # below is a harmless fixture; it never calls a vendor CLI and uses only the fake home.
+  $env:AICM_TASK_PATH = $taskPath
+  $preference = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $installOutput = & $ps -NoProfile -File (Join-Path $root 'bin\aicm.ps1') schedule install -NoInventory -NoClean -NoMaintenance -KeepLegacyTask 2>&1 | Out-String -Width 400
+  $installStatus = $LASTEXITCODE
+  $ErrorActionPreference = $preference
+  if ($installStatus -ne 0) { throw "fixture schedule install failed: $installOutput" }
+  $fixtureApp = Join-Path $env:AICM_HOME 'app'
+  $fixtureUpdate = Join-Path $fixtureApp 'bin\update_ai_clis.ps1'
+  $finished = Join-Path $work 'auto-refresh-result.txt'
+  $quote = { param([string]$s) return $s.Replace("'", "''") }
+  $dummy = @'
+$env:USERPROFILE = '{0}'
+$env:HOME = '{0}'
+$env:LOCALAPPDATA = '{1}'
+$env:AICM_HOME = '{2}'
+$env:AICM_TASK_PATH = '{3}'
+& '{4}' -NoProfile -File '{5}' schedule refresh
+[IO.File]::WriteAllText('{6}', [string]$LASTEXITCODE)
+exit $LASTEXITCODE
+'@ -f (& $quote $fakeHome), (& $quote $local), (& $quote $env:AICM_HOME), (& $quote $taskPath), (& $quote $ps), (& $quote (Join-Path $root 'bin\aicm.ps1')), (& $quote $finished)
+  [IO.File]::WriteAllText($fixtureUpdate, $dummy, (New-Object Text.UTF8Encoding($false)))
+  Start-ScheduledTask -TaskPath $taskPath -TaskName 'Update'
+  $deadline = (Get-Date).AddSeconds(120)
+  while (-not (Test-Path -LiteralPath $finished) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+  while ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').State -eq 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+  $updateResult = (Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName 'Update').LastTaskResult
+  if ((Test-Path -LiteralPath $finished) -and [IO.File]::ReadAllText($finished) -eq '0' -and $updateResult -eq 0) { Pass 'a scheduled updater can refresh itself without stopping the task' } else { Fail "scheduled updater did not complete its isolated refresh (result $updateResult)" }
+
   [IO.File]::AppendAllText($exe, 'tampered')
   $tamperRefused = $false
   try { [void](Initialize-AicmWindowlessLauncher $root) } catch { $tamperRefused = $_.Exception.Message -match 'integrity check failed' }
@@ -82,8 +125,11 @@ if (fs.readFileSync(dest, 'utf8') !== text) {
   try { [void](Initialize-AicmWindowlessLauncher $root) } catch { $refused = $_.Exception.Message -match 'csc.exe is unavailable' }
   if ($refused) { Pass 'missing compiler fails closed' } else { Fail 'missing compiler was not refused' }
 } finally {
-  $task = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Exit 37' -ErrorAction SilentlyContinue
-  if ($task) { Unregister-ScheduledTask -TaskPath $taskPath -TaskName 'Exit 37' -Confirm:$false }
+  foreach ($name in 'Exit 37', 'Update') {
+    $task = Get-ScheduledTask -TaskPath $taskPath -TaskName $name -ErrorAction SilentlyContinue
+    if ($task -and $task.State -eq 'Running') { Stop-ScheduledTask -TaskPath $taskPath -TaskName $name -ErrorAction SilentlyContinue }
+    if ($task) { Unregister-ScheduledTask -TaskPath $taskPath -TaskName $name -Confirm:$false }
+  }
   foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
   if (Test-Path -LiteralPath $work) { Remove-TestWorkspace $work }
 }

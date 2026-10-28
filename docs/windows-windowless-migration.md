@@ -21,6 +21,14 @@ run the following only when ready to change the installed tasks:
 .\bin\aicm.ps1 schedule refresh
 ```
 
+If the existing source checkout contains local changes, use a separate checkout for this migration
+and add `-PreserveSource`. That copies the reviewed version into the app while retaining the original
+`SOURCE` and schedule source path for future updates:
+
+```powershell
+.\bin\aicm.ps1 schedule refresh -PreserveSource
+```
+
 For an existing version 2.10.0 or older, run this refresh from the new checkout before allowing the
 old daily updater to refresh the app if rollback to the old app version is required. The old updater
 swaps the installed copy before it can call the new migration code; in that automatic path, the XML
@@ -92,12 +100,20 @@ $launcher = [string]$managed.Actions[0].Execute
 if (-not (Test-Path -LiteralPath $launcher -PathType Leaf) -or
     [IO.Path]::GetFileName($launcher) -notmatch '^aicm-run-[0-9a-f]{24}\.exe$') { throw 'Verified manager launcher is unavailable' }
 $xml = [string](Export-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup')
+[xml]$oldDefinition = $xml
+$oldSections = $oldDefinition.Task.Triggers.OuterXml + $oldDefinition.Task.Principals.OuterXml + $oldDefinition.Task.Settings.OuterXml
 $stream = [IO.File]::Open($backupFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
 try { $bytes = [Text.Encoding]::UTF8.GetBytes($xml); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
 if ([IO.File]::ReadAllText($backupFile) -cne $xml) { throw 'Backup verification failed' }
 $actionArgs = @{ Execute = $launcher; Argument = $psArguments }
 if ($old.WorkingDirectory) { $actionArgs.WorkingDirectory = [string]$old.WorkingDirectory }
 Set-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup' -Action (New-ScheduledTaskAction @actionArgs) | Out-Null
+$updated = Get-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup'
+[xml]$newDefinition = Export-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup'
+$newSections = $newDefinition.Task.Triggers.OuterXml + $newDefinition.Task.Principals.OuterXml + $newDefinition.Task.Settings.OuterXml
+if ($newSections -cne $oldSections -or [string]$updated.Actions[0].Arguments -cne $psArguments) {
+  throw 'The task differs from the backup; inspect it and use the rollback instructions below'
+}
 ```
 
 To restore that task's old action from its saved XML without changing its current schedule, account

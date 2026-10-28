@@ -62,6 +62,7 @@ param(
   [switch]$ProcessesOnly,
   [switch]$KeepLegacyTask,
   [switch]$KeepOtherJobs,
+  [switch]$PreserveSource,
   [switch]$Apply,
   [int]$Days = 0,
   [switch]$Kill,
@@ -96,7 +97,7 @@ function Show-Help {
   Write-Host '  aicm.ps1 status'
   Write-Host '  aicm.ps1 doctor'
   Write-Host '  aicm.ps1 schedule  install|remove|show|refresh [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
-  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-CleanCategory list] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply] [-KeepOtherJobs]'
+  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-CleanCategory list] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply] [-KeepOtherJobs] [-PreserveSource]'
   Write-Host '  aicm.ps1 uninstall [-Purge] [-DryRun]   -DryRun lists what would be removed and changes nothing'
   Write-Host '  aicm.ps1 version'
 }
@@ -234,7 +235,7 @@ function Get-TaskSignature($Action, $Trigger) {
 # The clone the installed copy came from (when this runs from the installed copy itself).
 function Get-ScheduleSource([string]$App) {
   $sourceFile = Join-Path $App 'SOURCE'
-  if ((Test-AicmSamePath (Get-AicmRoot) $App) -and (Test-Path -LiteralPath $sourceFile)) { return (Read-AicmUtf8FirstLine $sourceFile) }
+  if (Test-Path -LiteralPath $sourceFile) { return (Read-AicmUtf8FirstLine $sourceFile) }
   return (Get-AicmRoot)
 }
 
@@ -255,15 +256,29 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
   $prev = Read-AicmState 'schedule'
   $jobs = New-Object System.Collections.Generic.List[string]
   $existingNames = @($script:JobNames | Where-Object { Get-AicmTask $_ })
+  Assert-AicmManagedTasksIdle $existingNames $script:AicmTaskPath ([bool]$Refresh)
+  $recordedSource = Get-AicmRoot
+  if ($PreserveSource) {
+    $currentApp = Get-AicmAppDir
+    $sourceFile = Join-Path $currentApp 'SOURCE'
+    $sourceItem = Get-Item -LiteralPath $sourceFile -Force -ErrorAction SilentlyContinue
+    if (-not (Test-AicmRealFile $sourceItem)) { throw 'cannot preserve source: installed SOURCE is missing or linked' }
+    $recordedSource = Read-AicmUtf8FirstLine $sourceFile
+    if (-not $recordedSource -or -not [IO.Path]::IsPathRooted($recordedSource) -or
+        -not (Test-Path -LiteralPath $recordedSource -PathType Container) -or (Test-AicmSamePath $recordedSource $currentApp)) {
+      throw 'cannot preserve source: installed SOURCE is unavailable or points to the installed copy'
+    }
+  }
   # Compile and record the old definitions/copy before changing either tasks or app.
   $launcher = Initialize-AicmWindowlessLauncher (Get-AicmRoot)
   $backup = New-AicmScheduleBackup $existingNames $script:AicmTaskPath
   $migrated = @()
   if ($backup) {
     Write-Host "schedule backup: $backup"
+    Assert-AicmManagedTasksIdle $existingNames $script:AicmTaskPath ([bool]$Refresh)
     $migrated = @(Convert-AicmLegacyTasks $existingNames $script:AicmTaskPath $launcher $backup)
   }
-  try { $app = Sync-AicmAppCopy (Get-AicmRoot) }
+  try { $app = Sync-AicmAppCopy (Get-AicmRoot) $recordedSource }
   catch {
     if ($backup) { try { Restore-AicmTaskActions $backup } catch { Write-Warning "Could not restore all task actions; use backup $backup" } }
     throw

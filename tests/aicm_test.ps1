@@ -121,6 +121,35 @@ try {
   if ($r.ExitCode -eq 0 -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Execute -eq $launcherFile) { Pass 'a restored legacy task can be migrated again' } else { Fail "remigrate: $($r.Output)" }
   # The rollback deliberately preserves the newer app beside the old one. Remove only this fixture.
   Get-ChildItem -LiteralPath $aicmHome -Directory -Filter 'app.rollback-*' -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+  $alternate = Join-Path $work 'alternate source'
+  New-Item -ItemType Directory -Path $alternate -Force | Out-Null
+  foreach ($dir in 'bin', 'lib', 'rules', 'windows') { Copy-Item -LiteralPath (Join-Path $root $dir) -Destination (Join-Path $alternate $dir) -Recurse -Force }
+  foreach ($file in 'VERSION', 'LICENSE', 'README.md') { Copy-Item -LiteralPath (Join-Path $root $file) -Destination (Join-Path $alternate $file) -Force }
+  $sourceBefore = [IO.File]::ReadAllText((Join-Path $appDir 'SOURCE')).Trim()
+  $r = Invoke-Child @('-File', (Join-Path $alternate 'bin\aicm.ps1'), 'schedule', 'refresh', '-PreserveSource')
+  $sourceAfter = [IO.File]::ReadAllText((Join-Path $appDir 'SOURCE')).Trim()
+  $stateSource = (Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json).source
+  if ($r.ExitCode -eq 0 -and $sourceAfter -eq $sourceBefore -and $stateSource -eq $sourceBefore) { Pass 'an alternate checkout preserves the original update source' } else { Fail "preserve source: $($r.Output)" }
+  $hold = Join-Path $work 'hold-task.ps1'
+  'Start-Sleep -Seconds 90' | Set-Content -LiteralPath $hold -Encoding ASCII
+  $savedAction = (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0]
+  $holdArgs = '-NoProfile -NonInteractive -File "{0}"' -f $hold
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $holdArgs) | Out-Null
+  try {
+    Start-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory'
+    $deadline = (Get-Date).AddSeconds(30)
+    do { Start-Sleep -Milliseconds 250; $state = (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').State } while ($state -ne 'Running' -and (Get-Date) -lt $deadline)
+    if ($state -ne 'Running') { Fail 'fixture task did not start' }
+    else {
+      $r = Invoke-Aicm @('schedule', 'refresh')
+      if ($r.ExitCode -ne 0 -and $r.Output -match 'Inventory is running or queued' -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0].Arguments -eq $holdArgs) { Pass 'refresh leaves a running task untouched' } else { Fail "running task: $($r.Output)" }
+    }
+  } finally {
+    Stop-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue
+    $stopping = (Get-Date).AddSeconds(20)
+    while ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').State -eq 'Running' -and (Get-Date) -lt $stopping) { Start-Sleep -Milliseconds 250 }
+    Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action $savedAction | Out-Null
+  }
 
   # Installing the same schedule again changes no task; an unrecognized action fails closed.
   $installArgs = @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')

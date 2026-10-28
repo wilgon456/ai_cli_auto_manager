@@ -189,6 +189,26 @@ function Get-AicmTaskPreservedHash([string]$TaskPath, [string]$Name) {
   return (Get-AicmSha256Text ($xml.Task.Triggers.OuterXml + $xml.Task.Principals.OuterXml + $xml.Task.Settings.OuterXml))
 }
 
+function Test-AicmUpdaterParent {
+  # Auto-refresh can be invoked by the scheduled Update itself. A manual refresh must wait for it.
+  try {
+    $self = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+    $parent = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($self.ParentProcessId)" -ErrorAction Stop
+    $expected = Join-Path (Get-AicmAppDir) 'bin\update_ai_clis.ps1'
+    return ($parent.Name -match '(?i)^(powershell|pwsh)\.exe$' -and
+      ([string]$parent.CommandLine).IndexOf($expected, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+  } catch { return $false }
+}
+
+function Assert-AicmManagedTasksIdle([string[]]$Names, [string]$TaskPath, [bool]$Refresh) {
+  foreach ($name in $Names) {
+    $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $name -ErrorAction Stop
+    if ($task.State -notin @('Running', 'Queued')) { continue }
+    if ($Refresh -and $name -eq 'Update' -and (Test-AicmUpdaterParent)) { continue }
+    throw "scheduled task $name is running or queued; retry when it is idle"
+  }
+}
+
 function Convert-AicmLegacyTasks([string[]]$Names, [string]$TaskPath, [string]$Launcher, [string]$Backup) {
   $scripts = @{ Update = 'update_ai_clis.ps1'; Inventory = 'inventory_ai_clis.ps1'; Clean = 'clean_ai_leftovers.ps1'; Maintenance = 'aicm.ps1' }
   $pending = @()
@@ -199,11 +219,17 @@ function Convert-AicmLegacyTasks([string[]]$Names, [string]$TaskPath, [string]$L
     $old = @($task.Actions)[0]
     $params = @{ Execute = $Launcher; Argument = $arguments }
     if ($old.WorkingDirectory) { $params.WorkingDirectory = [string]$old.WorkingDirectory }
-    $pending += @{ name = $name; action = (New-ScheduledTaskAction @params); preserved = (Get-AicmTaskPreservedHash $TaskPath $name) }
+    $pending += @{ name = $name; action = (New-ScheduledTaskAction @params); args = $arguments
+      workingDirectory = [string]$old.WorkingDirectory; preserved = (Get-AicmTaskPreservedHash $TaskPath $name) }
   }
   try {
     foreach ($item in $pending) {
       Set-ScheduledTask -TaskPath $TaskPath -TaskName $item.name -Action $item.action -ErrorAction Stop | Out-Null
+      $after = Get-ScheduledTask -TaskPath $TaskPath -TaskName $item.name -ErrorAction Stop
+      if (@($after.Actions).Count -ne 1 -or [string]$after.Actions[0].Execute -cne $Launcher -or
+          [string]$after.Actions[0].Arguments -cne $item.args -or [string]$after.Actions[0].WorkingDirectory -cne $item.workingDirectory) {
+        throw "task $($item.name) action did not retain its arguments or working directory; review backup $Backup"
+      }
       if ((Get-AicmTaskPreservedHash $TaskPath $item.name) -cne $item.preserved) {
         throw "task $($item.name) trigger, principal or settings changed; review backup $Backup"
       }

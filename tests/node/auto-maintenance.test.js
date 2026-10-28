@@ -97,7 +97,7 @@ test('quarantine is reversible, excludes/protected files/links kept, retention u
     assert.equal(preview.actions.filter((a) => a.action === 'would-quarantine').length, 1);
     assert.ok(fs.existsSync(path.join(dir, 'old.tmp')));
     const apply = await run(c, { files: true, processes: false, apply: true, now });
-    const moved = apply.actions.find((a) => a.action === 'quarantine'); assert.ok(moved);
+    const moved = apply.actions.find((a) => a.action === 'quarantine'); assert.ok(moved, JSON.stringify(apply.actions));
     assert.equal(fs.existsSync(path.join(dir, 'old.tmp')), false);
     assert.equal(fs.readFileSync(path.join(moved.quarantine, 'payload'), 'utf8'), 'data');
     assert.equal(JSON.parse(fs.readFileSync(path.join(moved.quarantine, 'manifest.json'))).source, path.join(dir, 'old.tmp'));

@@ -1147,9 +1147,10 @@ function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
 # Copies bin, lib, rules, windows and VERSION from $Source into the app folder. The new copy is built
 # next to the old one and checked file by file before the swap; when anything fails, the old copy
 # stays (or is put back), so the scheduled tasks never point at a missing or half-copied folder.
-function Sync-AicmAppCopy([string]$Source) {
+function Sync-AicmAppCopy([string]$Source, [string]$RecordedSource = '') {
   $app = Get-AicmAppDir
   if (Test-AicmSamePath $Source $app) { return $app }
+  if (-not $RecordedSource) { $RecordedSource = $Source }
   Confirm-AicmHome
   $new = "$app.new"
   $old = "$app.old"
@@ -1170,7 +1171,7 @@ function Sync-AicmAppCopy([string]$Source) {
       $p = Join-Path $Source $f
       if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force -ErrorAction Stop }
     }
-    Write-AicmUtf8Text (Join-Path $new 'SOURCE') $Source
+    Write-AicmUtf8Text (Join-Path $new 'SOURCE') $RecordedSource
     # The copy's own file list: what a later sync, uninstall or purge may replace or remove.
     $copied = Get-AicmCopyFiles $new
     if ($null -eq $copied) { throw "the new copy is incomplete ($($script:AicmHomeProblem))" }

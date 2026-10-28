@@ -17,6 +17,10 @@ if (-not $SkipUpdate) {
     throw 'Update has a user post-update hook. Review its effects separately before attempting a live Update; use -SkipUpdate to observe the other tasks.'
   }
 }
+$observingSession = [Diagnostics.Process]::GetCurrentProcess().SessionId
+$interactiveDesktop = [Environment]::UserInteractive -and
+  @((Get-Process -Name explorer -ErrorAction SilentlyContinue) | Where-Object { $_.SessionId -eq $observingSession }).Count -gt 0
+if (-not $interactiveDesktop) { throw 'Run the observer in the interactive desktop session with Explorer; no task was started.' }
 if (Test-Path -LiteralPath $OutputDir) { throw 'Choose a new output directory.' }
 New-Item -ItemType Directory -Path $OutputDir -ErrorAction Stop | Out-Null
 Add-Type -Path (Join-Path $PSScriptRoot 'window-observer.cs')
@@ -26,7 +30,6 @@ $targets = @(
 )
 if (-not $SkipUpdate) { $targets += @{ Path = '\AI CLI Auto Manager\'; Name = 'Update' } }
 if ($IncludeExternalPaseo) { $targets += @{ Path = '\'; Name = 'Paseo-Session-Cleanup' } }
-$observingSession = [Diagnostics.Process]::GetCurrentProcess().SessionId
 $summaries = New-Object System.Collections.Generic.List[object]
 
 foreach ($target in $targets) {
