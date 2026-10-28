@@ -76,7 +76,7 @@ jobs:
       fail-fast: false
       matrix:
         shell: [powershell, pwsh]
-        suite: [clean_test, aicm_test, inventory_test, maintenance_json_test, update_policy_test, home_ownership_test, unicode_paths_test, cache_budget_test]
+        suite: [clean_test, aicm_test, inventory_test, maintenance_json_test, update_policy_test, home_ownership_test, unicode_paths_test, cache_budget_test, windowless_launcher_test]
     runs-on: windows-latest
     defaults:
       run:
@@ -101,7 +101,7 @@ jobs:
         shell: pwsh
         run: |
           $nodeTests = @(Get-ChildItem -Path tests/node -Filter *.test.js | ForEach-Object { $_.FullName })
-          node --test @nodeTests
+          node --test --test-concurrency=2 @nodeTests
       - name: PSScriptAnalyzer errors
         shell: pwsh
         run: |

@@ -62,6 +62,7 @@ param(
   [switch]$ProcessesOnly,
   [switch]$KeepLegacyTask,
   [switch]$KeepOtherJobs,
+  [switch]$PreserveSource,
   [switch]$Apply,
   [int]$Days = 0,
   [switch]$Kill,
@@ -73,6 +74,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $binDir = $PSScriptRoot
 . (Join-Path (Split-Path -Parent $binDir) 'lib\aicm-common.ps1')
+. (Join-Path (Split-Path -Parent $binDir) 'lib\aicm-scheduler.ps1')
 
 $legacyTaskName = 'AI CLI Auto Update'
 
@@ -95,7 +97,7 @@ function Show-Help {
   Write-Host '  aicm.ps1 status'
   Write-Host '  aicm.ps1 doctor'
   Write-Host '  aicm.ps1 schedule  install|remove|show|refresh [-UpdateAt 05:00] [-InventoryDay Monday] [-InventoryAt 12:00]'
-  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-CleanCategory list] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply] [-KeepOtherJobs]'
+  Write-Host '                     [-CleanDay Monday] [-CleanAt 12:30] [-CleanCategory list] [-NoUpdate] [-NoInventory] [-NoClean] [-NoMaintenance] [-MaintenanceApply] [-KeepOtherJobs] [-PreserveSource]'
   Write-Host '  aicm.ps1 uninstall [-Purge] [-DryRun]   -DryRun lists what would be removed and changes nothing'
   Write-Host '  aicm.ps1 version'
 }
@@ -118,32 +120,10 @@ function Get-StateAgeDays($State) {
   try { return ((Get-Date) - [datetime]::Parse($State.finishedAt).ToLocalTime()).TotalDays } catch { return [double]::PositiveInfinity }
 }
 
-# Tasks run the installed copy through windows\run-hidden.vbs, so no PowerShell window flashes on screen
-# (//B: a script error never opens a dialog that would keep the task waiting). Where Windows Script Host
-# cannot run (turned off by policy, VBScript removed), they start PowerShell directly with a hidden window.
-function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra, [string]$Launcher = 'wscript') {
-  $ps = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $App "bin\$Script")`"") + $Extra
-  if ($Launcher -eq 'powershell') {
-    return (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ((@('-WindowStyle', 'Hidden') + $ps) -join ' '))
-  }
-  $vbs = Join-Path $App 'windows\run-hidden.vbs'
-  return (New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ((@('//B', '//Nologo', "`"$vbs`"", 'powershell.exe') + $ps) -join ' '))
-}
-
-# 'wscript' when wscript.exe runs windows\run-hidden.vbs and passes the exit code back, else 'powershell'.
-# The test runs a trivial command in batch mode (no dialog) and gives up after 20 seconds.
-# AICM_WSCRIPT_EXE replaces wscript.exe for the test (used by the tests to simulate a broken launcher).
-function Get-TaskLauncher([string]$App) {
-  if (@(Get-AicmWshDisabled).Count -gt 0) { return 'powershell' }
-  $exe = if ($env:AICM_WSCRIPT_EXE) { $env:AICM_WSCRIPT_EXE } else { 'wscript.exe' }
-  $vbs = Join-Path $App 'windows\run-hidden.vbs'
-  try {
-    $p = Start-Process -FilePath $exe -ArgumentList @('//B', '//Nologo', "`"$vbs`"", 'cmd.exe', '/c', 'exit', '7') -WindowStyle Hidden -PassThru -ErrorAction Stop
-    $null = $p.Handle
-    if (-not $p.WaitForExit(20000)) { try { $p.Kill() } catch { }; return 'powershell' }
-    if ($p.ExitCode -eq 7) { return 'wscript' }
-  } catch { }
-  return 'powershell'
+# The GUI-subsystem launcher starts a console-free PowerShell and passes its exit code through.
+function New-TaskAction([string]$App, [string]$Script, [string[]]$Extra, [string]$Launcher) {
+  $ps = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f (Join-Path $App "bin\$Script"))) + $Extra
+  return (New-ScheduledTaskAction -Execute $Launcher -Argument ($ps -join ' '))
 }
 
 # HH:MM or H:MM with hour 0-23 and minute 0-59.
@@ -255,7 +235,7 @@ function Get-TaskSignature($Action, $Trigger) {
 # The clone the installed copy came from (when this runs from the installed copy itself).
 function Get-ScheduleSource([string]$App) {
   $sourceFile = Join-Path $App 'SOURCE'
-  if ((Test-AicmSamePath (Get-AicmRoot) $App) -and (Test-Path -LiteralPath $sourceFile)) { return (Read-AicmUtf8FirstLine $sourceFile) }
+  if (Test-Path -LiteralPath $sourceFile) { return (Read-AicmUtf8FirstLine $sourceFile) }
   return (Get-AicmRoot)
 }
 
@@ -271,40 +251,69 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
   foreach ($k in 'updateAt', 'inventoryAt', 'cleanAt') {
     if (-not (Test-TimeText $Opt[$k])) { throw "invalid time '$($Opt[$k])' for $k`: use HH:MM with hour 0-23 and minute 0-59, like 05:00" }
   }
+  $lock = Enter-AicmScheduleLock
+  try {
   # Options are valid. Only then claim the home (a folder this tool did not create is refused untouched).
   Confirm-AicmHome
   $prev = Read-AicmState 'schedule'
   $jobs = New-Object System.Collections.Generic.List[string]
-  $app = Sync-AicmAppCopy (Get-AicmRoot)
+  $existingNames = @($script:JobNames | Where-Object { Get-AicmTask $_ })
+  Assert-AicmManagedTasksIdle $existingNames $script:AicmTaskPath ([bool]$Refresh)
+  $recordedSource = Get-AicmRoot
+  if ($PreserveSource) {
+    $currentApp = Get-AicmAppDir
+    $sourceFile = Join-Path $currentApp 'SOURCE'
+    $sourceItem = Get-Item -LiteralPath $sourceFile -Force -ErrorAction SilentlyContinue
+    if (-not (Test-AicmRealFile $sourceItem)) { throw 'cannot preserve source: installed SOURCE is missing or linked' }
+    $recordedSource = Read-AicmUtf8FirstLine $sourceFile
+    if (-not $recordedSource -or -not [IO.Path]::IsPathRooted($recordedSource) -or
+        -not (Test-Path -LiteralPath $recordedSource -PathType Container) -or (Test-AicmSamePath $recordedSource $currentApp)) {
+      throw 'cannot preserve source: installed SOURCE is unavailable or points to the installed copy'
+    }
+  }
+  # Compile and record the old definitions/copy before changing either tasks or app.
+  $launcher = Initialize-AicmWindowlessLauncher (Get-AicmRoot)
+  $backup = New-AicmScheduleBackup $existingNames $script:AicmTaskPath
+  $migrated = @()
+  if ($backup) {
+    Write-Host "schedule backup: $backup"
+    Assert-AicmManagedTasksIdle $existingNames $script:AicmTaskPath ([bool]$Refresh)
+    $migrated = @(Convert-AicmLegacyTasks $existingNames $script:AicmTaskPath $launcher $backup)
+  }
+  try { $app = Sync-AicmAppCopy (Get-AicmRoot) $recordedSource }
+  catch {
+    if ($backup) { try { Restore-AicmTaskActions $backup } catch { Write-Warning "Could not restore all task actions; use backup $backup" } }
+    throw
+  }
   if (-not $Refresh) { Write-Host "installed copy: $app (version $(Get-AicmVersion))" }
-  $launcher = Get-TaskLauncher $app
-  if ($launcher -ne 'wscript') { Write-Host 'note: wscript.exe cannot run windows\run-hidden.vbs here (Windows Script Host turned off?); the tasks start PowerShell directly with a hidden window, which may flash briefly' }
   $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-  $changed = $false
+  $changed = ($migrated.Count -gt 0)
   foreach ($name in $script:JobNames) {
     $existing = Get-AicmTask $name
     if ($Want -contains $name) {
       $spec = Get-JobSpec $name $Opt $app $launcher
       $same = $existing -and (Get-TaskSignature $existing.Actions[0] $existing.Triggers[0]) -eq (Get-TaskSignature $spec.Action $spec.Trigger)
-      # A plain install also turns a disabled task back on; a refresh leaves that choice alone.
-      if ($same -and ($Refresh -or $existing.State -ne 'Disabled')) {
+      # Refresh preserves the existing task's arguments and trigger; migration already replaced
+      # its launcher after validating the installed script. Explicit install can change options.
+      if ($existing -and $Refresh) { $same = $true }
+      if ($same) {
         if (-not $Refresh) { Write-Host ("unchanged:  {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text) }
       } else {
-        $register = @{ TaskPath = $script:AicmTaskPath; TaskName = $name; Action = $spec.Action; Trigger = $spec.Trigger
-          Settings = $settings; Description = $spec.Description; Force = $true }
-        if ($Refresh -and $existing) {
-          $register.Settings = $existing.Settings
-          $register.Principal = $existing.Principal
-        }
-        Register-ScheduledTask @register | Out-Null
-        if ($Refresh -and $existing -and $existing.State -eq 'Disabled') {
-          Disable-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name | Out-Null
+        if ($existing) {
+          # Existing principal and settings stay. Refresh never replaces the trigger.
+          if ($Refresh) {
+            Set-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Action $spec.Action -ErrorAction Stop | Out-Null
+          } else {
+            Set-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Action $spec.Action -Trigger $spec.Trigger -ErrorAction Stop | Out-Null
+          }
+        } else {
+          Register-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Action $spec.Action -Trigger $spec.Trigger -Settings $settings -Description $spec.Description -Force | Out-Null
         }
         Write-Host ("registered: {0}{1,-10} {2}" -f $script:AicmTaskPath, $name, $spec.Text)
         $changed = $true
       }
       $jobs.Add($name)
-    } elseif ($KeepOthers) {
+    } elseif ($KeepOthers -or $Refresh) {
       if ($existing) { $jobs.Add($name) }
     } elseif ($existing) {
       Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Confirm:$false
@@ -312,21 +321,21 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
       $changed = $true
     }
   }
-  if (-not $Refresh -and -not $KeepLegacyTask -and $Want -contains 'Update' -and (Get-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
-    Unregister-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -Confirm:$false
-    Write-Host "removed legacy task: \$legacyTaskName (replaced by $($script:AicmTaskPath)Update)"
+  if (-not $Refresh -and -not $KeepLegacyTask -and (Get-ScheduledTask -TaskPath '\' -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
+    Write-Host "kept legacy task: \$legacyTaskName; review it separately before removing it"
   }
   $installedAt = Get-AicmTimestamp
   if ($Refresh -and $prev -and $prev.PSObject.Properties['installedAt']) { $installedAt = [string]$prev.installedAt }
   Write-AicmState 'schedule' ([ordered]@{
     installedAt = $installedAt; version = Get-AicmVersion; app = $app; source = (Get-ScheduleSource $app)
-    jobs = $jobs.ToArray(); launcher = $launcher; options = $Opt
+    jobs = $jobs.ToArray(); launcher = 'windowless'; options = $Opt
   })
   if ($Refresh) {
     if (-not $changed) { Write-Host 'scheduled tasks already match the installed copy' }
   } else {
     Write-Host 'Each run checks that the other jobs still exist and shows a desktop notification if one is gone.'
   }
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 # Jobs asked for on the command line.
@@ -340,6 +349,8 @@ function Get-WantedJobs {
 }
 
 function Invoke-ScheduleInstall {
+  $lock = Enter-AicmScheduleLock
+  try {
   $opt = Get-ParamScheduleOptions
   if ($KeepOtherJobs) {
     # Jobs that are not being installed keep the days and times they were installed with.
@@ -350,19 +361,25 @@ function Invoke-ScheduleInstall {
     if ($NoUpdate) { foreach ($k in 'updateAt', 'targets', 'installMissing', 'logRetentionDays') { $opt[$k] = $base[$k] } }
   }
   Install-Schedule $opt @(Get-WantedJobs) -KeepOthers:$KeepOtherJobs
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 # Re-registers the installed jobs with their stored options (run by the update after it refreshed
 # the installed copy). Changes nothing when the tasks already match.
 function Invoke-ScheduleRefresh {
+  $lock = Enter-AicmScheduleLock
+  try {
   $sched = Read-AicmState 'schedule'
   if (-not $sched) { Write-Host 'no schedule installed; nothing to refresh'; return }
   $want = @(@($sched.jobs) | Where-Object { $script:JobNames -contains $_ })
   if ($want.Count -eq 0) { Write-Host 'no scheduled jobs recorded; nothing to refresh'; return }
   Install-Schedule (Get-InstalledScheduleOptions $sched) $want -Refresh
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 function Remove-Schedule {
+  $lock = Enter-AicmScheduleLock
+  try {
   foreach ($name in 'Update', 'Inventory', 'Clean', 'Maintenance') {
     if (Get-AicmTask $name) {
       Unregister-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -Confirm:$false
@@ -371,6 +388,7 @@ function Remove-Schedule {
   }
   $file = Join-Path (Join-Path (Get-AicmHome) 'state') 'schedule.json'
   if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 # The tasks `aicm.ps1 uninstall` would remove (for -DryRun).
@@ -385,6 +403,8 @@ function Show-SchedulePreview {
 # Removes the scheduled jobs and the installed copy. Logs, state and archives stay unless -Purge.
 # Everything is checked before anything is changed; -DryRun only lists what would go.
 function Invoke-Uninstall {
+  $lock = Enter-AicmScheduleLock
+  try {
   $app = Get-AicmAppDir
   $homeDir = Get-AicmHome
   $removeApp = $false
@@ -425,6 +445,7 @@ function Invoke-Uninstall {
   } else {
     Write-Host "kept $homeDir (logs, state, archive, local rules); add -Purge to remove it too"
   }
+  } finally { Exit-AicmScheduleLock $lock }
 }
 
 function Show-Schedule {

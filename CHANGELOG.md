@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.10.1 - 2026-10-28
+
+- Replace the Windows scheduled-task VBScript launcher with a GUI-subsystem executable compiled by
+  the .NET Framework compiler. It starts PowerShell without a console window and returns the child
+  exit code. Installation fails closed if the compiler or launcher is unavailable.
+- Before migrating the manager's Windows tasks, save task XML and the installed app, then replace
+  only the action while preserving arguments, triggers, principal and settings. The launcher stays
+  outside the app so an update does not replace a running executable. Backups are retained for rollback.
+- Third-party tasks are not migrated automatically. The Windows migration guide describes how to
+  inspect them and retain any existing dry-run arguments.
+- A separate checkout can install the reviewed copy with `schedule refresh -PreserveSource` while
+  retaining the original update-source path. A running task blocks manual refresh. The old
+  `AI CLI Auto Update` task is no longer removed automatically; review it separately.
+- A standalone migration can change only managed task actions without replacing a customized
+  installed app. Its backup can be restored with the `-ActionsOnly` option.
+- Serialize manager schedule and app-copy changes for the same home, avoid new backups on an
+  already-completed standalone migration, and report legacy task actions even if the stored state
+  says the launcher is windowless.
+- Verify launcher and backup hashes with .NET so migration also works when PowerShell does not
+  auto-load the Windows utility module containing `Get-FileHash`.
+
 ## 2.10.0 - 2026-10-27
 
 ### Integration with v2.9.0

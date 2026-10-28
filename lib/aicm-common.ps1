@@ -62,6 +62,36 @@ function Get-AicmLockName([string]$Kind) {
   return $name
 }
 
+# Serialize schedule/app mutations across processes and interactive sessions for the same home.
+# The operating system releases the mutex if a holder exits unexpectedly. The mutex is recursive
+# within a thread so schedule refresh can call the app-copy helper while holding the same lock.
+function Enter-AicmScheduleLock([int]$WaitMilliseconds = 30000) {
+  $homePath = [IO.Path]::GetFullPath((Get-AicmHome)).TrimEnd('\', '/').ToLowerInvariant()
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { $hash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($homePath)))).Replace('-', '').ToLowerInvariant() }
+  finally { $sha.Dispose() }
+  $mutex = [Threading.Mutex]::new($false, ('Global\aicm-schedule-' + $hash.Substring(0, 24)))
+  $acquired = $false
+  try {
+    try { $acquired = $mutex.WaitOne($WaitMilliseconds) }
+    catch {
+      $ex = $_.Exception
+      while ($ex -and -not ($ex -is [Threading.AbandonedMutexException])) { $ex = $ex.InnerException }
+      if (-not $ex) { throw }
+      # WaitOne owns an abandoned mutex even though it throws. Release it, then stop so the caller
+      # can inspect the latest backup and task actions before starting another mutation.
+      $mutex.ReleaseMutex()
+      throw 'a previous schedule operation stopped unexpectedly; review the task and latest backup before retrying'
+    }
+    if (-not $acquired) { throw 'another schedule operation is in progress; retry when it completes' }
+    return $mutex
+  } catch { $mutex.Dispose(); throw }
+}
+
+function Exit-AicmScheduleLock($Mutex) {
+  try { $Mutex.ReleaseMutex() } finally { $Mutex.Dispose() }
+}
+
 function Initialize-AicmDirectory([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) {
     New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -716,9 +746,10 @@ function Test-AicmHomeMarker([string]$HomeDir) {
 function Test-AicmAppFileShape([string]$Rel) {
   $known = @(
     'bin/aicm', 'bin/aicm.ps1', 'bin/clean_ai_leftovers.ps1', 'bin/clean_ai_leftovers.sh', 'bin/inventory_ai_clis.ps1', 'bin/inventory_ai_clis.sh', 'bin/update_ai_clis.ps1', 'bin/update_ai_clis.sh',
-    'lib/aicm-common.ps1', 'lib/aicm-common.sh', 'lib/aicm-file-guard.cs', 'lib/aicm-job.cs', 'lib/aicm-process-token.cs', 'lib/auto-maintenance.js', 'lib/codex-host.sh', 'lib/config-drift.js', 'lib/maintenance-cli.js', 'lib/maintenance-files.js', 'lib/maintenance-files.ps1', 'lib/maintenance-processes.js', 'lib/maintenance.js', 'lib/node-common.js', 'lib/npm-guard.js', 'lib/optimize.js', 'lib/processes.js', 'lib/supervise.js', 'lib/update-policy.js', 'lib/worktrees.js',
+    'lib/aicm-common.ps1', 'lib/aicm-common.sh', 'lib/aicm-scheduler.ps1', 'lib/aicm-file-guard.cs', 'lib/aicm-job.cs', 'lib/aicm-process-token.cs', 'lib/auto-maintenance.js', 'lib/codex-host.sh', 'lib/config-drift.js', 'lib/maintenance-cli.js', 'lib/maintenance-files.js', 'lib/maintenance-files.ps1', 'lib/maintenance-processes.js', 'lib/maintenance.js', 'lib/node-common.js', 'lib/npm-guard.js', 'lib/optimize.js', 'lib/processes.js', 'lib/supervise.js', 'lib/update-policy.js', 'lib/worktrees.js',
     'rules/ai-clis.conf', 'rules/clean-categories.conf', 'rules/clean-rules.conf', 'rules/maintenance.conf',
-    'windows/install_scheduled_task.ps1', 'windows/run-hidden.vbs'
+    'windows/install_scheduled_task.ps1', 'windows/run-hidden.vbs', 'windows/aicm-windowless.cs', 'windows/restore-schedule-backup.ps1', 'windows/migrate-windowless-tasks.ps1',
+    'windows/window-observer.cs', 'windows/check-scheduled-windows.ps1'
   )
   return $known -contains $Rel
 }
@@ -1126,7 +1157,7 @@ function Move-AicmDirectory([string]$From, [string]$To) {
 # files every copy needs. Empty when the copy is complete.
 function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
   $gaps = New-Object System.Collections.Generic.List[string]
-  foreach ($f in 'VERSION', 'bin\aicm.ps1', 'lib\aicm-common.ps1', 'windows\run-hidden.vbs') {
+  foreach ($f in 'VERSION', 'bin\aicm.ps1', 'lib\aicm-common.ps1', 'lib\aicm-scheduler.ps1', 'windows\aicm-windowless.cs') {
     if (-not (Test-Path -LiteralPath (Join-Path $Copy $f) -PathType Leaf)) { $gaps.Add($f) }
   }
   if (-not (Get-ChildItem -LiteralPath (Join-Path $Copy 'rules') -File -ErrorAction SilentlyContinue)) { $gaps.Add('rules') }
@@ -1146,9 +1177,16 @@ function Get-AicmAppCopyGaps([string]$Source, [string]$Copy) {
 # Copies bin, lib, rules, windows and VERSION from $Source into the app folder. The new copy is built
 # next to the old one and checked file by file before the swap; when anything fails, the old copy
 # stays (or is put back), so the scheduled tasks never point at a missing or half-copied folder.
-function Sync-AicmAppCopy([string]$Source) {
+function Sync-AicmAppCopy([string]$Source, [string]$RecordedSource = '') {
+  $lock = Enter-AicmScheduleLock
+  try { return (Sync-AicmAppCopyLocked $Source $RecordedSource) }
+  finally { Exit-AicmScheduleLock $lock }
+}
+
+function Sync-AicmAppCopyLocked([string]$Source, [string]$RecordedSource = '') {
   $app = Get-AicmAppDir
   if (Test-AicmSamePath $Source $app) { return $app }
+  if (-not $RecordedSource) { $RecordedSource = $Source }
   Confirm-AicmHome
   $new = "$app.new"
   $old = "$app.old"
@@ -1169,7 +1207,7 @@ function Sync-AicmAppCopy([string]$Source) {
       $p = Join-Path $Source $f
       if (Test-Path -LiteralPath $p) { Copy-Item -LiteralPath $p -Destination (Join-Path $new $f) -Force -ErrorAction Stop }
     }
-    Write-AicmUtf8Text (Join-Path $new 'SOURCE') $Source
+    Write-AicmUtf8Text (Join-Path $new 'SOURCE') $RecordedSource
     # The copy's own file list: what a later sync, uninstall or purge may replace or remove.
     $copied = Get-AicmCopyFiles $new
     if ($null -eq $copied) { throw "the new copy is incomplete ($($script:AicmHomeProblem))" }
@@ -1214,18 +1252,21 @@ function Update-AicmAppCopy {
     Write-Host "installed copy: $source has version $newVersion, not newer than $current; keeping $current"
     return
   }
-  try { [void](Sync-AicmAppCopy $source) }
-  catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); keeping $current, trying again next run"; return }
-  Write-Host "installed copy: updated $current -> $newVersion from $source"
-  if (-not (Read-AicmState 'schedule')) { return }
-  try {
-    $exe = (Get-Process -Id $PID).Path
-    $out = & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $app 'bin\aicm.ps1') schedule refresh 2>&1
-    foreach ($line in @($out)) { if ("$line".Trim()) { Write-Host "schedule refresh: $line" } }
-    if ($LASTEXITCODE -ne 0) { Write-Host "schedule refresh: failed (exit code $LASTEXITCODE); run: aicm.ps1 schedule install" }
-  } catch {
-    Write-Host "schedule refresh: failed ($($_.Exception.Message)); run: aicm.ps1 schedule install"
+  if (Read-AicmState 'schedule') {
+    # The new source backs up and migrates existing actions BEFORE it swaps the old installed copy.
+    try {
+      $exe = (Get-Process -Id $PID).Path
+      $out = & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $source 'bin\aicm.ps1') schedule refresh 2>&1
+      foreach ($line in @($out)) { if ("$line".Trim()) { Write-Host "schedule refresh: $line" } }
+      if ($LASTEXITCODE -ne 0 -or (Read-AicmUtf8FirstLine (Join-Path $app 'VERSION')) -ne $newVersion) {
+        Write-Host "installed copy: could not refresh; keeping or reviewing $current, trying again next run"; return
+      }
+    } catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); trying again next run"; return }
+  } else {
+    try { [void](Sync-AicmAppCopy $source) }
+    catch { Write-Host "installed copy: could not refresh ($($_.Exception.Message)); keeping $current, trying again next run"; return }
   }
+  Write-Host "installed copy: updated $current -> $newVersion from $source"
 }
 
 # AICM_TASK_PATH lets tests register throwaway tasks in their own folder.
@@ -1233,25 +1274,6 @@ $script:AicmTaskPath = if ($env:AICM_TASK_PATH) { $env:AICM_TASK_PATH } else { '
 
 function Get-AicmTask([string]$Name) {
   return (Get-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $Name -ErrorAction SilentlyContinue)
-}
-
-# Registry keys that turn Windows Script Host off (value Enabled = 0); the tasks normally start
-# through wscript.exe, so they cannot run then. AICM_WSH_KEYS (paths separated by ';') replaces the
-# two real keys in tests.
-function Get-AicmWshDisabled {
-  $keys = if ($env:AICM_WSH_KEYS) { $env:AICM_WSH_KEYS -split ';' } else {
-    @('HKCU:\Software\Microsoft\Windows Script Host\Settings', 'HKLM:\Software\Microsoft\Windows Script Host\Settings')
-  }
-  foreach ($k in $keys) {
-    if (-not $k) { continue }
-    $v = $null
-    try {
-      $properties = Get-ItemProperty -LiteralPath $k -ErrorAction Stop
-      if (-not $properties.PSObject.Properties['Enabled']) { continue }
-      $v = $properties.Enabled
-    } catch { continue }
-    if ("$v".Trim() -eq '0') { $k }
-  }
 }
 
 # A registered task that cannot do its work: turned off, pointing at a file that is gone, or failed
@@ -1293,10 +1315,8 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
   $installedDays = 0
   try { $installedDays = ((Get-Date).ToUniversalTime() - [datetime]::Parse($sched.installedAt).ToUniversalTime()).TotalDays } catch { }
   $launcher = if ($sched.PSObject.Properties['launcher']) { [string]$sched.launcher } else { 'wscript' }
-  if ($launcher -eq 'wscript') {
-    foreach ($k in @(Get-AicmWshDisabled)) {
-      $problems.Add("Windows Script Host is turned off ($k = 0), so the scheduled tasks cannot start; run: aicm.ps1 schedule install (it then starts them through PowerShell)")
-    }
+  if ($launcher -eq 'wscript' -or $launcher -eq 'powershell') {
+    $problems.Add('scheduled tasks use a legacy launcher; run: aicm.ps1 schedule refresh to migrate them')
   }
   foreach ($job in @($sched.jobs)) {
     if ($job -eq $Skip) { continue }
@@ -1304,6 +1324,15 @@ function Get-AicmScheduleProblems([string]$Skip = '', [switch]$NoStale) {
     if (-not $task) {
       $problems.Add("scheduled task '$job' is missing; run: aicm.ps1 schedule install")
       continue
+    }
+    if ($launcher -eq 'windowless') {
+      $legacy = @($task.Actions | Where-Object {
+        [string]$_.Execute -match '(?i)(?:^|[\\/])(?:wscript|cscript|powershell)(?:\.exe)?$' -or
+        [string]$_.Execute -match '(?i)\.vbs$' -or
+        [string]$_.Arguments -match '(?i)(?:^|[\\/\s"])(?:wscript|cscript)(?:\.exe)?(?:\s|"|$)' -or
+        [string]$_.Arguments -match '(?i)\.vbs(?:\s|"|$)'
+      })
+      if ($legacy.Count -gt 0) { $problems.Add("scheduled task '$job' uses a legacy launcher despite windowless state; run: aicm.ps1 schedule refresh") }
     }
     foreach ($p in @(Get-AicmTaskProblems $task $job)) { $problems.Add($p) }
     if ($NoStale -or -not $limits.ContainsKey($job)) { continue }
