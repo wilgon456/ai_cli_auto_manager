@@ -115,6 +115,12 @@ try {
   $onlyLines = @($migrationOnly.Output -split '\r?\n' | Where-Object { $_ -match '^schedule backup: ' } | Select-Object -First 1)
   $onlyBackup = if ($onlyLines.Count -eq 1) { $onlyLines[0] -replace '^schedule backup: ', '' } else { '' }
   if ($migrationOnly.ExitCode -eq 0 -and $appHashBefore -ceq $appHashAfter -and $newState.launcher -eq 'windowless' -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Execute -eq $launcherFile) { Pass 'launcher-only migration preserves every installed app file' } else { Fail "launcher-only migration: $($migrationOnly.Output)" }
+  $scheduleBackup = Join-Path $onlyBackup 'schedule.json'
+  $scheduleBytes = [IO.File]::ReadAllBytes($scheduleBackup)
+  [IO.File]::AppendAllText($scheduleBackup, ' ')
+  $refusedState = Invoke-Script 'windows\restore-schedule-backup.ps1' @('-BackupDir', $onlyBackup, '-ActionsOnly')
+  if ($refusedState.ExitCode -ne 0 -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Execute -eq $launcherFile) { Pass 'launcher-only rollback refuses a modified schedule state backup before changing tasks' } else { Fail "tampered schedule backup: $($refusedState.Output)" }
+  [IO.File]::WriteAllBytes($scheduleBackup, $scheduleBytes)
   $onlyRollback = Invoke-Script 'windows\restore-schedule-backup.ps1' @('-BackupDir', $onlyBackup, '-ActionsOnly')
   $restoredState = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
   if ($onlyRollback.ExitCode -eq 0 -and $restoredState.launcher -eq 'wscript' -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Arguments -eq $legacyArgs) { Pass 'launcher-only rollback restores task action and state' } else { Fail "launcher-only rollback: $($onlyRollback.Output)" }

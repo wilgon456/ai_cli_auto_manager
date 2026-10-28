@@ -131,11 +131,15 @@ function New-AicmScheduleBackup([string[]]$Names, [string]$TaskPath) {
   if ($stateItem -and -not (Test-AicmRealDir $stateItem)) { throw 'schedule state folder is linked or invalid' }
   $schedule = Join-Path $stateDir 'schedule.json'
   $schedItem = Get-Item -LiteralPath $schedule -Force -ErrorAction SilentlyContinue
+  $scheduleHash = ''
   if ($schedItem) {
     if (-not (Test-AicmRealFile $schedItem)) { throw 'schedule state is not a real file' }
-    Copy-Item -LiteralPath $schedule -Destination (Join-Path $backup 'schedule.json') -ErrorAction Stop
+    $savedSchedule = Join-Path $backup 'schedule.json'
+    Copy-Item -LiteralPath $schedule -Destination $savedSchedule -ErrorAction Stop
+    $scheduleHash = (Get-FileHash -LiteralPath $savedSchedule -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($scheduleHash -cne (Get-FileHash -LiteralPath $schedule -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'schedule state backup verification failed' }
   }
-  $meta = @{ format = 1; taskPath = $TaskPath; names = @($Names); aicmHome = (Get-AicmHome); hasApp = [bool]$appItem; xmlHashes = $xmlHashes; appHashes = $appHashes }
+  $meta = @{ format = 1; taskPath = $TaskPath; names = @($Names); aicmHome = (Get-AicmHome); hasApp = [bool]$appItem; xmlHashes = $xmlHashes; appHashes = $appHashes; schedulePresent = [bool]$schedItem; scheduleHash = $scheduleHash }
   Write-AicmUtf8Text (Join-Path $backup 'backup.json') (($meta | ConvertTo-Json -Depth 6) + [Environment]::NewLine)
   return $backup
 }

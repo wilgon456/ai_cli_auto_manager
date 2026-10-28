@@ -20,6 +20,13 @@ if ($meta.format -ne 1 -or -not (Test-AicmSamePath ([string]$meta.aicmHome) (Get
 if ([string]$meta.taskPath -ne $script:AicmTaskPath) { throw 'backup belongs to a different task folder' }
 $names = @($meta.names)
 if ($names.Count -eq 0 -or -not $meta.hasApp) { throw 'backup does not contain tasks and an installed copy' }
+if (-not $meta.PSObject.Properties['schedulePresent'] -or -not $meta.PSObject.Properties['scheduleHash']) { throw 'backup does not contain schedule state verification metadata' }
+$savedSchedule = Join-Path $backup 'schedule.json'
+$savedScheduleItem = Get-Item -LiteralPath $savedSchedule -Force -ErrorAction SilentlyContinue
+if ($meta.schedulePresent) {
+  if (-not (Test-AicmRealFile $savedScheduleItem) -or
+      (Get-FileHash -LiteralPath $savedSchedule -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$meta.scheduleHash) { throw 'schedule state backup failed verification' }
+} elseif ($savedScheduleItem) { throw 'backup contains an unexpected schedule state file' }
 foreach ($name in $names) {
   if (@('Update', 'Inventory', 'Clean', 'Maintenance') -notcontains [string]$name) { throw 'backup contains an unrecognized task' }
   $xmlFile = Join-Path $backup "$name.xml"
@@ -46,8 +53,7 @@ $recovery = New-AicmScheduleBackup $names $script:AicmTaskPath
 Write-Host "Current task XML and installed copy backed up to: $recovery"
 if ($ActionsOnly) {
   Restore-AicmTaskActions $backup
-  $savedSchedule = Join-Path $backup 'schedule.json'
-  if (Test-Path -LiteralPath $savedSchedule -PathType Leaf) {
+  if ($meta.schedulePresent) {
     $stateDir = Join-Path (Get-AicmHome) 'state'
     if (-not (Test-AicmRealDir (Get-Item -LiteralPath $stateDir -Force -ErrorAction SilentlyContinue))) { throw 'current schedule state folder is linked or missing' }
     $schedule = Join-Path $stateDir 'schedule.json'
@@ -71,8 +77,7 @@ try {
     Write-Warning "Task restore was incomplete. Current actions and copy are backed up at $recovery; current copy is also at $savedCurrent."
     throw
   }
-  $savedSchedule = Join-Path $backup 'schedule.json'
-  if (Test-Path -LiteralPath $savedSchedule -PathType Leaf) {
+  if ($meta.schedulePresent) {
     $schedule = Join-Path (Join-Path (Get-AicmHome) 'state') 'schedule.json'
     $currentSchedule = Get-Item -LiteralPath $schedule -Force -ErrorAction SilentlyContinue
     if ($currentSchedule -and -not (Test-AicmRealFile $currentSchedule)) { throw 'current schedule state is linked; it was not replaced' }
