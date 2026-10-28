@@ -95,6 +95,66 @@ function Initialize-AicmWindowlessLauncher([string]$SourceRoot) {
   }
 }
 
+# The process installing the manager and Task Scheduler can see different filesystem views even
+# with the same user SID. Before changing a real action, ask Task Scheduler to run this exact file
+# under each existing task principal and verify the file's hash in that task's own context.
+function Assert-AicmLauncherVisible([string]$Launcher, [string]$ExpectedHash, [string[]]$Names, [string]$TaskPath) {
+  if ($ExpectedHash -cnotmatch '^[0-9a-f]{64}$') { throw 'invalid launcher hash for scheduled visibility check' }
+  $script = @'
+$ErrorActionPreference = 'Stop'
+try {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $stream = [IO.File]::OpenRead('__AICM_LAUNCHER__')
+    try { $hash = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose() }
+  } finally { $sha.Dispose() }
+  if ($hash -ceq '__AICM_HASH__') { exit 23 }
+  exit 24
+} catch { exit 25 }
+'@
+  $script = $script.Replace('__AICM_LAUNCHER__', $Launcher.Replace("'", "''")).Replace('__AICM_HASH__', $ExpectedHash)
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+  $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + $encoded
+  $folder = 'AICM Launcher Probe ' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+  $probePath = '\' + $folder + '\'
+  $created = New-Object System.Collections.Generic.List[string]
+  $targets = @($Names)
+  if ($targets.Count -eq 0) { $targets = @('') }
+  try {
+    $index = 0
+    foreach ($name in $targets) {
+      $probeName = 'check-' + $index; $index++
+      $action = New-ScheduledTaskAction -Execute $Launcher -Argument $arguments
+      $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddHours(2))
+      $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+      $options = @{ TaskPath = $probePath; TaskName = $probeName; Action = $action; Trigger = $trigger; Settings = $settings; Force = $true; ErrorAction = 'Stop' }
+      if ($name) { $options.Principal = (Get-ScheduledTask -TaskPath $TaskPath -TaskName $name -ErrorAction Stop).Principal }
+      Register-ScheduledTask @options | Out-Null
+      $created.Add($probeName)
+      $before = (Get-ScheduledTaskInfo -TaskPath $probePath -TaskName $probeName -ErrorAction Stop).LastRunTime
+      Start-ScheduledTask -TaskPath $probePath -TaskName $probeName -ErrorAction Stop
+      $deadline = (Get-Date).AddSeconds(60); $done = $false; $result = $null
+      do {
+        Start-Sleep -Milliseconds 200
+        $probe = Get-ScheduledTask -TaskPath $probePath -TaskName $probeName -ErrorAction Stop
+        $info = Get-ScheduledTaskInfo -TaskPath $probePath -TaskName $probeName -ErrorAction Stop
+        $code = [int64]$info.LastTaskResult
+        if ($info.LastRunTime -gt $before -and $probe.State -notin @('Running', 'Queued') -and $code -notin @(0x41301, 0x41303, 0x41325)) { $done = $true; $result = $code }
+      } while (-not $done -and (Get-Date) -lt $deadline)
+      if (-not $done -or $result -ne 23) { throw "Task Scheduler cannot run and verify the launcher for '$name' (result $result); no managed task was changed" }
+    }
+  } finally {
+    foreach ($name in $created) {
+      $probe = Get-ScheduledTask -TaskPath $probePath -TaskName $name -ErrorAction SilentlyContinue
+      if ($probe -and $probe.State -eq 'Running') { Stop-ScheduledTask -TaskPath $probePath -TaskName $name -ErrorAction SilentlyContinue }
+      Unregister-ScheduledTask -TaskPath $probePath -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    try { $service = New-Object -ComObject 'Schedule.Service'; $service.Connect(); $service.GetFolder('\').DeleteFolder($folder, 0) }
+    catch { if ($created.Count -gt 0) { Write-Warning "Could not remove the empty launcher probe task folder: $probePath" } }
+  }
+}
+
 function New-AicmScheduleBackup([string[]]$Names, [string]$TaskPath) {
   if ($Names.Count -eq 0) { return '' }
   $app = Get-AicmAppDir

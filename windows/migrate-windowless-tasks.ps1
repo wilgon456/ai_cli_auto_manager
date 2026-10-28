@@ -17,6 +17,7 @@ $names = @(@('Update', 'Inventory', 'Clean', 'Maintenance') | Where-Object {
 if ($names.Count -eq 0) { throw 'no managed tasks found' }
 Assert-AicmManagedTasksIdle $names $script:AicmTaskPath $false
 $launcher = Initialize-AicmWindowlessLauncher $root
+Assert-AicmLauncherVisible -Launcher $launcher -ExpectedHash (Get-AicmFileSha256 $launcher) -Names $names -TaskPath $script:AicmTaskPath
 $scripts = @{ Update = 'update_ai_clis.ps1'; Inventory = 'inventory_ai_clis.ps1'; Clean = 'clean_ai_leftovers.ps1'; Maintenance = 'aicm.ps1' }
 $needsChange = $false
 foreach ($name in $names) {

@@ -273,6 +273,7 @@ function Install-Schedule($Opt, [string[]]$Want, [switch]$KeepOthers, [switch]$R
   }
   # Compile and record the old definitions/copy before changing either tasks or app.
   $launcher = Initialize-AicmWindowlessLauncher (Get-AicmRoot)
+  Assert-AicmLauncherVisible -Launcher $launcher -ExpectedHash (Get-AicmFileSha256 $launcher) -Names $existingNames -TaskPath $script:AicmTaskPath
   $backup = New-AicmScheduleBackup $existingNames $script:AicmTaskPath
   $migrated = @()
   if ($backup) {

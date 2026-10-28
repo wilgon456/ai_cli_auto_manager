@@ -21,6 +21,13 @@ try {
   $env:AICM_HOME = Join-Path $fakeHome '.ai-cli-auto-manager'
   $exe = Initialize-AicmWindowlessLauncher $root
   if ((Test-Path -LiteralPath $exe -PathType Leaf) -and (Initialize-AicmWindowlessLauncher $root) -eq $exe) { Pass 'compiled GUI launcher is reused after hash verification' } else { Fail 'launcher compilation or verification' }
+  $launcherHash = Get-AicmFileSha256 $exe
+  $visible = $false
+  try { Assert-AicmLauncherVisible -Launcher $exe -ExpectedHash $launcherHash -Names @() -TaskPath $taskPath; $visible = $true } catch { }
+  if ($visible) { Pass 'Task Scheduler can run and hash the launcher in its own context' } else { Fail 'scheduler launcher visibility check' }
+  $wrongHashRefused = $false
+  try { Assert-AicmLauncherVisible -Launcher $exe -ExpectedHash ('0' * 64) -Names @() -TaskPath $taskPath } catch { $wrongHashRefused = $_.Exception.Message -match 'cannot run and verify the launcher' }
+  if ($wrongHashRefused) { Pass 'scheduler visibility check rejects a different launcher hash' } else { Fail 'scheduler accepted the wrong launcher hash' }
 
   $fixture = Join-Path $work 'test script.ps1'
   @'
