@@ -44,7 +44,32 @@ function Invoke-Child([string[]]$PsArguments) {
   }
 }
 
-function Invoke-Aicm([string[]]$Arguments) { return (Invoke-Script 'bin\aicm.ps1' $Arguments) }
+# Keep the fixture's real triggers from firing while the suite manipulates its disposable tasks.
+# Preserve their clock times and days so the schedule assertions and manual starts remain meaningful.
+$fixtureStartDate = (Get-Date).Date.AddDays(7)
+function Defer-FixtureTriggers {
+  foreach ($task in @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) {
+    $changed = $false
+    $triggers = @($task.Triggers)
+    foreach ($trigger in $triggers) {
+      if (-not $trigger.StartBoundary) { continue }
+      $start = [datetime]$trigger.StartBoundary
+      if ($start.Date -lt $fixtureStartDate) {
+        $trigger.StartBoundary = $fixtureStartDate.Add($start.TimeOfDay).ToString('yyyy-MM-ddTHH:mm:ss')
+        $changed = $true
+      }
+    }
+    if ($changed) { Set-ScheduledTask -TaskPath $taskPath -TaskName $task.TaskName -Trigger $triggers -ErrorAction Stop | Out-Null }
+  }
+}
+
+function Invoke-Aicm([string[]]$Arguments) {
+  $result = Invoke-Script 'bin\aicm.ps1' $Arguments
+  if ($Arguments.Count -ge 2 -and $Arguments[0] -eq 'schedule' -and $Arguments[1] -eq 'install' -and $result.ExitCode -eq 0) {
+    Defer-FixtureTriggers
+  }
+  return $result
+}
 
 function Write-FreshUpdateState {
   $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')

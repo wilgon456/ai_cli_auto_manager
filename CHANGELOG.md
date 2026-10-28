@@ -22,6 +22,7 @@
   auto-load the Windows utility module containing `Get-FileHash`.
 - Before changing task actions, use a temporary scheduled task for each execution account to confirm
   that Task Scheduler can start and hash the same launcher; refuse the migration on failure.
+- The system-wide VBScript audit handles non-executable scheduled-task actions, including COM handlers.
 
 ## 2.10.0 - 2026-10-27
 

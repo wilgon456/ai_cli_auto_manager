@@ -10,6 +10,7 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'lib\aicm-scheduler.ps1')
 if (-not $RunTasks) { throw 'Pass -RunTasks only after approving execution of the real update and cleanup tasks.' }
 if (-not $SkipUpdate) {
   $managerHome = if ($env:AICM_HOME) { $env:AICM_HOME } else { Join-Path $env:USERPROFILE '.ai-cli-auto-manager' }
@@ -109,12 +110,7 @@ foreach ($target in $targets) {
   })
 }
 $vbsTasks = @(Get-ScheduledTask | Where-Object {
-  @($_.Actions | Where-Object {
-    [string]$_.Execute -match '(?i)(?:^|[\\/])(?:wscript|cscript)(?:\.exe)?$' -or
-    [string]$_.Execute -match '(?i)\.vbs$' -or
-    [string]$_.Arguments -match '(?i)(?:^|[\\/\s"])(?:wscript|cscript)(?:\.exe)?(?:\s|"|$)' -or
-    [string]$_.Arguments -match '(?i)\.vbs(?:\s|"|$)'
-  }).Count -gt 0
+  @($_.Actions | Where-Object { Test-AicmWindowsScriptAction $_ }).Count -gt 0
 } | ForEach-Object { @{ path = $_.TaskPath; name = $_.TaskName } })
 $report = @{ samplingIntervalMs = 100; desktopSession = $observingSession; tasks = @($summaries.ToArray()); remainingVbsTasks = $vbsTasks }
 [IO.File]::WriteAllText((Join-Path $OutputDir 'summary.json'), (($report | ConvertTo-Json -Depth 6) + [Environment]::NewLine), (New-Object Text.UTF8Encoding($false)))
