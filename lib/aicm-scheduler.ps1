@@ -172,9 +172,13 @@ function Restore-AicmTaskActions([string]$Backup) {
     $items = @($xml.Task.Actions.Exec)
     if ($items.Count -ne 1) { throw "backup for $name does not have one executable action" }
     $old = $items[0]
-    $actionArgs = @{ Execute = [string]$old.Command }
-    if ($old.Arguments) { $actionArgs.Argument = [string]$old.Arguments }
-    if ($old.WorkingDirectory) { $actionArgs.WorkingDirectory = [string]$old.WorkingDirectory }
+    $commandNode = $old.SelectSingleNode("*[local-name()='Command']")
+    $argumentNode = $old.SelectSingleNode("*[local-name()='Arguments']")
+    $directoryNode = $old.SelectSingleNode("*[local-name()='WorkingDirectory']")
+    if (-not $commandNode -or -not $commandNode.InnerText) { throw "backup for $name has no executable" }
+    $actionArgs = @{ Execute = [string]$commandNode.InnerText }
+    if ($argumentNode -and $argumentNode.InnerText) { $actionArgs.Argument = [string]$argumentNode.InnerText }
+    if ($directoryNode -and $directoryNode.InnerText) { $actionArgs.WorkingDirectory = [string]$directoryNode.InnerText }
     $action = New-ScheduledTaskAction @actionArgs
     Set-ScheduledTask -TaskPath ([string]$meta.taskPath) -TaskName $name -Action $action -ErrorAction Stop | Out-Null
   }

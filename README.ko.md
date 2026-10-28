@@ -390,7 +390,7 @@ aicm optimize --apply --tasks npm-verify,pnpm-prune
 | macOS | `~/Library/LaunchAgents/io.github.wilgon456.ai-cli-auto-manager.{update,inventory,clean}.plist` | `--update-at 05:00 --inventory-day mon --inventory-at 12:00 --clean-day mon --clean-at 12:30` |
 | Linux | 사용자 crontab(`# aicm:update`, `# aicm:inventory`, `# aicm:clean` 표시가 붙은 줄만 건드림) | 위와 같음 |
 
-`schedule install`은 도구를 `~/.ai-cli-auto-manager/app`에 복사하고 예약 작업은 그 사본을 실행합니다. 그래서 git 저장소 폴더를 옮기거나 지워도 작업이 멈추지 않습니다. 저장소에서 새 버전을 받으면(`git pull`) 다음 날 업데이트 작업이 사본을 새것으로 바꾸고, 처음 등록할 때 정한 요일·시각 그대로 예약 작업을 새 사본 기준으로 다시 등록합니다(`schedule refresh`로 직접 해도 됩니다. 이미 맞는 작업은 건드리지 않습니다). 저장소에서 옛 태그를 꺼내 버전이 더 낮아져도 사본은 바뀌지 않습니다. 새 사본은 파일을 하나하나 대조한 뒤에 바꿔 넣고, 중간에 실패하면 옛 사본을 그대로 둡니다.
+`schedule install`은 도구를 `~/.ai-cli-auto-manager/app`에 복사하고 예약 작업은 그 사본을 실행합니다. 그래서 git 저장소 폴더를 옮기거나 지워도 작업이 멈추지 않습니다. 저장소에서 새 버전을 받으면(`git pull`) 다음 업데이트 작업이 사본을 새것으로 바꿉니다. `schedule refresh`로 직접 할 수도 있습니다. Windows에서는 기존 작업의 인자·일정·계정·설정을 유지하고 필요한 경우 실행기만 바꿉니다. 저장소에서 옛 태그를 꺼내 버전이 더 낮아져도 사본은 바뀌지 않습니다. 새 사본은 파일을 하나하나 대조한 뒤에 바꿔 넣고, 중간에 실패하면 옛 사본을 그대로 둡니다.
 
 윈도우 예약 작업은 내장 .NET Framework 컴파일러로 만든 GUI 실행기(`windows/aicm-windowless.cs`)를 사용합니다. 실행기는 PowerShell을 `CREATE_NO_WINDOW`로 시작하고 종료 코드를 전달합니다. 컴파일러가 없거나 실행기 검증에 실패하면 예약 변경을 멈춥니다. 기존 작업을 바꾸기 전에는 작업 XML과 이전 설치본을 백업합니다. 자세한 절차는 [Windows 이전·복구 안내](docs/windows-windowless-migration.md)를 보세요.
 

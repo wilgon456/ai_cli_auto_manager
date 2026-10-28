@@ -21,6 +21,11 @@ run the following only when ready to change the installed tasks:
 .\bin\aicm.ps1 schedule refresh
 ```
 
+For an existing version 2.10.0 or older, run this refresh from the new checkout before allowing the
+old daily updater to refresh the app if rollback to the old app version is required. The old updater
+swaps the installed copy before it can call the new migration code; in that automatic path, the XML
+backup is still made before task actions change, but the backup app may already be the newer version.
+
 Before changing a managed task, the command copies the old app and exports XML for the existing
 Update, Inventory, Clean and Maintenance tasks into a unique folder under the current user's
 `%LOCALAPPDATA%\AI CLI Auto Manager\w-<home hash>\backups\`. The command prints that
@@ -64,6 +69,53 @@ do not switch it to a real cleanup. Save the XML outside temporary directories s
 can be reconstructed with `Set-ScheduledTask -Action` if needed. Do not change a task whose action
 or ownership cannot be established.
 
+For the stated legacy Paseo task, after separate review and approval, this example saves its XML and
+changes only its action. Replace the backup path with a new file in an existing protected directory.
+The script preserves all PowerShell arguments and refuses the change if the dry-run settings differ.
+
+```powershell
+$backupFile = 'C:\path\to\protected\new-paseo-task-backup.xml'
+$task = Get-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup' -ErrorAction Stop
+if (@($task.Actions).Count -ne 1 -or $task.State -in @('Running', 'Queued')) { throw 'Task must be idle with one action' }
+$old = @($task.Actions)[0]
+$text = [string]$old.Arguments
+if ([string]$old.Execute -notmatch '(?i)(?:^|[\\/])wscript(?:\.exe)?$' -or
+    $text -notmatch '(?i)^\s*(?:(?://B|//Nologo)\s+)*"[^"]+run-hidden\.vbs"\s+"?powershell(?:\.exe)?"?\s+(?<ps>.+)$') {
+  throw 'Unrecognized legacy action'
+}
+$psArguments = $Matches.ps
+if ($psArguments -notmatch '(?i)(?:^|\s)--dry-run(?:\s|$)' -or
+    $psArguments -notmatch '(?i)(?:^|\s)--min-age-hours\s+168(?:\s|$)' -or
+    $psArguments -notmatch '(?i)cleanup_paseo_sessions\.ps1') { throw 'Required dry-run arguments are missing' }
+$managed = Get-ScheduledTask -TaskPath '\AI CLI Auto Manager\' -TaskName 'Update' -ErrorAction Stop
+$launcher = [string]$managed.Actions[0].Execute
+if (-not (Test-Path -LiteralPath $launcher -PathType Leaf) -or
+    [IO.Path]::GetFileName($launcher) -notmatch '^aicm-run-[0-9a-f]{24}\.exe$') { throw 'Verified manager launcher is unavailable' }
+$xml = [string](Export-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup')
+$stream = [IO.File]::Open($backupFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try { $bytes = [Text.Encoding]::UTF8.GetBytes($xml); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+if ([IO.File]::ReadAllText($backupFile) -cne $xml) { throw 'Backup verification failed' }
+$actionArgs = @{ Execute = $launcher; Argument = $psArguments }
+if ($old.WorkingDirectory) { $actionArgs.WorkingDirectory = [string]$old.WorkingDirectory }
+Set-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup' -Action (New-ScheduledTaskAction @actionArgs) | Out-Null
+```
+
+To restore that task's old action from its saved XML without changing its current schedule, account
+or settings:
+
+```powershell
+[xml]$xml = [IO.File]::ReadAllText($backupFile)
+$saved = @($xml.Task.Actions.Exec)
+if ($saved.Count -ne 1) { throw 'Expected one saved executable action' }
+$commandNode = $saved[0].SelectSingleNode("*[local-name()='Command']")
+$argumentNode = $saved[0].SelectSingleNode("*[local-name()='Arguments']")
+$directoryNode = $saved[0].SelectSingleNode("*[local-name()='WorkingDirectory']")
+$restoreArgs = @{ Execute = [string]$commandNode.InnerText }
+if ($argumentNode -and $argumentNode.InnerText) { $restoreArgs.Argument = [string]$argumentNode.InnerText }
+if ($directoryNode -and $directoryNode.InnerText) { $restoreArgs.WorkingDirectory = [string]$directoryNode.InnerText }
+Set-ScheduledTask -TaskPath '\' -TaskName 'Paseo-Session-Cleanup' -Action (New-ScheduledTaskAction @restoreArgs) | Out-Null
+```
+
 The repository's Windows CI exercises the launcher with throwaway scripts and tasks. A 100 ms
 window sample on the actual desktop provides evidence for that execution, but cannot prove no
 shorter-lived window appeared between samples or observe windows on another desktop/session.
@@ -75,7 +127,9 @@ After approval to start the actual tasks, run the observer from the interactive 
 
 This starts Clean, Inventory and Update, and the separately managed Paseo task when requested.
 Update and Clean are real operations; Paseo is refused unless its current arguments still include
-`--dry-run --min-age-hours 168`. The report records each new matching window's owner and parent
+`--dry-run --min-age-hours 168`. If a post-update hook exists, the observer refuses to start any
+task; use `-SkipUpdate` to observe the others and review the hook's effects separately before
+arranging a live Update. The report records each new matching window's owner and parent
 chain, completion result, maximum sample interval, and remaining tasks using VBScript. A result
 is inconclusive if the task process was not observed, the session differs, sampling falls behind, or
 an observed window cannot be attributed. Existing unrelated VBScript tasks remain listed.

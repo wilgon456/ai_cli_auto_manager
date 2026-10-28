@@ -4,20 +4,27 @@
 param(
   [Parameter(Mandatory = $true)][string]$OutputDir,
   [switch]$RunTasks,
+  [switch]$SkipUpdate,
   [switch]$IncludeExternalPaseo,
   [ValidateRange(30, 14400)][int]$TimeoutSeconds = 1800
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if (-not $RunTasks) { throw 'Pass -RunTasks only after approving execution of the real update and cleanup tasks.' }
+if (-not $SkipUpdate) {
+  $managerHome = if ($env:AICM_HOME) { $env:AICM_HOME } else { Join-Path $env:USERPROFILE '.ai-cli-auto-manager' }
+  if (Get-Item -LiteralPath (Join-Path $managerHome 'hooks\post-update.ps1') -Force -ErrorAction SilentlyContinue) {
+    throw 'Update has a user post-update hook. Review its effects separately before attempting a live Update; use -SkipUpdate to observe the other tasks.'
+  }
+}
 if (Test-Path -LiteralPath $OutputDir) { throw 'Choose a new output directory.' }
 New-Item -ItemType Directory -Path $OutputDir -ErrorAction Stop | Out-Null
 Add-Type -Path (Join-Path $PSScriptRoot 'window-observer.cs')
 $targets = @(
   @{ Path = '\AI CLI Auto Manager\'; Name = 'Clean' },
-  @{ Path = '\AI CLI Auto Manager\'; Name = 'Inventory' },
-  @{ Path = '\AI CLI Auto Manager\'; Name = 'Update' }
+  @{ Path = '\AI CLI Auto Manager\'; Name = 'Inventory' }
 )
+if (-not $SkipUpdate) { $targets += @{ Path = '\AI CLI Auto Manager\'; Name = 'Update' } }
 if ($IncludeExternalPaseo) { $targets += @{ Path = '\'; Name = 'Paseo-Session-Cleanup' } }
 $observingSession = [Diagnostics.Process]::GetCurrentProcess().SessionId
 $summaries = New-Object System.Collections.Generic.List[object]
