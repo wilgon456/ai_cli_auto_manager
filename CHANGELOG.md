@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.10.1 - Unreleased
+## 2.10.1 - 2026-10-28
 
 - Replace the Windows scheduled-task VBScript launcher with a GUI-subsystem executable compiled by
   the .NET Framework compiler. It starts PowerShell without a console window and returns the child
