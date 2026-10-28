@@ -5,7 +5,10 @@ The manager's tasks use a GUI-subsystem executable built from `windows/aicm-wind
 .NET Framework compiler. It starts Windows PowerShell with `CREATE_NO_WINDOW` and returns its exit
 code. The launcher is stored outside the installed app, so an app update does not replace a running
 executable. Installation refuses to change tasks if the compiler is unavailable or the launcher
-does not pass its integrity check.
+does not pass its integrity check. Before changing any existing task, the manager also starts a
+temporary probe under each execution account and verifies the launcher's hash from that task's own
+filesystem view. A shell and Task Scheduler can see different files at the same path, so a failed
+probe leaves the existing task actions unchanged.
 
 `windows/run-hidden.vbs` is retained only as a compatibility bridge: older installed updaters require
 the file to exist before they will copy a new version. New scheduled actions never invoke it. Keep it
