@@ -129,6 +129,9 @@ try {
     }
   }
   if (-not $repeatProblem) { Pass 'five repeated launcher-only migrations make no backup or state changes' } else { Fail "repeated migration: $repeatProblem" }
+  $migrationPath = (Join-Path $root 'windows\migrate-windowless-tasks.ps1').Replace("'", "''")
+  $withoutHashCmd = Invoke-Lib $root "function Get-FileHash { throw 'unexpected utility module dependency' }; & '$migrationPath'"
+  if ($withoutHashCmd.ExitCode -eq 0 -and $withoutHashCmd.Output -match 'already use the verified windowless launcher') { Pass 'migration does not depend on Get-FileHash module auto-loading' } else { Fail "migration without Get-FileHash: $($withoutHashCmd.Output)" }
   $savedScheduleHome = [Environment]::GetEnvironmentVariable('AICM_HOME')
   $heldScheduleLock = $null
   $worker = $null; $workerBlocked = $false
@@ -184,7 +187,9 @@ $ErrorActionPreference = 'Stop'
   $refusedState = Invoke-Script 'windows\restore-schedule-backup.ps1' @('-BackupDir', $onlyBackup, '-ActionsOnly')
   if ($refusedState.ExitCode -ne 0 -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Execute -eq $launcherFile) { Pass 'launcher-only rollback refuses a modified schedule state backup before changing tasks' } else { Fail "tampered schedule backup: $($refusedState.Output)" }
   [IO.File]::WriteAllBytes($scheduleBackup, $scheduleBytes)
-  $onlyRollback = Invoke-Script 'windows\restore-schedule-backup.ps1' @('-BackupDir', $onlyBackup, '-ActionsOnly')
+  $restorePath = (Join-Path $root 'windows\restore-schedule-backup.ps1').Replace("'", "''")
+  $restoreBackupArg = $onlyBackup.Replace("'", "''")
+  $onlyRollback = Invoke-Lib $root "function Get-FileHash { throw 'unexpected utility module dependency' }; & '$restorePath' -BackupDir '$restoreBackupArg' -ActionsOnly"
   $restoredState = Get-Content -LiteralPath $schedFile -Raw | ConvertFrom-Json
   if ($onlyRollback.ExitCode -eq 0 -and $restoredState.launcher -eq 'wscript' -and (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update').Actions[0].Arguments -eq $legacyArgs) { Pass 'launcher-only rollback restores task action and state' } else { Fail "launcher-only rollback: $($onlyRollback.Output)" }
   $r = Invoke-Aicm @('schedule', 'refresh')

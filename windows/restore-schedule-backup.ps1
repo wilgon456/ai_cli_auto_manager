@@ -27,13 +27,13 @@ $savedSchedule = Join-Path $backup 'schedule.json'
 $savedScheduleItem = Get-Item -LiteralPath $savedSchedule -Force -ErrorAction SilentlyContinue
 if ($meta.schedulePresent) {
   if (-not (Test-AicmRealFile $savedScheduleItem) -or
-      (Get-FileHash -LiteralPath $savedSchedule -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$meta.scheduleHash) { throw 'schedule state backup failed verification' }
+      (Get-AicmFileSha256 $savedSchedule) -cne [string]$meta.scheduleHash) { throw 'schedule state backup failed verification' }
 } elseif ($savedScheduleItem) { throw 'backup contains an unexpected schedule state file' }
 foreach ($name in $names) {
   if (@('Update', 'Inventory', 'Clean', 'Maintenance') -notcontains [string]$name) { throw 'backup contains an unrecognized task' }
   $xmlFile = Join-Path $backup "$name.xml"
   if (-not (Test-AicmRealFile (Get-Item -LiteralPath $xmlFile -Force -ErrorAction SilentlyContinue)) -or
-      (Get-FileHash -LiteralPath $xmlFile -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$meta.xmlHashes.$name) { throw "task backup failed verification: $name" }
+      (Get-AicmFileSha256 $xmlFile) -cne [string]$meta.xmlHashes.$name) { throw "task backup failed verification: $name" }
   $task = Get-ScheduledTask -TaskPath $script:AicmTaskPath -TaskName $name -ErrorAction Stop
   if ($task.State -in @('Running', 'Queued')) { throw "task $name is running or queued; wait for it to finish" }
 }
@@ -47,7 +47,7 @@ foreach ($file in $oldFiles) {
   if (-not (Test-AicmRealFile $file) -or (Test-AicmPathHasLink $file.FullName)) { throw 'backup copy contains a link' }
   $relative = $file.FullName.Substring($oldApp.TrimEnd('\', '/').Length + 1)
   if ($savedNames -notcontains $relative -or
-      (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$meta.appHashes.$relative) { throw "backup copy failed verification: $relative" }
+      (Get-AicmFileSha256 $file.FullName) -cne [string]$meta.appHashes.$relative) { throw "backup copy failed verification: $relative" }
 }
 $app = Get-AicmAppDir
 if (-not (Test-AicmAppCopyOwned $app)) { throw "current installed copy is not safe to replace: $($script:AicmHomeProblem)" }

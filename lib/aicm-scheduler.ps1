@@ -8,6 +8,17 @@ function Get-AicmSha256Text([string]$Text) {
   finally { $sha.Dispose() }
 }
 
+# Avoid relying on PowerShell module auto-loading: some scheduled and remote shells omit the
+# Windows utility module path even though .NET and the framework compiler are present.
+function Get-AicmFileSha256([string]$Path) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $stream = [IO.File]::OpenRead($Path)
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $stream.Dispose() }
+  } finally { $sha.Dispose() }
+}
+
 function Get-AicmWindowlessArea {
   $local = Get-AicmLocalAppData
   if (-not [IO.Path]::IsPathRooted($local)) { throw 'LOCALAPPDATA must be an absolute directory' }
@@ -38,7 +49,7 @@ function Get-AicmWindowlessArea {
 function Initialize-AicmWindowlessLauncher([string]$SourceRoot) {
   $source = Join-Path $SourceRoot 'windows\aicm-windowless.cs'
   if (-not (Test-AicmRealFile (Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue))) { throw 'windowless launcher source is missing or linked' }
-  $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+  $sourceHash = Get-AicmFileSha256 $source
   $area = Get-AicmWindowlessArea
   $stem = 'aicm-run-' + $sourceHash.Substring(0, 24)
   $exe = Join-Path $area "$stem.exe"
@@ -50,7 +61,7 @@ function Initialize-AicmWindowlessLauncher([string]$SourceRoot) {
     if (-not (Test-AicmRealFile $exeItem) -or -not (Test-AicmRealFile $recordItem)) { throw 'windowless launcher is incomplete; refusing to replace it' }
     $saved = $null
     try { $saved = (Read-AicmUtf8Text $record) | ConvertFrom-Json } catch { }
-    if (-not $saved -or $saved.sourceHash -cne $sourceHash -or $saved.exeHash -cne (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'windowless launcher integrity check failed' }
+    if (-not $saved -or $saved.sourceHash -cne $sourceHash -or $saved.exeHash -cne (Get-AicmFileSha256 $exe)) { throw 'windowless launcher integrity check failed' }
     return $exe
   }
   $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -72,7 +83,7 @@ function Initialize-AicmWindowlessLauncher([string]$SourceRoot) {
       $out = $stdoutTask.GetAwaiter().GetResult() + $stderrTask.GetAwaiter().GetResult()
       if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $temp -PathType Leaf)) { throw "launcher compilation failed: $out" }
     } finally { $proc.Dispose() }
-    $exeHash = (Get-FileHash -LiteralPath $temp -Algorithm SHA256).Hash.ToLowerInvariant()
+    $exeHash = Get-AicmFileSha256 $temp
     [IO.File]::Move($temp, $exe) # never replace an existing file
     $json = (@{ sourceHash = $sourceHash; exeHash = $exeHash } | ConvertTo-Json -Compress)
     $file = [IO.File]::Open($record, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -108,7 +119,7 @@ function New-AicmScheduleBackup([string[]]$Names, [string]$TaskPath) {
     if (@($parsed.Task.Actions.Exec).Count -ne 1) { throw "task $name does not have one restorable executable action" }
     Write-AicmUtf8Text (Join-Path $backup "$name.xml") $xml
     if ((Read-AicmUtf8Text (Join-Path $backup "$name.xml")) -cne $xml) { throw "could not verify backup for $name" }
-    $xmlHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $backup "$name.xml") -Algorithm SHA256).Hash.ToLowerInvariant()
+    $xmlHashes[$name] = Get-AicmFileSha256 (Join-Path $backup "$name.xml")
   }
   if ($appItem) {
     $appBackup = Join-Path $backup 'app'
@@ -120,10 +131,10 @@ function New-AicmScheduleBackup([string[]]$Names, [string]$TaskPath) {
       $relative = $f.FullName.Substring($app.TrimEnd('\', '/').Length + 1)
       $copied = Get-Item -LiteralPath (Join-Path $appBackup $relative) -Force -ErrorAction Stop
       if (-not (Test-AicmRealFile $copied) -or
-          (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $copied.FullName -Algorithm SHA256).Hash) {
+          (Get-AicmFileSha256 $f.FullName) -cne (Get-AicmFileSha256 $copied.FullName)) {
         throw "installed-copy backup verification failed for $relative"
       }
-      $appHashes[$relative] = (Get-FileHash -LiteralPath $copied.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+      $appHashes[$relative] = Get-AicmFileSha256 $copied.FullName
     }
   }
   $stateDir = Join-Path (Get-AicmHome) 'state'
@@ -136,8 +147,8 @@ function New-AicmScheduleBackup([string[]]$Names, [string]$TaskPath) {
     if (-not (Test-AicmRealFile $schedItem)) { throw 'schedule state is not a real file' }
     $savedSchedule = Join-Path $backup 'schedule.json'
     Copy-Item -LiteralPath $schedule -Destination $savedSchedule -ErrorAction Stop
-    $scheduleHash = (Get-FileHash -LiteralPath $savedSchedule -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($scheduleHash -cne (Get-FileHash -LiteralPath $schedule -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'schedule state backup verification failed' }
+    $scheduleHash = Get-AicmFileSha256 $savedSchedule
+    if ($scheduleHash -cne (Get-AicmFileSha256 $schedule)) { throw 'schedule state backup verification failed' }
   }
   $meta = @{ format = 1; taskPath = $TaskPath; names = @($Names); aicmHome = (Get-AicmHome); hasApp = [bool]$appItem; xmlHashes = $xmlHashes; appHashes = $appHashes; schedulePresent = [bool]$schedItem; scheduleHash = $scheduleHash }
   Write-AicmUtf8Text (Join-Path $backup 'backup.json') (($meta | ConvertTo-Json -Depth 6) + [Environment]::NewLine)
@@ -167,7 +178,7 @@ function Get-AicmOldTaskArguments($Task, [string]$ExpectedScript, [string]$App) 
     $recordItem = Get-Item -LiteralPath $record -Force -ErrorAction SilentlyContinue
     if (-not (Test-AicmRealFile $binary) -or -not (Test-AicmRealFile $recordItem)) { throw 'previous launcher is missing or linked' }
     $saved = (Read-AicmUtf8Text $record) | ConvertFrom-Json
-    if ($saved.exeHash -cne (Get-FileHash -LiteralPath $execute -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'previous launcher integrity check failed' }
+    if ($saved.exeHash -cne (Get-AicmFileSha256 $execute)) { throw 'previous launcher integrity check failed' }
   }
   $script = [regex]::Escape((Join-Path $App "bin\$ExpectedScript"))
   if ($argsText -notmatch ('(?i)(?:^|\s)-File\s+(?:"' + $script + '"|' + $script + ')(?:\s|$)')) { throw "task $($Task.TaskName) does not run its expected installed script" }

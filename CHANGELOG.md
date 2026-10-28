@@ -18,6 +18,8 @@
 - Serialize manager schedule and app-copy changes for the same home, avoid new backups on an
   already-completed standalone migration, and report legacy task actions even if the stored state
   says the launcher is windowless.
+- Verify launcher and backup hashes with .NET so migration also works when PowerShell does not
+  auto-load the Windows utility module containing `Get-FileHash`.
 
 ## 2.10.0 - 2026-10-27
 
