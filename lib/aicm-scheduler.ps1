@@ -19,6 +19,20 @@ function Get-AicmFileSha256([string]$Path) {
   } finally { $sha.Dispose() }
 }
 
+# Scheduled tasks may contain COM-handler or other actions without Execute/Arguments.
+# Inspect only properties that exist, so an unrelated task cannot break the system audit.
+function Test-AicmWindowsScriptAction($Action) {
+  if (-not $Action) { return $false }
+  $commandProperty = $Action.PSObject.Properties['Execute']
+  $argumentsProperty = $Action.PSObject.Properties['Arguments']
+  $command = if ($commandProperty) { [string]$commandProperty.Value } else { '' }
+  $arguments = if ($argumentsProperty) { [string]$argumentsProperty.Value } else { '' }
+  return ($command -match '(?i)(?:^|[\\/])(?:wscript|cscript)(?:\.exe)?$' -or
+    $command -match '(?i)\.vbs$' -or
+    $arguments -match '(?i)(?:^|[\\/\s"])(?:wscript|cscript)(?:\.exe)?(?:\s|"|$)' -or
+    $arguments -match '(?i)\.vbs')
+}
+
 function Get-AicmWindowlessArea {
   $local = Get-AicmLocalAppData
   if (-not [IO.Path]::IsPathRooted($local)) { throw 'LOCALAPPDATA must be an absolute directory' }

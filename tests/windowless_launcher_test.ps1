@@ -12,6 +12,24 @@ $script:fails = 0
 function Pass([string]$Message) { Write-Host "ok   - $Message" }
 function Fail([string]$Message) { Write-Host "FAIL - $Message"; $script:fails++ }
 
+$auditCases = @(
+  @{ action = [pscustomobject]@{ ClassId = '{test-com-handler}' }; expected = $false },
+  @{ action = [pscustomobject]@{ Execute = 'powershell.exe' }; expected = $false },
+  @{ action = [pscustomobject]@{ Execute = 'C:\Windows\System32\wscript.exe' }; expected = $true },
+  @{ action = [pscustomobject]@{ Execute = 'cmd.exe'; Arguments = '/c cscript.exe test.vbs' }; expected = $true },
+  @{ action = [pscustomobject]@{ Arguments = '"C:\example\run.vbs";other' }; expected = $true }
+)
+$auditPassed = $true
+foreach ($case in $auditCases) {
+  if ((Test-AicmWindowsScriptAction $case.action) -ne $case.expected) { $auditPassed = $false }
+}
+try {
+  foreach ($task in @(Get-ScheduledTask)) {
+    foreach ($action in @($task.Actions)) { [void](Test-AicmWindowsScriptAction $action) }
+  }
+} catch { $auditPassed = $false }
+if ($auditPassed) { Pass 'system task audit handles COM actions and detects Windows Script Host actions' } else { Fail 'system task audit' }
+
 $saved = @{}
 foreach ($key in 'USERPROFILE', 'HOME', 'AICM_HOME', 'LOCALAPPDATA', 'WINDIR', 'AICM_TASK_PATH') { $saved[$key] = [Environment]::GetEnvironmentVariable($key) }
 try {
@@ -81,6 +99,11 @@ if (!fs.readFileSync(log, 'utf8').includes('windowless transcript fixture')) pro
   Add-Type -Path (Join-Path $root 'windows\window-observer.cs')
   $snapshot = @([AicmWindowObserver.Snapshot]::Processes())
   if (@($snapshot | Where-Object { $_.Pid -eq $PID }).Count -eq 1) { Pass 'window observer captures process ancestry' } else { Fail 'window observer could not find the current process' }
+  $sampler = [AicmWindowObserver.Sampler]::new('aicm-no-such-process.exe', [uint32][Diagnostics.Process]::GetCurrentProcess().SessionId)
+  $sampler.Start()
+  Start-Sleep -Milliseconds 700
+  $samples = $sampler.Stop()
+  if ($samples.SampleCount -ge 3 -and -not $samples.Error) { Pass 'window sampling continues while the caller is blocked' } else { Fail 'background window sampler did not complete' }
 
   $hookDir = Join-Path $env:AICM_HOME 'hooks'
   New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
