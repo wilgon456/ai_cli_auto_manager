@@ -24,19 +24,22 @@ try {
 
   $fixture = Join-Path $work 'test script.ps1'
   @'
-param([string]$Output, [string]$Text, [int]$Result)
+param([string]$Output, [string]$Text, [int]$Result, [string]$Log)
+Start-Transcript -Path $Log -Force | Out-Null
+Write-Host 'windowless transcript fixture'
 [IO.File]::WriteAllText($Output, $Text, (New-Object Text.UTF8Encoding($false)))
+Stop-Transcript | Out-Null
 exit $Result
 '@ | Set-Content -LiteralPath $fixture -Encoding ASCII
   $nodeTest = Join-Path $work 'launch-test.js'
   @'
 const fs = require('fs');
 const cp = require('child_process');
-const [exe, script, dest] = process.argv.slice(2);
+const [exe, script, dest, log] = process.argv.slice(2);
 const text = 'Korean \uD55C\uAE00, spaces, "quotes", and a trailing slash \\';
 const result = cp.spawnSync(exe, [
   '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
-  '-Output', dest, '-Text', text, '-Result', '37'
+  '-Output', dest, '-Text', text, '-Result', '37', '-Log', log
 ], { windowsHide: true, timeout: 30000 });
 if (result.error || result.status !== 37) {
   console.error('launcher status:', result.status, 'error:', result.error && result.error.message);
@@ -46,10 +49,11 @@ if (fs.readFileSync(dest, 'utf8') !== text) {
   console.error('launcher altered fixture arguments');
   process.exit(2);
 }
+if (!fs.readFileSync(log, 'utf8').includes('windowless transcript fixture')) process.exit(3);
 '@ | Set-Content -LiteralPath $nodeTest -Encoding ASCII
   $node = (Get-Command node -CommandType Application | Select-Object -First 1).Source
-  & $node $nodeTest $exe $fixture (Join-Path $work 'output.txt')
-  if ($LASTEXITCODE -eq 0) { Pass 'arguments and nonzero exit code survive the launcher' } else { Fail "argument/exit fixture: $LASTEXITCODE" }
+  & $node $nodeTest $exe $fixture (Join-Path $work 'output.txt') (Join-Path $work 'transcript.log')
+  if ($LASTEXITCODE -eq 0) { Pass 'arguments, transcript and nonzero exit code survive the launcher' } else { Fail "argument/log/exit fixture: $LASTEXITCODE" }
 
   $failure = Join-Path $work 'exit-37.ps1'
   'exit 37' | Set-Content -LiteralPath $failure -Encoding ASCII

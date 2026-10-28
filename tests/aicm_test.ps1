@@ -134,7 +134,7 @@ try {
   'Start-Sleep -Seconds 90' | Set-Content -LiteralPath $hold -Encoding ASCII
   $savedAction = (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').Actions[0]
   $holdArgs = '-NoProfile -NonInteractive -File "{0}"' -f $hold
-  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $holdArgs) | Out-Null
+  Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute $launcherFile -Argument $holdArgs) | Out-Null
   try {
     Start-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory'
     $deadline = (Get-Date).AddSeconds(30)
@@ -148,6 +148,19 @@ try {
     Stop-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue
     $stopping = (Get-Date).AddSeconds(20)
     while ((Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').State -eq 'Running' -and (Get-Date) -lt $stopping) { Start-Sleep -Milliseconds 250 }
+    # Reset the fixture's LastTaskResult after intentionally stopping it, using a hidden no-op.
+    $success = Join-Path $work 'exit-zero.ps1'
+    'exit 0' | Set-Content -LiteralPath $success -Encoding ASCII
+    $successArgs = '-NoProfile -NonInteractive -File "{0}"' -f $success
+    Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action (New-ScheduledTaskAction -Execute $launcherFile -Argument $successArgs) | Out-Null
+    Start-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory'
+    $resetDeadline = (Get-Date).AddSeconds(30)
+    do {
+      Start-Sleep -Milliseconds 250
+      $resetInfo = Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName 'Inventory'
+      $resetState = (Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory').State
+    } while (($resetInfo.LastTaskResult -ne 0 -or $resetState -eq 'Running') -and (Get-Date) -lt $resetDeadline)
+    if ($resetInfo.LastTaskResult -ne 0 -or $resetState -eq 'Running') { Fail 'fixture task status did not reset to success' }
     Set-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -Action $savedAction | Out-Null
   }
 

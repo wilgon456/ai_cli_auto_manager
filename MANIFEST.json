@@ -50,7 +50,7 @@
   "rules/maintenance.conf": "cf5f66db67c4148ec28249a799c09f25112bfdbb022537d38c214d164e1595eb",
   "scripts/build_release.py": "81f794e382c65f57e9e1e98f865ed695aee648a7458183960d6a8108d3912be8",
   "scripts/check_manifest.py": "8ae17bedd0dd281f64703d4d96c686bc4cde84016416d171a5ba1711c8494004",
-  "tests/aicm_test.ps1": "1dc597a55cc9e5de83739033af88745f8b18a10b3e7365caa76ab2de04857ff2",
+  "tests/aicm_test.ps1": "a7fcd9c145c6b54ba8d024d1e470cc21389f959faeb9dffc646b8dd74238c31d",
   "tests/aicm_test.sh": "21d9d1c5729a81ae56092c91c457476be9544ce81a539624dc7f0f6020cca043",
   "tests/auto_maintenance_test.ps1": "18b8dd09aa502fe0525f874e684bd593360fcb5904b00f132dabf2fc51a6f4bf",
   "tests/cache_budget_test.ps1": "40d12d989dcb20a366bfdd3882515409ab3857724f2d66af400ad1fbe7d71dc8",
@@ -87,11 +87,11 @@
   "tests/update_policy_test.ps1": "a01ce383d30e6df7c215bc7b43d17511b98de9dbf30d0a98049d2efc7315c8b0",
   "tests/update_policy_test.sh": "f360f5f2839c895568e94a8d43ea0c0a5f256747ca0834f45fc67a09b60d2f17",
   "tests/update_verify_test.sh": "fcf65e9d6e749ea6ffcf46b570bfa42c4f490d05d572e58cf82495239fc96922",
-  "tests/windowless_launcher_test.ps1": "374d1ba42e9c90f3e82fc12e41cf1369071feb2dc852935b842cb54e668e1748",
+  "tests/windowless_launcher_test.ps1": "56f62c48de548d086af6f1a511e506a574e066d7006d0a8f95632bf7cf9fa8a7",
   "windows/aicm-windowless.cs": "3d421fd69e124c1b292eae1d19a3e249d340643c71458e3f216294a1b8699d40",
   "windows/check-scheduled-windows.ps1": "a32190169431052374fb0bb833536378085e7f5731d8c5f5ef773698c62eea50",
   "windows/install_scheduled_task.ps1": "6477d040bc50a8db4cf74d80d50ebafa8ce9a231d7029f3cec5f016cd94e2c08",
-  "windows/restore-schedule-backup.ps1": "e0d51057e8ff23434e2934e9052c937258a58740a99e8c7307b118afd54b7f94",
+  "windows/restore-schedule-backup.ps1": "d151dbc11713a7469162a280978ada0c8a82a179f55dafe3870088b322160bfb",
   "windows/run-hidden.vbs": "ff3acc41769acc2d896fd9b236bea3c33901ac5eb19567b26ac5c8acb5ef8836",
   "windows/window-observer.cs": "929409ea9c4480ba7fe89a6609e35aab2093a3c284f4cca0ee03dfa3f9432694"
 }

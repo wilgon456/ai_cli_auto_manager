@@ -30,6 +30,7 @@ foreach ($name in $names) {
 }
 $oldApp = Join-Path $backup 'app'
 if (-not (Test-AicmRealDir (Get-Item -LiteralPath $oldApp -Force -ErrorAction SilentlyContinue)) -or (Test-AicmPathHasLink $oldApp)) { throw 'backup copy is missing or linked' }
+if (-not (Test-AicmAppCopyOwned $oldApp)) { throw "backup copy contains an unexpected file or link: $($script:AicmHomeProblem)" }
 $oldFiles = @(Get-ChildItem -LiteralPath $oldApp -Recurse -File -Force)
 $savedNames = @($meta.appHashes.PSObject.Properties.Name)
 if ($oldFiles.Count -ne $savedNames.Count) { throw 'backup copy has missing or extra files' }
@@ -45,6 +46,7 @@ $recovery = New-AicmScheduleBackup $names $script:AicmTaskPath
 Write-Host "Current task XML and installed copy backed up to: $recovery"
 $stage = "$app.restore-$([guid]::NewGuid().ToString('N'))"
 $savedCurrent = "$app.rollback-$([guid]::NewGuid().ToString('N'))"
+if ((Test-Path -LiteralPath $stage) -or (Test-Path -LiteralPath $savedCurrent)) { throw 'rollback staging path already exists' }
 Copy-Item -LiteralPath $oldApp -Destination $stage -Recurse -ErrorAction Stop
 try {
   Move-AicmDirectory $app $savedCurrent
