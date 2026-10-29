@@ -25,7 +25,7 @@ This tool schedules inventory, updates, cleanup and an hourly maintenance previe
 | Job | Runs (default) | What it does |
 | --- | --- | --- |
 | Inventory | weekly (Mon 12:00) | Lists the installed AI CLIs with version, latest version, install method, and whether the daily update actually reaches the copy on PATH. Compares MCP servers and skills across the CLIs. Notifies you when a CLI appears or disappears |
-| Update | daily (05:00) | Updates every installed CLI. npm-installed CLIs only get releases at least 3 days old, after red-flag and signature checks. One failure does not stop the rest. Also reports MCP servers, browsers and agent CLIs left running after their session ended |
+| Update | daily (05:00) | Updates supported installed CLIs. npm-installed CLIs only get releases at least 3 days old, after red-flag and signature checks. One failure does not stop the rest. Also reports MCP servers, browsers and agent CLIs left running after their session ended |
 | Maintenance | hourly (minute 7) | Previews owned orphan/cache cleanup, writes an action log and daily summary, and warns about CLI version floors. Explicit apply enables quarantine and tagged-only termination |
 | Clean | weekly (Mon 12:30) | Deletes conversation history unused for 30 days and expired temp files and caches, and removes git worktrees and branches whose work is already merged. Never follows links and never deletes memory, credential, settings files or unpushed work |
 
@@ -37,6 +37,16 @@ Cleanup can permanently delete conversation history unused for 30 days. Preview
 the rules and keep a backup before enabling it. The examples below start with
 update and inventory schedules only; see [compatibility and first use](docs/compatibility.md)
 for supported installation channels and how to enable cleanup after review.
+These examples are for a first installation. Reinstalling a schedule can replace
+existing managed jobs; review `aicm status` before changing them.
+
+- `inventory` shows the active PATH copy and whether the daily update reaches it.
+  Some installation channels need a manual update.
+- `update --dry-run` previews the update without installing anything.
+  `clean --dry-run` previews the cleanup rules and targets before files are changed.
+- Only retained archives can be restored: use `archive list` and `restore ID`
+  for indexed files, or `codex unarchive <id>` for an archived Codex session.
+  Directly deleted items and expired archives cannot be restored by this tool.
 
 ### Windows
 
@@ -46,9 +56,10 @@ cd ai_cli_auto_manager
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 .\bin\aicm.ps1 inventory           # report installed CLIs and update coverage
+.\bin\aicm.ps1 update -DryRun      # preview update targets
 .\bin\aicm.ps1 status              # schedules, last runs, disk use and what can be freed
 .\bin\aicm.ps1 clean -DryRun       # preview what would be removed
-.\bin\aicm.ps1 schedule install -NoClean  # update daily 05:00, inventory Mon 12:00
+.\bin\aicm.ps1 schedule install -NoClean -NoMaintenance  # update daily 05:00, inventory Mon 12:00
 ```
 
 ### macOS · Linux
@@ -58,9 +69,10 @@ git clone https://github.com/wilgon456/ai_cli_auto_manager.git
 cd ai_cli_auto_manager
 
 ./bin/aicm inventory
+./bin/aicm update --dry-run
 ./bin/aicm status
 ./bin/aicm clean --dry-run
-./bin/aicm schedule install --no-clean
+./bin/aicm schedule install --no-clean --no-maintenance
 ```
 
 ## Automatic maintenance
@@ -426,7 +438,7 @@ On Windows, scheduled jobs use a small GUI-subsystem launcher compiled from `win
 On macOS and Linux the jobs get the `PATH` of the shell you ran `schedule install` in (plus the folders of `node`, `npm`, `brew` and `codex`), so CLIs installed with nvm, fnm, volta, mise, `~/.npm-global` or Homebrew are found. If you later move Node.js, run `schedule install` again; `doctor` tells you when the jobs no longer find `node` or `npm`.
 
 On Windows a run missed while the PC was off starts at the next boot; on macOS a run missed during sleep starts on wake. cron (Linux) skips missed runs, so there the weekly jobs start every day at their time and run only when this week's run has not happened yet.
-Leave out jobs you do not want with `--no-update`, `--no-inventory`, `--no-clean` (`-NoUpdate`, `-NoInventory`, `-NoClean`). On Windows, `-KeepOtherJobs` leaves the jobs you did not ask for as they are instead of removing them.
+Leave out jobs you do not want with `--no-update`, `--no-inventory`, `--no-clean`, `--no-maintenance` (`-NoUpdate`, `-NoInventory`, `-NoClean`, `-NoMaintenance`). On Windows, `-KeepOtherJobs` leaves the jobs you did not ask for as they are instead of removing them.
 
 Scheduled jobs can disappear or stop working silently. The jobs installed are recorded at install time, and every run checks that the others still exist, are not disabled, still point at existing files, did not fail on their last run, and have completed recently (update within 3 days, inventory and clean within 9). On Windows it also flags legacy launchers; on Linux it checks that a cron daemon runs (WSL starts none by default). It shows a desktop notification when something is wrong. Every notification is also written to `logs/notifications.log`, and `status` and `doctor` show the latest ones, so a notification that never reached the screen is not lost. State files are written atomically, so a crash never leaves a half-written file behind. Set `AICM_NOTIFY=0` to turn desktop notifications off.
 

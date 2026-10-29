@@ -128,17 +128,18 @@ Windows PowerShell 5.1.
 3. Install only the update and inventory schedules first:
 
    ```sh
-   ./bin/aicm schedule install --no-clean
+   ./bin/aicm schedule install --no-clean --no-maintenance
    ```
 
    ```powershell
-   .\bin\aicm.ps1 schedule install -NoClean
+   .\bin\aicm.ps1 schedule install -NoClean -NoMaintenance
    ```
 
 4. Review the cleanup rules and retention periods. The default Codex rule
    permanently deletes conversations unused for 30 days through Codex's own
    command. Once you accept that policy, run `schedule install` without
-   `--no-clean`/`-NoClean` to enable all three schedules.
+   `--no-clean`/`-NoClean` and `--no-maintenance`/`-NoMaintenance` to enable
+   cleanup and the hourly maintenance preview as well.
 5. Use `doctor` to confirm the jobs exist and can find the required runtimes. To
    stop maintenance while keeping logs and local data, use `schedule remove`.
 
