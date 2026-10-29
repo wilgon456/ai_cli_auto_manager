@@ -98,6 +98,10 @@ try {
   }
   if ($accepted.Count -eq 0 -and -not (Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue)) { Pass 'invalid times rejected before anything is registered' } else { Fail "invalid times accepted: $($accepted -join ', ')" }
 
+  $r = Invoke-Aicm @('schedule', 'install', '-NoClean', '-NoMaintenance', '-KeepLegacyTask')
+  $firstJobs = @(Get-ScheduledTask -TaskPath $taskPath -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName } | Sort-Object)
+  if ($r.ExitCode -eq 0 -and ($firstJobs -join ',') -eq 'Inventory,Update') { Pass 'first-install example excludes cleanup and maintenance' } else { Fail "first-install jobs: $($firstJobs -join ', '); $($r.Output)" }
+
   $r = Invoke-Aicm @('schedule', 'install', '-UpdateAt', '06:15', '-InventoryDay', 'Wednesday', '-InventoryAt', '11:40', '-CleanDay', 'Sunday', '-CleanAt', '13:05', '-Targets', 'codex,claude', '-KeepLegacyTask')
   $update = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Update' -ErrorAction SilentlyContinue
   $inventory = Get-ScheduledTask -TaskPath $taskPath -TaskName 'Inventory' -ErrorAction SilentlyContinue

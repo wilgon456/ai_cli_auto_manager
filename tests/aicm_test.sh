@@ -439,6 +439,10 @@ mkdir -p "$OPT/foreign"; echo mine > "$OPT/foreign/notes.txt"
 out="$(AICM_HOME="$OPT/foreign" FAKE_OPTIMIZE_CALLS="$OPT/calls.jsonl" AICM_PROCESS_LIST="$OPT/procs.json" PATH="$OPTBIN:$PATH" "$AICM" optimize --apply --json 2>/dev/null)" && rc=0 || rc=$?
 [[ "$rc" == 1 && ! -e "$OPT/calls.jsonl" && ! -e "$OPT/foreign/.aicm-home" && ! -e "$OPT/foreign/state" ]] && grep -q '"status":"refused"' <<< "$out" && pass "optimize --apply refuses a foreign AICM_HOME untouched" || fail "optimize foreign home rc=$rc: $out"
 
+# The documented first-install example registers only update and inventory.
+"$AICM" schedule install --no-clean --no-maintenance >/dev/null
+[[ "$(grep -c '# aicm:' "$WORK/crontab.txt")" == 2 ]] && grep -q '# aicm:update' "$WORK/crontab.txt" && grep -q '# aicm:inventory' "$WORK/crontab.txt" && ! grep -Eq '# aicm:(clean|maintenance)' "$WORK/crontab.txt" && pass "first-install example excludes cleanup and maintenance" || fail "first-install example registered an unexpected job"
+
 # Hourly apply is explicit and survives refresh; opting out does not reappear on refresh.
 "$AICM" schedule install --no-update --no-inventory --no-clean --maintenance-apply >/dev/null
 "$AICM" schedule refresh >/dev/null
