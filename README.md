@@ -42,8 +42,8 @@ existing managed jobs; review `aicm status` before changing them.
 
 - `inventory` shows the active PATH copy and whether the daily update reaches it.
   Some installation channels need a manual update.
-- `update --dry-run` previews the update without installing anything. `clean
-  --dry-run` previews the cleanup rules and targets before files are changed.
+- `update --dry-run` previews the update without installing anything.
+  `clean --dry-run` previews the cleanup rules and targets before files are changed.
 - Only retained archives can be restored: use `archive list` and `restore ID`
   for indexed files, or `codex unarchive <id>` for an archived Codex session.
   Directly deleted items and expired archives cannot be restored by this tool.

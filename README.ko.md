@@ -86,7 +86,7 @@ cd ai_cli_auto_manager
 | `aicm optimize` | 패키지 관리자 자체 명령(`npm cache verify`, `uv cache prune`, `pnpm store prune`)으로 캐시를 손봅니다. 기본은 미리보기이고 `--apply`(`-Apply`)를 줘야만 실행합니다. `--tasks npm-verify,uv-prune,pnpm-prune`, `--dry-run`, `--json`. Node.js가 필요합니다 |
 | `aicm status` | 예약 상태, 마지막 실행 결과, 마지막 목록, 규칙별 용량과 지울 수 있는 양을 보여 줍니다 |
 | `aicm doctor` | 예약이 사라졌거나 실행이 밀렸거나 실패했을 때, 업데이트 정책이 잘못되었거나(또는 필요한 Node.js가 없을 때), `AICM_HOME`을 쓸 수 없을 때 문제를 적고 종료 코드 1을 냅니다. 설치 사본과 그 원본·버전도 보여 줍니다. 아무것도 바꾸지 않습니다 |
-| `aicm schedule install` | 업데이트·목록·정리 예약을 등록합니다. 다시 실행하면 같은 작업을 덮어씁니다 |
+| `aicm schedule install` | 업데이트·목록·정리와 시간별 유지 관리 예약을 등록합니다. 다시 실행하면 같은 작업을 덮어씁니다 |
 | `aicm schedule remove` | 등록한 예약을 지웁니다 |
 | `aicm uninstall` | 예약과 설치 사본을 지웁니다. `--purge`(`-Purge`)면 이 도구가 쓴 로그·상태·아카이브까지 지웁니다. `--dry-run`(`-DryRun`)은 지울 것만 보여 주고 아무것도 바꾸지 않습니다 |
 | `aicm version` | 버전을 출력합니다 |
