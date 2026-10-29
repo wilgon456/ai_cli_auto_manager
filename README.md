@@ -25,7 +25,7 @@ This tool schedules inventory, updates, cleanup and an hourly maintenance previe
 | Job | Runs (default) | What it does |
 | --- | --- | --- |
 | Inventory | weekly (Mon 12:00) | Lists the installed AI CLIs with version, latest version, install method, and whether the daily update actually reaches the copy on PATH. Compares MCP servers and skills across the CLIs. Notifies you when a CLI appears or disappears |
-| Update | daily (05:00) | Updates every installed CLI. npm-installed CLIs only get releases at least 3 days old, after red-flag and signature checks. One failure does not stop the rest. Also reports MCP servers, browsers and agent CLIs left running after their session ended |
+| Update | daily (05:00) | Updates supported installed CLIs. npm-installed CLIs only get releases at least 3 days old, after red-flag and signature checks. One failure does not stop the rest. Also reports MCP servers, browsers and agent CLIs left running after their session ended |
 | Maintenance | hourly (minute 7) | Previews owned orphan/cache cleanup, writes an action log and daily summary, and warns about CLI version floors. Explicit apply enables quarantine and tagged-only termination |
 | Clean | weekly (Mon 12:30) | Deletes conversation history unused for 30 days and expired temp files and caches, and removes git worktrees and branches whose work is already merged. Never follows links and never deletes memory, credential, settings files or unpushed work |
 
@@ -40,6 +40,14 @@ for supported installation channels and how to enable cleanup after review.
 These examples are for a first installation. Reinstalling a schedule can replace
 existing managed jobs; review `aicm status` before changing them.
 
+- `inventory` shows the active PATH copy and whether the daily update reaches it.
+  Some installation channels need a manual update.
+- `update --dry-run` previews the update without installing anything. `clean
+  --dry-run` previews the cleanup rules and targets before files are changed.
+- Only retained archives can be restored: use `archive list` and `restore ID`
+  for indexed files, or `codex unarchive <id>` for an archived Codex session.
+  Directly deleted items and expired archives cannot be restored by this tool.
+
 ### Windows
 
 ```powershell
@@ -48,6 +56,7 @@ cd ai_cli_auto_manager
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 .\bin\aicm.ps1 inventory           # report installed CLIs and update coverage
+.\bin\aicm.ps1 update -DryRun      # preview update targets
 .\bin\aicm.ps1 status              # schedules, last runs, disk use and what can be freed
 .\bin\aicm.ps1 clean -DryRun       # preview what would be removed
 .\bin\aicm.ps1 schedule install -NoClean -NoMaintenance  # update daily 05:00, inventory Mon 12:00
@@ -60,6 +69,7 @@ git clone https://github.com/wilgon456/ai_cli_auto_manager.git
 cd ai_cli_auto_manager
 
 ./bin/aicm inventory
+./bin/aicm update --dry-run
 ./bin/aicm status
 ./bin/aicm clean --dry-run
 ./bin/aicm schedule install --no-clean --no-maintenance

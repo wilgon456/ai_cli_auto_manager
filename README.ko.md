@@ -25,7 +25,7 @@ AI 코딩 CLI를 몇 달 쓰면 세 가지가 헷갈리기 시작합니다. 무�
 | 작업 | 주기 (기본 시각) | 하는 일 |
 | --- | --- | --- |
 | 목록 | 매주 (월 12:00) | 깔린 AI CLI를 찾아 버전, 최신 버전, 설치 방식, 매일 업데이트가 실제로 닿는지를 표로 남깁니다. CLI끼리 MCP 서버와 스킬이 어긋났는지도 봅니다. 새로 생기거나 사라진 CLI는 알림으로 알려 줍니다 |
-| 업데이트 | 매일 (05:00) | 깔린 CLI를 모두 올립니다. npm으로 깐 CLI는 나온 지 3일 지난 버전만, 이상 징후와 서명을 확인한 뒤 깝니다. 하나가 실패해도 나머지는 계속합니다. 세션이 끝난 뒤에도 남아 도는 MCP 서버·브라우저·에이전트 CLI를 알려 줍니다 |
+| 업데이트 | 매일 (05:00) | 깔린 CLI 중 지원하는 설치본을 업데이트합니다. npm으로 깐 CLI는 나온 지 3일 지난 버전만, 이상 징후와 서명을 확인한 뒤 깝니다. 하나가 실패해도 나머지는 계속합니다. 세션이 끝난 뒤에도 남아 도는 MCP 서버·브라우저·에이전트 CLI를 알려 줍니다 |
 | 유지 관리 | 매시간 7분 | 소유권이 확인된 고아 프로세스와 캐시·임시 파일을 기본적으로 미리보기만 합니다. 실제 처리는 별도 옵션으로 켭니다 |
 | 정리 | 매주 (월 12:30) | 30일 동안 쓰지 않은 대화 기록과 날짜가 지난 임시 파일·캐시를 지우고, 작업이 이미 합쳐진 git worktree와 가지를 정리합니다. 링크는 따라가지 않고, 메모리·인증·설정 파일과 올리지 않은 작업은 건드리지 않습니다 |
 
@@ -38,6 +38,10 @@ AI 코딩 CLI를 몇 달 쓰면 세 가지가 헷갈리기 시작합니다. 무�
 등록합니다. 지원하는 설치 방식과 정리 예약을 켜는 절차는
 [호환성·첫 실행 안내](docs/compatibility.md)에 있습니다. 이 예시는 처음 설치할 때를 기준으로 합니다. 다시 설치하면 기존 관리 예약이 바뀔 수 있으므로 먼저 `aicm status`로 확인하세요.
 
+- `inventory`에서 PATH로 실행되는 설치본과 예약 업데이트가 닿는지 확인합니다. 설치 방식에 따라 직접 업데이트해야 할 수 있습니다.
+- `update --dry-run`은 실제 설치 없이 업데이트 대상을, `clean --dry-run`은 변경 전에 정리 규칙과 대상을 보여 줍니다.
+- 보관 중인 아카이브만 복원할 수 있습니다. 색인된 파일은 `archive list`와 `restore ID`로, 아카이브한 Codex 세션은 `codex unarchive <id>`로 복원합니다. 바로 삭제된 항목과 보관 기한이 지난 아카이브는 이 도구로 되돌릴 수 없습니다.
+
 ### Windows
 
 ```powershell
@@ -46,6 +50,7 @@ cd ai_cli_auto_manager
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 .\bin\aicm.ps1 inventory           # 깔린 AI CLI와 업데이트 지원 여부 확인
+.\bin\aicm.ps1 update -DryRun      # 업데이트 대상 미리 보기
 .\bin\aicm.ps1 status              # 예약 상태, 마지막 실행, 폴더별 용량과 지울 수 있는 양
 .\bin\aicm.ps1 clean -DryRun       # 지울 대상만 미리 보기
 .\bin\aicm.ps1 schedule install -NoClean -NoMaintenance  # 매일 05:00 업데이트, 매주 월요일 12:00 목록
@@ -58,6 +63,7 @@ git clone https://github.com/wilgon456/ai_cli_auto_manager.git
 cd ai_cli_auto_manager
 
 ./bin/aicm inventory
+./bin/aicm update --dry-run
 ./bin/aicm status
 ./bin/aicm clean --dry-run
 ./bin/aicm schedule install --no-clean --no-maintenance
