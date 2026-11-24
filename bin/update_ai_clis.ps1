@@ -942,11 +942,104 @@ try {
       if ($result.ExitCode -ne 0) { throw "$($Entry.Command) $($Entry.SelfUpdate) failed with exit code $($result.ExitCode)" }
     }
 
+    # WinGet builds its installed list from the Windows uninstall registry (HKLM 64/32-bit and HKCU) and
+    # the user's MSIX packages. Read that inventory once, without launching WinGet. $null means it could
+    # not be read in full (or HKCU is not this user's own profile hive), so nothing may be ruled out.
+    $script:windowsInstallInventory = $null
+    function Get-WindowsInstallInventory {
+      if ($null -ne $script:windowsInstallInventory) { return ,$script:windowsInstallInventory }
+      $rows = New-Object System.Collections.Generic.List[string]
+      try {
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $profileKey = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction Stop
+        $profilePath = [Environment]::ExpandEnvironmentVariables([string]$profileKey.ProfileImagePath).TrimEnd('\')
+        if (-not $profilePath -or $profilePath -ne ([string]$env:USERPROFILE).TrimEnd('\')) { return ,$null }
+        $userHive = [Microsoft.Win32.Registry]::Users.OpenSubKey($sid)
+        if ($null -eq $userHive) { return ,$null }
+        $userHive.Close()
+        $fields = @('DisplayName', 'Publisher', 'InstallLocation', 'UninstallString', 'QuietUninstallString', 'DisplayIcon')
+        foreach ($hive in @([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryHive]::CurrentUser)) {
+          foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
+            try {
+              $uninstall = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+              if ($null -eq $uninstall) { continue }
+              try {
+                foreach ($name in $uninstall.GetSubKeyNames()) {
+                  $key = $uninstall.OpenSubKey($name)
+                  if ($null -eq $key) { continue }
+                  try { $rows.Add(((@($name) + @($fields | ForEach-Object { [string]$key.GetValue($_) })) -join ' ')) }
+                  finally { $key.Close() }
+                }
+              } finally { $uninstall.Close() }
+            } finally { $base.Close() }
+          }
+        }
+        foreach ($package in @(Get-AppxPackage -ErrorAction Stop)) {
+          $rows.Add((@($package.Name, $package.PackageFamilyName, $package.Publisher, $package.InstallLocation) -join ' '))
+        }
+      } catch { return ,$null }
+      $normalized = New-Object System.Collections.Generic.List[string]
+      foreach ($row in $rows) { $normalized.Add(($row.ToLowerInvariant() -replace '[^a-z0-9]', '')) }
+      $script:windowsInstallInventory = $normalized.ToArray()
+      return ,$script:windowsInstallInventory
+    }
+
+    # Rows whose Windows install identity was checked against their WinGet manifests: the uninstall key
+    # (ProductCode) and names those manifests declare. SST.OpenCodeDesktop (removed from winget-pkgs on
+    # 2026-11-07) and Anomaly.OpenCode.Desktop both declare this ProductCode, PackageName and Publisher.
+    # Other rows always ask WinGet: their uninstall entry may carry an unrelated name.
+    $script:wingetRowIdentities = @{ 'opencode-desktop' = @('d074f30d-5f88-5885-b075-be1348cc7676', 'OpenCode') }
+
+    # True only for a row listed above, when that inventory reads in full and no entry mentions its
+    # ProductCode, product name, id or winget package name. Any doubt keeps WinGet's answer.
+    function Test-WingetRowAbsent($Entry) {
+      if (-not $script:wingetRowIdentities.ContainsKey([string]$Entry.Id)) { return $false }
+      $inventory = Get-WindowsInstallInventory
+      if ($null -eq $inventory) { return $false }
+      $names = New-Object System.Collections.Generic.List[string]
+      foreach ($part in @($script:wingetRowIdentities[[string]$Entry.Id]) + @($Entry.Name, @($Entry.Name -split '\s+')[0], @($Entry.Id -split '-')[0], @($Entry.Winget -split '\.', 2)[-1])) {
+        $name = ([string]$part).ToLowerInvariant() -replace '[^a-z0-9]', ''
+        if ($name -and -not $names.Contains($name)) { $names.Add($name) }
+      }
+      if ($names.Count -eq 0) { return $false }
+      foreach ($row in $inventory) {
+        foreach ($name in $names) { if ($row.Contains($name)) { return $false } }
+      }
+      return $true
+    }
+
     # Catalog CLIs without dedicated logic (rules\ai-clis.conf). Only installed ones are touched.
     $catalogExtras = New-Object System.Collections.Generic.List[object]
+    $wingetLookupError = ''
     foreach ($entry in @(Read-AicmCatalog | Where-Object { -not $_.Builtin })) {
       if (-not (Test-TargetEnabled $entry.Id)) { continue }
       if (Test-AicmPolicyExcluded $entry.Id) { continue }
+      if (-not $entry.Command -and $entry.Winget) {
+        if (Test-WingetRowAbsent $entry) {
+          Write-Host "$($entry.Name): not installed (no Windows uninstall or MSIX entry names it; WinGet not queried)"
+          continue
+        }
+        # A WindowsApps alias can resolve on PATH but refuse launch in an SSH session.
+        # Record the affected target and keep processing CLIs with independent owners.
+        if (-not $wingetLookupError) {
+          try {
+            $null = Get-AicmWingetText
+            # An install the Windows inventory may show cannot be ruled out by a failed WinGet listing.
+            if (-not $script:AicmWingetText -and (Resolve-AicmExecutable 'winget')) { $wingetLookupError = 'WinGet inventory listing failed' }
+          } catch [System.ComponentModel.Win32Exception] {
+            if ($_.Exception.GetBaseException().NativeErrorCode -ne 5) { throw }
+            $wingetLookupError = 'WinGet inventory launch denied (Win32 5)'
+          }
+        }
+        if ($wingetLookupError) {
+          Write-Host "error: $($entry.Name): $wingetLookupError"
+          $failStart = $script:failures.Count
+          $script:failures.Add("$($entry.Name): $wingetLookupError") | Out-Null
+          Add-TargetFailures $entry.Id $failStart
+          continue
+        }
+      }
       $install = Get-AicmCliInstall $entry
       if ($install.Installed -or ($InstallMissing -and $entry.Npm -and (Test-TargetNamed $entry.Id))) {
         $catalogExtras.Add([pscustomobject]@{ Entry = $entry; Install = $install })

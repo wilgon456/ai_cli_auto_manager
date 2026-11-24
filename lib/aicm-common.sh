@@ -366,8 +366,17 @@ aicm_state_write() {
 }
 
 aicm_json_escape() {
-  local s="$1"
+  local s="$1" code char escaped
   s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/ }"; s="${s//$'\r'/ }"; s="${s//$'\t'/ }"
+  # CLI diagnostics can carry ANSI color (ESC). JSON requires every C0 byte to be escaped.
+  if [[ "$s" == *[[:cntrl:]]* ]]; then
+    for ((code = 1; code < 32; code++)); do
+      printf -v char '%03o' "$code"
+      printf -v char '%b' "\\$char"
+      printf -v escaped '\\u%04x' "$code"
+      s="${s//"$char"/$escaped}"
+    done
+  fi
   printf '%s' "$s"
 }
 

@@ -194,6 +194,14 @@ printf 'ok 1.0.0\n' > "$WORK/ctrl/goodcli"
 set_next goodcli fail
 out="$("${UPD[@]}" goodcli 2>&1)" && rc=0 || rc=$?
 [[ "$rc" != 0 && "$(row goodcli status)" == verifyFailed && "$(row goodcli after.exitCode)" == 3 ]] && pass "nonzero --version fails the run" || fail "nonzero rc=$rc $(row goodcli status) $(row goodcli after.exitCode)"
+colored_error=$'\033[33mError: Your macOS login keychain is locked.\033[0m'
+printf 'fail %s\n' "$colored_error" > "$WORK/ctrl/goodcli"
+out="$("${UPD[@]}" goodcli --scheduled 2>&1)" && rc=0 || rc=$?
+[[ "$rc" != 0 && "$(okflag)" == false && "$(row goodcli status)" == verifyFailed &&
+   "$(row goodcli after.version)" == "$colored_error" &&
+   "$out" != *'already updated today'* && "$out" != *'update history failed'* ]] &&
+  pass "colored keychain failure stays failed and writes parseable state and history" ||
+  fail "colored keychain failure rc=$rc: $out"
 printf 'ok 1.0.0\n' > "$WORK/ctrl/goodcli"
 set_next goodcli empty
 out="$("${UPD[@]}" goodcli 2>&1)" && rc=0 || rc=$?
