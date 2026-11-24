@@ -154,6 +154,64 @@ try {
   if ($r.Output -match 'pass: Fake Shadow is installed standalone') { Pass 'no updater: reported, not failed' } else { Fail 'shadow handling' }
   if (-not ((Get-Calls) -match '@fake/shadow')) { Pass 'hidden npm copy is not touched' } else { Fail 'hidden copy was updated' }
 
+  Write-Host '# a resolvable but inaccessible WinGet alias'
+  $winget = Join-Path $fakeBin 'winget.exe'
+  Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\whoami.exe') -Destination $winget
+  $originalAcl = Get-Acl -LiteralPath $winget
+  $restrictedAcl = Get-Acl -LiteralPath $winget
+  $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+  $restrictedAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'ExecuteFile', 'Deny'))
+  Set-Acl -LiteralPath $winget -AclObject $restrictedAcl
+  # A per-user uninstall entry that names the desktop app, as its NSIS installer would write it.
+  $arpKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\aicm-test-$([guid]::NewGuid().ToString('N'))"
+  # The Windows install inventory is trusted only with this user's own profile (the fake home is not it).
+  $profileEnv = @{ USERPROFILE = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($sid.Value)").ProfileImagePath) }
+  $uninstallRoots = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
+  $openCodeListed = @(Get-ChildItem -LiteralPath $uninstallRoots -ErrorAction SilentlyContinue | Where-Object {
+      ($_.PSChildName + ' ' + [string]$_.GetValue('DisplayName') + ' ' + [string]$_.GetValue('InstallLocation')) -match '(?i)open\W*code|d074f30d' }).Count -gt 0
+  try {
+    if ($openCodeListed) {
+      Write-Host 'skip: this machine lists an OpenCode install, so the absent path cannot be shown here'
+    } else {
+      $r = Invoke-Script $upd @('-Targets', 'opencode-desktop,fakesolo', '-Scheduled') $profileEnv
+      $update = Get-Content -LiteralPath "$aicmHome\state\last-update.json" -Raw | ConvertFrom-Json
+      $absent = $update.results | Where-Object { $_.id -eq 'opencode-desktop' }
+      if ($r.ExitCode -eq 0 -and $update.ok -and $absent.status -eq 'unsupported' -and
+          $r.Output -match 'OpenCode Desktop: not installed \(no Windows uninstall or MSIX entry names it; WinGet not queried\)' -and
+          $r.Output -notmatch 'WinGet inventory') {
+        Pass 'OpenCode Desktop absent from the Windows install inventory is not installed, without launching WinGet'
+      } else { Fail "absent OpenCode Desktop: exit $($r.ExitCode) $($r.Output)" }
+    }
+
+    Add-Content -LiteralPath "$aicmHome\ai-clis.local.conf" -Value 'zqaicmabsent | - | Zqaicmabsent Probe | | | Zqaicm.AbsentProbe | |'
+    $r = Invoke-Script $upd @('-Targets', 'zqaicmabsent,fakesolo', '-Scheduled') $profileEnv
+    $update = Get-Content -LiteralPath "$aicmHome\state\last-update.json" -Raw | ConvertFrom-Json
+    $other = $update.results | Where-Object { $_.id -eq 'zqaicmabsent' }
+    if ($r.ExitCode -eq 1 -and $other.status -eq 'updateFailed' -and $other.reason -match 'WinGet inventory launch denied \(Win32 5\)') {
+      Pass 'a winget-only row without a verified install identity still asks WinGet'
+    } else { Fail "unverified winget-only row: exit $($r.ExitCode) $($r.Output)" }
+
+    New-Item -Path $arpKey -Force | Out-Null
+    New-ItemProperty -LiteralPath $arpKey -Name DisplayName -Value 'OpenCode (aicm test)' -PropertyType String | Out-Null
+    $soloBefore = @(Get-Content -LiteralPath "$work\solo-upgrades.log").Count
+    $r = Invoke-Script $upd @('-Targets', 'opencode-desktop,fakesolo', '-Scheduled') $profileEnv
+    $update = Get-Content -LiteralPath "$aicmHome\state\last-update.json" -Raw | ConvertFrom-Json
+    $desktop = $update.results | Where-Object { $_.id -eq 'opencode-desktop' }
+    if ($r.ExitCode -eq 1 -and -not $update.ok -and $desktop.status -eq 'updateFailed' -and
+        $desktop.reason -match 'WinGet inventory launch denied \(Win32 5\)') {
+      Pass 'an uninstall entry naming the app sends it to WinGet, and the denial fails the run'
+    } else { Fail "WinGet denial was not recorded: $($r.Output)" }
+    $retry = Invoke-Script $upd @('-Targets', 'opencode-desktop,fakesolo', '-Scheduled') $profileEnv
+    if ($retry.ExitCode -eq 1 -and $retry.Output -match 'AI CLI update finished with failures: .*WinGet inventory launch denied' -and
+        @(Get-Content -LiteralPath "$work\solo-upgrades.log").Count -eq ($soloBefore + 2)) {
+      Pass 'independently owned CLI runs and failed state does not trip the same-day guard'
+    } else { Fail "WinGet scheduled retry did not record the expected failure: $($retry.Output)" }
+  } finally {
+    Remove-Item -LiteralPath $arpKey -Recurse -Force -ErrorAction SilentlyContinue
+    Set-Acl -LiteralPath $winget -AclObject $originalAcl
+    Remove-Item -LiteralPath $winget
+  }
+
   $r = Invoke-Script $upd @('-Targets', 'fakenpm')
   if ($r.Output -match 'already current: @fake/npmcli 1\.1\.0') { Pass 'nothing newer than the waiting period: not reinstalled' } else { Fail "reinstalled: $($r.Output)" }
   if (@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count -eq 1) { Pass 'post-update hook ran once: only the run that changed a version' } else { Fail "hook runs: $(@(Get-Content -LiteralPath "$work\hook.log" -ErrorAction SilentlyContinue).Count)" }

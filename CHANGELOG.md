@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Escape control characters in Unix update state so colored CLI errors remain readable in history.
+- On Windows, record access-denied WinGet discovery as a target failure and continue through the
+  update routes whose owners can be established independently.
+- On Windows, OpenCode Desktop is checked against the Windows install inventory WinGet itself lists
+  (uninstall registry and MSIX packages) before WinGet starts, using the ProductCode and names its
+  WinGet manifests declare. When no entry names it, it is reported as not installed without launching
+  WinGet. A possible install, an inventory that cannot be read in full, and every other winget-only row
+  still go to WinGet, and a failed WinGet listing is now a target failure.
+
 ## 2.10.2 - 2026-10-28
 
 - macOS and Linux: defer updates to npm-installed CLIs when running sessions are detected. The check
